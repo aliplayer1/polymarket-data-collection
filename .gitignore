@@ -27,7 +27,7 @@ test_output_parquet/
 *.xlsx
 
 # -- IDE / editor --------------------------------------------------------------
-.vscode/settings.json
+.vscode/
 .idea/
 *.swp
 *.swo
