@@ -1,0 +1,16 @@
+[Unit]
+Description=Run Polymarket historical fetch every 6 hours
+Requires=polymarket-historical.service
+
+[Timer]
+# First run 2 minutes after boot (give network time to stabilise)
+OnBootSec=2min
+# Then every 6 hours from the last activation
+OnUnitActiveSec=6h
+# If a run is missed (e.g. the machine was off), fire immediately on next boot
+Persistent=true
+
+Unit=polymarket-historical.service
+
+[Install]
+WantedBy=timers.target

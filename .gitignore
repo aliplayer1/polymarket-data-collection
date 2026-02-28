@@ -1,0 +1,36 @@
+# -- Python --------------------------------------------------------------------
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# -- Secrets — never commit credentials ----------------------------------------
+.env
+.env.*
+!.env.example
+
+# -- Collected data — can be very large ----------------------------------------
+data/
+test_output/
+test_output_parquet/
+
+# -- Logs ----------------------------------------------------------------------
+*.log
+*.log.*
+
+# -- Misc formats produced during analysis -------------------------------------
+*.csv
+*.xlsx
+
+# -- IDE / editor --------------------------------------------------------------
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.claude/

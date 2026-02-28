@@ -1,0 +1,33 @@
+[Unit]
+Description=Polymarket Live WebSocket Data Stream
+Documentation=https://github.com/yourusername/polymarket-data-pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/polymarket
+
+# Load secrets from the .env file
+EnvironmentFile=/opt/polymarket/.env
+
+ExecStart=/opt/polymarket/.venv/bin/python -m polymarket_pipeline \
+    --data-dir /mnt/data/polymarket \
+    --log-file /var/log/polymarket/live.log
+
+# Restart on any failure; cap reconnect attempts to 30 s
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Give the process time to flush its WebSocket buffer on SIGTERM
+TimeoutStopSec=60
+
+# Basic resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

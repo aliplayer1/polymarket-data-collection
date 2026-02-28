@@ -1,0 +1,25 @@
+[Unit]
+Description=Polymarket Historical Data Fetch (one-shot)
+Documentation=https://github.com/yourusername/polymarket-data-pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Keep exit status across timer restarts so failed runs surface in journalctl
+RemainAfterExit=no
+
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/polymarket
+
+EnvironmentFile=/opt/polymarket/.env
+
+ExecStart=/opt/polymarket/.venv/bin/python -m polymarket_pipeline \
+    --historical-only \
+    --upload \
+    --data-dir /mnt/data/polymarket \
+    --log-file /var/log/polymarket/historical.log
+
+TimeoutStartSec=3600
