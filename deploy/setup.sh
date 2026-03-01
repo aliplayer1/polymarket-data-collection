@@ -51,18 +51,22 @@ if ! id "$SERVICE_USER" &>/dev/null; then
     useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
 fi
 
-# ── 3. Directories ────────────────────────────────────────────────────────────
-mkdir -p "$APP_DIR" "$DATA_DIR" "$LOG_DIR"
-chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR" "$DATA_DIR" "$LOG_DIR"
+# ── 3. Directories (data + log only; app dir is created by git clone) ─────────
+mkdir -p "$DATA_DIR" "$LOG_DIR"
+chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" "$LOG_DIR"
 
 # ── 4. Clone or update code from GitHub ───────────────────────────────────────
 if [ -d "$APP_DIR/.git" ]; then
     echo "Updating existing repository..."
     sudo -u "$SERVICE_USER" git -C "$APP_DIR" pull --ff-only
 else
+    # Remove the directory if it exists but isn't a git repo (e.g. from a
+    # failed previous run), then clone fresh.
+    rm -rf "$APP_DIR"
     echo "Cloning repository..."
     sudo -u "$SERVICE_USER" git clone "$REPO_URL" "$APP_DIR"
 fi
+chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
 
 # ── 5. Install .env (copied from local machine before running this script) ────
 ENV_FILE="$APP_DIR/.env"
