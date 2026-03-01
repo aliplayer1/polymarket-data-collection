@@ -129,6 +129,7 @@ def main() -> None:
     polygonscan_key = args.polygonscan_key  or os.environ.get("POLYGONSCAN_API_KEY")
     data_dir        = args.data_dir         or os.environ.get("POLYMARKET_DATA_DIR")
     log_file        = args.log_file         or os.environ.get("POLYMARKET_LOG_FILE")
+    hf_repo         = args.hf_repo         or os.environ.get("HF_REPO_ID")
 
     logger = configure_logging(log_file)
     try:
@@ -144,7 +145,7 @@ def main() -> None:
             timeframes=args.timeframe,
             test_limit=args.test,
             upload=args.upload,
-            hf_repo=args.hf_repo,
+            hf_repo=hf_repo,
             data_dir=data_dir,
             from_date=args.from_date,
         )
