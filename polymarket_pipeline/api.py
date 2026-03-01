@@ -179,25 +179,25 @@ class PolymarketApi:
             if not page:
                 break
 
-            # Track the maximum end_ts across all raw markets on this page.
-            # Pages are sorted by closedTime DESC, so if the newest market on
-            # the page is older than our cutoff, every subsequent page will be
+            # Track the maximum closedTime across all raw markets on this page.
+            # Pages are sorted by closedTime DESC, so when the newest closedTime
+            # on a page falls below our cutoff, every subsequent page will be
             # even older and we can stop the entire scan here.
-            page_max_end_ts = 0
+            # We use closedTime (not endDate) because endDate can be a far-future
+            # scheduled resolution date that would prevent the cutoff from triggering.
+            page_max_closed_ts = 0
             for raw_market in page:
-                raw_end = parse_iso_timestamp(
-                    raw_market.get("end_date") or raw_market.get("endDate")
-                )
-                if raw_end is not None and raw_end > page_max_end_ts:
-                    page_max_end_ts = raw_end
+                raw_closed = parse_iso_timestamp(raw_market.get("closedTime"))
+                if raw_closed is not None and raw_closed > page_max_closed_ts:
+                    page_max_closed_ts = raw_closed
                 parsed = self._normalize_market(raw_market, is_active=active)
                 if parsed:
                     yield parsed
 
-            if end_ts_min is not None and page_max_end_ts > 0 and page_max_end_ts < end_ts_min:
+            if end_ts_min is not None and page_max_closed_ts > 0 and page_max_closed_ts < end_ts_min:
                 self.logger.info(
-                    "Scan cutoff reached (page max end_ts %s < cutoff %s); stopping early.",
-                    page_max_end_ts, end_ts_min,
+                    "Scan cutoff reached (page max closedTime %s < cutoff %s); stopping early.",
+                    page_max_closed_ts, end_ts_min,
                 )
                 return
 
