@@ -745,6 +745,24 @@ class PolymarketDataPipeline:
             else:
                 self.logger.info("No markets matched for tick backfill.")
 
+        # Upload to Hugging Face Hub after historical phase, before WebSocket.
+        # Must happen here — the WebSocket loop below never exits, so any code
+        # placed after it would never run.
+        if upload and is_test:
+            self.logger.warning(
+                "--upload is ignored in test mode (test data is never pushed to Hugging Face). "
+                "Re-run without --test to upload production data."
+            )
+        elif upload:
+            self.logger.info("Uploading dataset to Hugging Face Hub...")
+            upload_to_huggingface(
+                repo_id=hf_repo,
+                markets_path=self._parquet_markets_path,
+                prices_dir=self._parquet_prices_dir,
+                ticks_dir=self._parquet_ticks_dir,
+                logger=self.logger,
+            )
+
         if is_test:
             self._print_test_report()
         elif historical_only:
@@ -760,19 +778,3 @@ class PolymarketDataPipeline:
         else:
             self.logger.info("No active markets matched the filters for real-time monitoring")
             self.print_summary()
-
-        # Upload to Hugging Face Hub if requested (not in test mode)
-        if upload and is_test:
-            self.logger.warning(
-                "--upload is ignored in test mode (test data is never pushed to Hugging Face). "
-                "Re-run without --test to upload production data."
-            )
-        elif upload:
-            self.logger.info("Uploading dataset to Hugging Face Hub...")
-            upload_to_huggingface(
-                repo_id=hf_repo,
-                markets_path=self._parquet_markets_path,
-                prices_dir=self._parquet_prices_dir,
-                ticks_dir=self._parquet_ticks_dir,
-                logger=self.logger,
-            )
