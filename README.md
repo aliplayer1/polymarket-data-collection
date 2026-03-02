@@ -42,7 +42,7 @@ Modular pipeline for collecting historical and real-time Polymarket crypto up/do
 
 ```bash
 # Check service status
-ssh hetzner-root 'systemctl status polymarket-live polymarket-historical.timer'
+ssh hetzner-root 'systemctl status polymarket-live polymarket-historical.timer polymarket-restart.timer'
 
 # Follow live logs
 ssh hetzner-root 'journalctl -fu polymarket-live'
@@ -60,6 +60,12 @@ ssh hetzner-root 'git -C /opt/polymarket pull && systemctl restart polymarket-li
 # Restart services manually
 ssh hetzner-root 'systemctl restart polymarket-live'
 ssh hetzner-root 'systemctl restart polymarket-historical.timer'
+
+# Check when the daily restart timer will next fire
+ssh hetzner-root 'systemctl list-timers polymarket-restart.timer'
+
+# Run tick backfill (first full run — no auto-stop)
+ssh hetzner-root 'cd /opt/polymarket && .venv/bin/python scripts/tick_backfill.py --stop-after 0'
 ```
 
 ## Quick Reference
@@ -83,6 +89,13 @@ cp .env.example .env   # then fill in your keys
 
 # Limit initial backfill to the last 12 months (faster first run)
 .venv/bin/python -m polymarket_pipeline --historical-only --from-date 2025-02-28
+
+# Standalone historical on-chain tick backfill (safe to run alongside the live service)
+# First full run — scans everything since 2025-01-01, no auto-stop
+.venv/bin/python scripts/tick_backfill.py --stop-after 0
+
+# Incremental re-run — stops after 50 consecutive already-covered markets
+.venv/bin/python scripts/tick_backfill.py
 
 # Write to a specific directory and log to file
 .venv/bin/python -m polymarket_pipeline \
@@ -116,10 +129,13 @@ cp .env.example .env   # then fill in your keys
 | `polymarket_pipeline/pipeline.py` | Historical + WebSocket ingestion orchestration |
 | `polymarket_pipeline/cli.py` | CLI argument parsing and logging setup |
 | `polymarket_pipeline/__main__.py` | Module runner (`python -m polymarket_pipeline`) |
+| `scripts/tick_backfill.py` | Standalone historical on-chain tick backfill (safe to run in parallel with the live service) |
 | `deploy/setup.sh` | One-shot server provisioner (Ubuntu 22.04/24.04) |
 | `deploy/polymarket-live.service` | systemd unit — continuous WebSocket stream |
 | `deploy/polymarket-historical.service` | systemd unit — historical fetch (one-shot) |
 | `deploy/polymarket-historical.timer` | systemd timer — triggers historical fetch every 6 h |
+| `deploy/polymarket-restart.service` | systemd oneshot unit — restarts the live service |
+| `deploy/polymarket-restart.timer` | systemd timer — restarts the live service daily at 00:05 UTC to discover newly-created markets |
 
 ## Setup
 
@@ -224,7 +240,8 @@ The `deploy/` directory contains everything needed to run the pipeline continuou
 ```text
 Hetzner CAX21 (4 vCPU ARM64 / 8 GB RAM / 80 GB SSD)
   ├── polymarket-live.service      → 24/7 WebSocket stream, auto-restart
-  └── polymarket-historical.timer  → incremental historical re-fetch every 6 h + HF upload
+  ├── polymarket-historical.timer  → incremental historical re-fetch every 6 h + HF upload
+  └── polymarket-restart.timer     → restarts live service daily at 00:05 UTC (new market discovery)
 
   /opt/polymarket/          ← app code (cloned from GitHub)
   /opt/polymarket/data/     ← Parquet data storage
@@ -285,7 +302,10 @@ ssh hetzner-root 'git -C /opt/polymarket pull && \
   cp /opt/polymarket/deploy/polymarket-live.service /etc/systemd/system/ && \
   cp /opt/polymarket/deploy/polymarket-historical.service /etc/systemd/system/ && \
   cp /opt/polymarket/deploy/polymarket-historical.timer /etc/systemd/system/ && \
+  cp /opt/polymarket/deploy/polymarket-restart.service /etc/systemd/system/ && \
+  cp /opt/polymarket/deploy/polymarket-restart.timer /etc/systemd/system/ && \
   systemctl daemon-reload && \
+  systemctl enable --now polymarket-restart.timer && \
   systemctl restart polymarket-live'
 ```
 
@@ -310,7 +330,20 @@ Every Polymarket trade fill is settled on Polygon PoS as an `OrderFilled` event 
 - Fill price (USDC / outcome token)
 - Notional size (USDC)
 
-The backfill runs automatically after the historical price collection completes, provided `POLYGONSCAN_API_KEY` (or `--polygonscan-key`) is set. Rate limiting is respected: requests are throttled to **~2.5 req/s** (below the Etherscan V2 free plan limit of 3 req/s). If the Etherscan V2 endpoint fails (e.g. rate-limit spikes), the pipeline automatically retries via the native Polygonscan API before falling back to direct JSON-RPC.
+Historical tick backfill is performed by the **standalone `scripts/tick_backfill.py`** script. It is safe to run in parallel with the live service (it only writes to `ticks/` and never touches `prices/` or `markets.parquet`). Rate limiting is respected: requests are throttled to **~2.5 req/s** (below the Etherscan V2 free plan limit of 3 req/s). If the Etherscan V2 endpoint fails (e.g. rate-limit spikes), the pipeline automatically falls back to direct JSON-RPC.
+
+```bash
+# First full backfill (reads credentials from .env automatically)
+.venv/bin/python scripts/tick_backfill.py --stop-after 0
+
+# Incremental re-run — stops after 50 consecutive already-covered markets
+.venv/bin/python scripts/tick_backfill.py
+
+# Restrict scan to a specific date range
+.venv/bin/python scripts/tick_backfill.py --from-date 2025-06-01
+```
+
+**Resume detection:** the script tracks consecutive already-covered markets and stops automatically once `--stop-after` (default: 50) are encountered in a row, making incremental re-runs fast — typically a few seconds to confirm the dataset is up to date.
 
 ### WebSocket Ticks (Live)
 
@@ -522,4 +555,6 @@ Active markets are monitored over a WebSocket connection (`ws-subscriptions-clob
 - **Atomic writes** — Parquet files are written to a `.tmp` path and then atomically renamed, preventing partial/corrupt files on crash.
 - **Partition-aware I/O** — On each write, only the affected `(crypto, timeframe)` Parquet partitions are loaded from disk for merging. Unrelated partitions are never read or overwritten.
 - **Price validation** — Out-of-range prices (outside [0, 1]) are filtered during fetch and logged as warnings.
-- **Incremental scan checkpoint** — After each completed closed-market scan, the pipeline writes `data/.scan_checkpoint` with the highest `end_ts` seen. On subsequent runs this is read automatically and the market scan stops as soon as it reaches pages older than `checkpoint − 2 days`. The initial full scan takes ~60 s; every 6-hourly run after that takes 2–5 s. Pass `--from-date YYYY-MM-DD` to override the cutoff manually.
+- **Incremental scan checkpoint** — After each completed closed-market scan, the pipeline writes `data/.scan_checkpoint` with the highest `end_ts` seen. On subsequent runs this is read automatically and the market scan stops as soon as it reaches pages older than `checkpoint − 2 days`. The initial full scan takes ~60 s; every 6-hourly run after that takes 2–5 s. Pass `--from-date YYYY-MM-DD` to override the cutoff manually. The checkpoint is saved incrementally every 500 markets so an interrupted scan retains partial progress.
+- **Non-fatal HF uploads** — Errors during Hugging Face Hub uploads are caught and logged as warnings rather than crashing the service, ensuring transient network or auth issues do not interrupt data collection.
+- **Daily market re-discovery** — The live WebSocket service subscribes to markets found at startup and does not re-scan while running. The `polymarket-restart.timer` restarts the service daily at 00:05 UTC so newly-created markets (typically ~30–50 per hour per asset) are picked up within 24 hours.
