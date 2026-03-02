@@ -348,15 +348,15 @@ class PolymarketDataPipeline:
             return
 
         token_to_market: dict[str, tuple[MarketRecord, str]] = {}
-        condition_ids: list[str] = []
+        token_ids: list[str] = []
         for market in active_markets:
-            if market.condition_id:
-                condition_ids.append(str(market.condition_id))
             token_to_market[market.up_token_id] = (market, "up")
             token_to_market[market.down_token_id] = (market, "down")
+            token_ids.append(market.up_token_id)
+            token_ids.append(market.down_token_id)
 
-        if not condition_ids:
-            self.logger.warning("No condition IDs available for active markets; skipping WebSocket stream")
+        if not token_ids:
+            self.logger.warning("No token IDs available for active markets; skipping WebSocket stream")
             return
 
         last_prices = self._initial_last_prices(active_markets)
@@ -369,8 +369,12 @@ class PolymarketDataPipeline:
         while True:
             try:
                 async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                    await ws.send(json.dumps({"action": "subscribe", "ids": condition_ids}))
-                    self.logger.info("Subscribed to %s active markets over WebSocket", len(condition_ids))
+                    await ws.send(json.dumps({
+                        "assets_ids": token_ids,
+                        "type": "market",
+                        "custom_feature_enabled": True,
+                    }))
+                    self.logger.info("Subscribed to %s active markets (%s tokens) over WebSocket", len(active_markets), len(token_ids))
                     reconnect_attempts = 0
 
                     while True:
@@ -379,10 +383,10 @@ class PolymarketDataPipeline:
                         events = payload if isinstance(payload, list) else [payload]
 
                         for event in events:
-                            if event.get("type") != "trade":
+                            if event.get("event_type") != "last_trade_price":
                                 continue
 
-                            token_id = str(event.get("token_id", ""))
+                            token_id = str(event.get("asset_id", ""))
                             if token_id not in token_to_market:
                                 continue
 
