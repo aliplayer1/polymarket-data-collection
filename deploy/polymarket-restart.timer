@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily restart of Polymarket Live service to discover new markets
+
+[Timer]
+# Every day at 00:05 UTC — a quiet time for crypto markets
+OnCalendar=*-*-* 00:05:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
