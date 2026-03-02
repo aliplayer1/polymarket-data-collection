@@ -136,9 +136,19 @@ class PolymarketDataPipeline:
         except Exception:
             return prediction_start
 
+    # Minimum fetch window (seconds) worth making an API call for.
+    # Windows shorter than this yield 0 rows from the CLOB API;
+    # skipping them avoids thousands of pointless HTTP round-trips
+    # during incremental re-scans of already-fetched markets.
+    _MIN_FETCH_WINDOW_SECONDS = 60
+
     def build_market_dataframe(self, market: MarketRecord) -> pd.DataFrame | None:
         start_ts = self._market_start_ts(market)
         if start_ts >= market.end_ts:
+            return None
+
+        # Skip tiny fetch windows — they return 0 rows and waste API calls
+        if (market.end_ts - start_ts) < self._MIN_FETCH_WINDOW_SECONDS:
             return None
 
         self.logger.info("Fetching price history for market %s (start_ts=%s, end_ts=%s)", market.market_id, start_ts, market.end_ts)
@@ -811,13 +821,17 @@ class PolymarketDataPipeline:
             )
         elif upload:
             self.logger.info("Uploading dataset to Hugging Face Hub...")
-            upload_to_huggingface(
-                repo_id=hf_repo,
-                markets_path=self._parquet_markets_path,
-                prices_dir=self._parquet_prices_dir,
-                ticks_dir=self._parquet_ticks_dir,
-                logger=self.logger,
-            )
+            try:
+                upload_to_huggingface(
+                    repo_id=hf_repo,
+                    markets_path=self._parquet_markets_path,
+                    prices_dir=self._parquet_prices_dir,
+                    ticks_dir=self._parquet_ticks_dir,
+                    logger=self.logger,
+                )
+            except Exception as exc:
+                self.logger.error("Hugging Face upload failed (non-fatal): %s", exc)
+                self.logger.info("Continuing to WebSocket streaming despite upload failure.")
 
         if is_test:
             self._print_test_report()
