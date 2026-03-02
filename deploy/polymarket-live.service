@@ -16,7 +16,9 @@ EnvironmentFile=/opt/polymarket/.env
 
 # Run full pipeline: quick incremental historical scan, then WebSocket stream.
 # --upload pushes data to Hugging Face after the historical phase completes.
-ExecStart=/opt/polymarket/.venv/bin/python -m polymarket_pipeline --upload
+ExecStart=/opt/polymarket/.venv/bin/python -m polymarket_pipeline \
+    --upload \
+    --from-date 2025-01-01
 
 # Restart on any failure; back off up to 30 s between attempts
 Restart=always
