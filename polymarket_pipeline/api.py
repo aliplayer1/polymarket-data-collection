@@ -149,7 +149,7 @@ class PolymarketApi:
         offset = 0
 
         while True:
-            order_field = "closed_time" if closed else "volume_24hr"
+            order_field = "closedTime" if closed else "volume24hr"
             params: dict[str, Any] = {
                 "limit": PAGE_SIZE,
                 "offset": offset,
@@ -167,8 +167,7 @@ class PolymarketApi:
             try:
                 page = self._request_json(f"{GAMMA_API}/markets", params=params)
             except Exception as exc:
-                error_text = str(exc).lower()
-                if "422" not in error_text or "order fields are not valid" not in error_text:
+                if "422" not in str(exc).lower():
                     raise
                 fallback_params = dict(params)
                 fallback_params.pop("order", None)
