@@ -9,6 +9,19 @@ Data is split into three tables:
 
 Prices and ticks are Hive-partitioned on disk as  {table}/crypto=X/timeframe=Y/*.parquet
 and stored with Zstandard compression + optimised dtypes.
+
+Concurrency model
+-----------------
+Both `persist_normalized` and `persist_ticks` may be called from multiple threads
+(e.g. `run_in_executor` flush coroutine) **and** from a separate OS process
+(e.g. `polymarket-historical.service` running alongside `polymarket-websocket.service`).
+
+Protection is two-layered:
+  1. `threading.Lock` per canonical data-root — prevents races within one process.
+  2. `fcntl.flock(LOCK_EX)` on a `.write.lock` sentinel file — prevents races across
+     processes on the same host.  On non-Unix platforms (no `fcntl`) the file lock
+     degrades to a no-op; the thread lock alone is still sufficient for in-process
+     safety.
 """
 
 from __future__ import annotations
@@ -16,6 +29,8 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import threading
+from contextlib import contextmanager
 from typing import Any
 
 import pandas as pd
@@ -34,6 +49,54 @@ from .config import (
     PARQUET_TEST_TICKS_DIR,
     TIME_FRAMES,
 )
+
+# ---------------------------------------------------------------------------
+# Cross-process file locking (fcntl, Unix only)
+# ---------------------------------------------------------------------------
+
+try:
+    import fcntl as _fcntl
+    _HAVE_FCNTL = True
+except ImportError:
+    _HAVE_FCNTL = False  # Windows / non-Unix: thread lock still protects in-process
+
+
+# Per canonical-path threading locks (in-process thread safety)
+_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_WRITE_LOCKS_REGISTRY_LOCK = threading.Lock()
+
+
+def _get_thread_lock(canonical_root: str) -> threading.Lock:
+    with _WRITE_LOCKS_REGISTRY_LOCK:
+        if canonical_root not in _WRITE_LOCKS:
+            _WRITE_LOCKS[canonical_root] = threading.Lock()
+        return _WRITE_LOCKS[canonical_root]
+
+
+@contextmanager
+def _write_lock(data_root: str):
+    """Exclusive write lock for a Parquet data root directory.
+
+    Acquires both a threading.Lock (in-process) and an fcntl file lock
+    (cross-process) before yielding, so the caller can safely execute the
+    full read → merge → write cycle without racing another thread or process.
+    """
+    canonical = os.path.abspath(data_root)
+    thread_lock = _get_thread_lock(canonical)
+    lock_path = os.path.join(canonical, ".write.lock")
+    os.makedirs(canonical, exist_ok=True)
+
+    with thread_lock:
+        fd = open(lock_path, "w")
+        try:
+            if _HAVE_FCNTL:
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+            yield
+        finally:
+            if _HAVE_FCNTL:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            fd.close()
+
 
 # ---------------------------------------------------------------------------
 # Arrow schemas (enforced on every write)
@@ -213,9 +276,21 @@ def load_ticks(ticks_dir: str | None = None, filters: list | None = None) -> pd.
 def load_ticks_for_market(
     market_id: str,
     ticks_dir: str | None = None,
+    *,
+    crypto: str | None = None,
+    timeframe: str | None = None,
 ) -> pd.DataFrame:
-    """Load all ticks for a specific market_id."""
-    df = load_ticks(ticks_dir)
+    """Load all ticks for a specific market_id.
+
+    Pass *crypto* and *timeframe* to restrict the scan to the single Hive
+    partition that contains this market, avoiding a full-table scan.
+    """
+    filters: list = []
+    if crypto:
+        filters.append(("crypto", "=", crypto))
+    if timeframe:
+        filters.append(("timeframe", "=", timeframe))
+    df = load_ticks(ticks_dir, filters=filters if filters else None)
     if df.empty:
         return df
     return df[df["market_id"] == market_id].sort_values("timestamp_ms").reset_index(drop=True)
@@ -229,8 +304,12 @@ def persist_ticks(
 ) -> None:
     """Merge new tick rows with existing ticks on disk and write Parquet.
 
-    Deduplicates on (market_id, timestamp_ms, token_id, tx_hash).
+    Deduplicates on (market_id, timestamp_ms, token_id, tx_hash, log_index).
     Partitioned by crypto / timeframe.
+
+    The entire read → merge → write cycle is protected by an exclusive write
+    lock (threading + fcntl) so concurrent callers — whether from
+    ``run_in_executor`` threads or a separate OS process — cannot interleave.
     """
     if ticks_df.empty:
         return
@@ -255,38 +334,41 @@ def persist_ticks(
             ticks_df = ticks_df.copy()
             ticks_df[col] = ticks_df[col].astype(str)
 
-    if "crypto" in ticks_df.columns and "timeframe" in ticks_df.columns:
-        partition_pairs = list(ticks_df.groupby(["crypto", "timeframe"], sort=False).groups.keys())
-        partition_filters = [[("crypto", "=", str(c)), ("timeframe", "=", str(t))] for c, t in partition_pairs]
-        existing = load_ticks(t_dir, filters=partition_filters)
-    else:
-        existing = load_ticks(t_dir)
+    data_root = os.path.dirname(os.path.abspath(t_dir))
+    with _write_lock(data_root):
+        if "crypto" in ticks_df.columns and "timeframe" in ticks_df.columns:
+            partition_pairs = list(ticks_df.groupby(["crypto", "timeframe"], sort=False).groups.keys())
+            partition_filters = [[("crypto", "=", str(c)), ("timeframe", "=", str(t))] for c, t in partition_pairs]
+            existing = load_ticks(t_dir, filters=partition_filters)
+        else:
+            existing = load_ticks(t_dir)
 
-    # Flatten category columns before concat
-    for col in ("outcome", "side", "source", "crypto", "timeframe"):
-        if col in existing.columns and hasattr(existing[col], "cat"):
-            existing[col] = existing[col].astype(str)
+        # Flatten category columns before concat
+        for col in ("outcome", "side", "source", "crypto", "timeframe"):
+            if col in existing.columns and hasattr(existing[col], "cat"):
+                existing[col] = existing[col].astype(str)
 
-    merged = (
-        pd.concat([existing, ticks_df], ignore_index=True)
-        .drop_duplicates(subset=["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"], keep="last")
-        .sort_values(["market_id", "timestamp_ms"])
-        .reset_index(drop=True)
-    )
-    merged = optimise_ticks_df(merged)
-    table = pa.Table.from_pandas(merged, preserve_index=False)
-    _write_partitioned_atomic(table, t_dir, partition_cols=["crypto", "timeframe"])
-    log.info("Ticks table written: %s/ (%s rows)", t_dir, len(merged))
+        merged = (
+            pd.concat([existing, ticks_df], ignore_index=True)
+            .drop_duplicates(subset=["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"], keep="last")
+            .sort_values(["market_id", "timestamp_ms"])
+            .reset_index(drop=True)
+        )
+        merged = optimise_ticks_df(merged)
+        table = pa.Table.from_pandas(merged, preserve_index=False)
+        _write_partitioned_atomic(table, t_dir, partition_cols=["crypto", "timeframe"])
+        log.info("Ticks table written: %s/ (%s rows)", t_dir, len(merged))
 
 
 # ---------------------------------------------------------------------------
-# Write helpers  (atomic: write to .tmp dir then rename)
+# Write helpers  (atomic: write to per-PID .tmp dir then rename)
 # ---------------------------------------------------------------------------
 
 def _write_parquet_atomic(table: pa.Table, path: str) -> None:
-    """Atomically write a single Parquet file."""
+    """Atomically write a single Parquet file using a per-PID temp path."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp_path = path + ".tmp"
+    # Per-PID suffix prevents concurrent processes from colliding on the same tmp path.
+    tmp_path = f"{path}.{os.getpid()}.tmp"
     try:
         pq.write_table(table, tmp_path, compression="zstd")
         os.replace(tmp_path, path)
@@ -297,8 +379,16 @@ def _write_parquet_atomic(table: pa.Table, path: str) -> None:
 
 
 def _write_partitioned_atomic(table: pa.Table, root_dir: str, partition_cols: list[str]) -> None:
-    """Atomically write a Hive-partitioned Parquet dataset."""
-    tmp_dir = root_dir + ".tmp"
+    """Atomically write a Hive-partitioned Parquet dataset using a per-PID temp dir.
+
+    Each process uses a unique ``<root>.tmp.<pid>`` directory so that a
+    concurrent process running ``_write_partitioned_atomic`` on the same
+    *root_dir* cannot accidentally delete or overwrite the in-flight data.
+    The outer ``_write_lock`` still serialises the full read→merge→write
+    cycle; the per-PID tmp is defence-in-depth against any unforeseen
+    path where the lock is not held.
+    """
+    tmp_dir = f"{root_dir}.tmp.{os.getpid()}"
     try:
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir)
@@ -340,68 +430,83 @@ def persist_normalized(
     markets_path: str | None = None,
     prices_dir: str | None = None,
     logger: logging.Logger | None = None,
+    skip_markets: bool = False,
 ) -> None:
     """Merge new data with existing data on disk and write Parquet.
 
-    - Markets: merge on market_id (keep latest).
+    - Markets: merge on market_id (keep latest).  Skipped when *skip_markets*
+      is True (used by the WebSocket flush path where market metadata is
+      already up-to-date from the startup historical scan, saving an
+      unnecessary read+write on every 5-second flush cycle).
     - Prices: merge on (market_id, timestamp) (deduplicate).
+
     Both written with Zstd compression and optimised dtypes.
+
+    The entire read → merge → write cycle is protected by an exclusive write
+    lock (threading + fcntl) so concurrent callers — whether from
+    ``run_in_executor`` threads or a separate OS process — cannot interleave.
     """
     log = logger or logging.getLogger("polymarket_pipeline")
     m_path = markets_path or PARQUET_MARKETS_PATH
     p_dir = prices_dir or PARQUET_PRICES_DIR
 
-    # --- Markets ---
-    existing_markets = load_markets(m_path)
-    # Flatten category columns to plain strings so pd.concat doesn't choke on
-    # dtype mismatches between data read from Parquet and new incoming data.
-    for col in ("crypto", "timeframe"):
-        if col in existing_markets.columns and hasattr(existing_markets[col], "cat"):
-            existing_markets[col] = existing_markets[col].astype(str)
-        if col in markets_df.columns and hasattr(markets_df[col], "cat"):
-            markets_df = markets_df.copy()
-            markets_df[col] = markets_df[col].astype(str)
-    if not markets_df.empty:
-        merged_markets = (
-            pd.concat([existing_markets, markets_df], ignore_index=True)
-            .drop_duplicates(subset=["market_id"], keep="last")
-            .reset_index(drop=True)
-        )
-    else:
-        merged_markets = existing_markets
+    # Derive the data root (parent directory of markets.parquet) to use as the
+    # canonical lock key, so markets and prices always share the same lock.
+    data_root = os.path.dirname(os.path.abspath(m_path))
 
-    merged_markets = optimise_markets_df(merged_markets)
-    table_m = pa.Table.from_pandas(merged_markets, schema=MARKETS_SCHEMA, preserve_index=False)
-    _write_parquet_atomic(table_m, m_path)
-    log.info("Markets table written: %s (%s rows)", m_path, len(merged_markets))
+    with _write_lock(data_root):
+        # --- Markets ---
+        if not skip_markets:
+            existing_markets = load_markets(m_path)
+            # Flatten category columns to plain strings so pd.concat doesn't choke on
+            # dtype mismatches between data read from Parquet and new incoming data.
+            for col in ("crypto", "timeframe"):
+                if col in existing_markets.columns and hasattr(existing_markets[col], "cat"):
+                    existing_markets[col] = existing_markets[col].astype(str)
+                if col in markets_df.columns and hasattr(markets_df[col], "cat"):
+                    markets_df = markets_df.copy()
+                    markets_df[col] = markets_df[col].astype(str)
+            if not markets_df.empty:
+                merged_markets = (
+                    pd.concat([existing_markets, markets_df], ignore_index=True)
+                    .drop_duplicates(subset=["market_id"], keep="last")
+                    .reset_index(drop=True)
+                )
+            else:
+                merged_markets = existing_markets
 
-    # --- Prices (partitioned) ---
-    # Load only the (crypto, timeframe) partitions present in the new data to
-    # avoid reading the entire prices dataset when updating a small subset.
-    if not prices_df.empty:
-        # Flatten category columns to plain strings before operations.
-        for col in ("crypto", "timeframe"):
-            if col in prices_df.columns and hasattr(prices_df[col], "cat"):
-                prices_df = prices_df.copy()
-                prices_df[col] = prices_df[col].astype(str)
+            merged_markets = optimise_markets_df(merged_markets)
+            table_m = pa.Table.from_pandas(merged_markets, schema=MARKETS_SCHEMA, preserve_index=False)
+            _write_parquet_atomic(table_m, m_path)
+            log.info("Markets table written: %s (%s rows)", m_path, len(merged_markets))
 
-        partition_pairs = list(prices_df.groupby(["crypto", "timeframe"], sort=False).groups.keys())
-        partition_filters = [[("crypto", "=", str(c)), ("timeframe", "=", str(t))] for c, t in partition_pairs]
-        existing_prices = load_prices(p_dir, filters=partition_filters)
-        for col in ("crypto", "timeframe"):
-            if col in existing_prices.columns and hasattr(existing_prices[col], "cat"):
-                existing_prices[col] = existing_prices[col].astype(str)
+        # --- Prices (partitioned) ---
+        # Load only the (crypto, timeframe) partitions present in the new data to
+        # avoid reading the entire prices dataset when updating a small subset.
+        if not prices_df.empty:
+            # Flatten category columns to plain strings before operations.
+            for col in ("crypto", "timeframe"):
+                if col in prices_df.columns and hasattr(prices_df[col], "cat"):
+                    prices_df = prices_df.copy()
+                    prices_df[col] = prices_df[col].astype(str)
 
-        merged_prices = (
-            pd.concat([existing_prices, prices_df], ignore_index=True)
-            .drop_duplicates(subset=["market_id", "timestamp"], keep="last")
-            .sort_values(["market_id", "timestamp"])
-            .reset_index(drop=True)
-        )
-        merged_prices = optimise_prices_df(merged_prices)
-        table_p = pa.Table.from_pandas(merged_prices, preserve_index=False)
-        _write_partitioned_atomic(table_p, p_dir, partition_cols=["crypto", "timeframe"])
-        log.info("Prices table written: %s/ (%s rows)", p_dir, len(merged_prices))
+            partition_pairs = list(prices_df.groupby(["crypto", "timeframe"], sort=False).groups.keys())
+            partition_filters = [[("crypto", "=", str(c)), ("timeframe", "=", str(t))] for c, t in partition_pairs]
+            existing_prices = load_prices(p_dir, filters=partition_filters)
+            for col in ("crypto", "timeframe"):
+                if col in existing_prices.columns and hasattr(existing_prices[col], "cat"):
+                    existing_prices[col] = existing_prices[col].astype(str)
+
+            merged_prices = (
+                pd.concat([existing_prices, prices_df], ignore_index=True)
+                .drop_duplicates(subset=["market_id", "timestamp"], keep="last")
+                .sort_values(["market_id", "timestamp"])
+                .reset_index(drop=True)
+            )
+            merged_prices = optimise_prices_df(merged_prices)
+            table_p = pa.Table.from_pandas(merged_prices, preserve_index=False)
+            _write_partitioned_atomic(table_p, p_dir, partition_cols=["crypto", "timeframe"])
+            log.info("Prices table written: %s/ (%s rows)", p_dir, len(merged_prices))
 
 
 # ---------------------------------------------------------------------------
