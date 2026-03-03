@@ -38,6 +38,7 @@ from .config import (
 from .models import MarketRecord
 from .retry import api_call_with_retry
 from .storage import (
+    append_ws_ticks_staged,
     load_markets,
     load_prices,
     load_prices_for_timeframe,
@@ -423,7 +424,9 @@ class PolymarketDataPipeline:
             all_ticks.extend(rows)
         if all_ticks:
             ticks_df = pd.DataFrame(all_ticks)
-            persist_ticks(ticks_df, ticks_dir=self._parquet_ticks_dir, logger=self.logger)
+            # Use the staging writer — never reads the main consolidated partition.
+            # The next --historical-only pass absorbs the staging file via persist_ticks().
+            append_ws_ticks_staged(ticks_df, ticks_dir=self._parquet_ticks_dir, logger=self.logger)
 
         return flushed_rows
 
