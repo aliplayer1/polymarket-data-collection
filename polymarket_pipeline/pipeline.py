@@ -414,7 +414,7 @@ class PolymarketDataPipeline:
         reconnect_attempts = 0
         while True:
             try:
-                async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, max_size=None) as ws:
                     await ws.send(json.dumps({
                         "assets_ids": shard_token_ids,
                         "type": "market",
