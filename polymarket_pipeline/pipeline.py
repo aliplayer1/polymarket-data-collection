@@ -31,6 +31,7 @@ from .config import (
     TIMEFRAME_SECONDS,
     WS_FLUSH_BATCH_SIZE,
     WS_FLUSH_INTERVAL_SECONDS,
+    WS_MAX_TOKENS_PER_SHARD,
     WS_URL,
 )
 from .models import MarketRecord
@@ -394,38 +395,35 @@ class PolymarketDataPipeline:
 
         return flushed_rows
 
-    async def run_websocket(self, active_markets: list[MarketRecord]) -> None:
-        if not active_markets:
-            return
+    async def _run_ws_shard(
+        self,
+        shard_token_ids: list[str],
+        shard_idx: int,
+        n_shards: int,
+        token_to_market: dict[str, tuple[MarketRecord, str]],
+        last_prices: dict[str, dict[str, float]],
+        ws_buffer: dict[str, list[dict[str, Any]]],
+        tick_buffer: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """Run one WebSocket connection for a slice of token IDs.
 
-        token_to_market: dict[str, tuple[MarketRecord, str]] = {}
-        token_ids: list[str] = []
-        for market in active_markets:
-            token_to_market[market.up_token_id] = (market, "up")
-            token_to_market[market.down_token_id] = (market, "down")
-            token_ids.append(market.up_token_id)
-            token_ids.append(market.down_token_id)
-
-        if not token_ids:
-            self.logger.warning("No token IDs available for active markets; skipping WebSocket stream")
-            return
-
-        last_prices = self._initial_last_prices(active_markets)
-        ws_buffer: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        tick_buffer: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        pending_rows = 0
-        last_flush = time.time()
+        Reconnects on any error with exponential back-off.  Raises
+        CancelledError when the task is cancelled by run_websocket so the
+        caller can do a final flush.
+        """
         reconnect_attempts = 0
-
         while True:
             try:
                 async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                     await ws.send(json.dumps({
-                        "assets_ids": token_ids,
+                        "assets_ids": shard_token_ids,
                         "type": "market",
                         "custom_feature_enabled": True,
                     }))
-                    self.logger.info("Subscribed to %s active markets (%s tokens) over WebSocket", len(active_markets), len(token_ids))
+                    self.logger.info(
+                        "WS shard %d/%d: subscribed to %d tokens",
+                        shard_idx + 1, n_shards, len(shard_token_ids),
+                    )
                     reconnect_attempts = 0
 
                     while True:
@@ -451,16 +449,13 @@ class PolymarketDataPipeline:
                             if not (0.0 <= price <= 1.0):
                                 continue
 
-                            # Raw trade side from the event ("BUY" / "SELL")
                             trade_side = str(event.get("side") or event.get("type_side") or "").upper()
                             if trade_side not in ("BUY", "SELL"):
                                 trade_side = "BUY"
 
-                            # Size in shares; multiply by price to get USDC notional
                             size_shares = float(event.get("size") or event.get("amount") or 0)
                             size_usdc   = round(size_shares * price, 6) if size_shares > 0 else 0.0
 
-                            # --- Update coarse price feed ---
                             if market.market_id not in last_prices:
                                 last_prices[market.market_id] = {"up": 0.5, "down": 0.5}
                             last_prices[market.market_id][outcome_side] = price
@@ -479,7 +474,6 @@ class PolymarketDataPipeline:
                                 }
                             )
 
-                            # --- Tick-level record (full fill details) ---
                             outcome = "Up" if outcome_side == "up" else "Down"
                             tick_buffer[market.timeframe].append(
                                 {
@@ -493,36 +487,91 @@ class PolymarketDataPipeline:
                                     "price":        price,
                                     "size_usdc":    size_usdc,
                                     "tx_hash":      str(event.get("hash") or event.get("tx_hash") or ""),
-                                    "block_number": 0,          # not available from WS
-                                    "log_index":    0,          # not available from WS
+                                    "block_number": 0,
+                                    "log_index":    0,
                                     "source":       "websocket",
                                 }
                             )
-                            pending_rows += 1
 
-                        flush_due_to_size = pending_rows >= WS_FLUSH_BATCH_SIZE
-                        flush_due_to_time = (time.time() - last_flush) >= WS_FLUSH_INTERVAL_SECONDS
-                        if flush_due_to_size or flush_due_to_time:
-                            flushed = self._flush_ws_buffer(ws_buffer, tick_buffer)
-                            if flushed:
-                                self.logger.info("Flushed %s WebSocket ticks to disk", flushed)
-                            pending_rows = 0
-                            last_flush = time.time()
-
-            except KeyboardInterrupt:
-                flushed = self._flush_ws_buffer(ws_buffer, tick_buffer)
-                if flushed:
-                    self.logger.info("Final flush on shutdown: %s rows", flushed)
+            except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except Exception as exc:
                 reconnect_delay = min(10 * (2 ** reconnect_attempts), MAX_WS_RECONNECT_DELAY_SECONDS)
                 reconnect_attempts += 1
-                self.logger.warning("WebSocket disconnected: %s. Reconnecting in %ss...", exc, reconnect_delay)
-                flushed = self._flush_ws_buffer(ws_buffer, tick_buffer)
-                if flushed:
-                    self.logger.info("Flushed %s buffered rows before reconnect", flushed)
-                pending_rows = 0
+                self.logger.warning(
+                    "WS shard %d/%d disconnected: %s. Reconnecting in %ss...",
+                    shard_idx + 1, n_shards, exc, reconnect_delay,
+                )
                 await asyncio.sleep(reconnect_delay)
+
+    async def _ws_flush_loop(
+        self,
+        ws_buffer: dict[str, list[dict[str, Any]]],
+        tick_buffer: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """Periodically flush WebSocket buffers to Parquet."""
+        while True:
+            await asyncio.sleep(WS_FLUSH_INTERVAL_SECONDS)
+            flushed = self._flush_ws_buffer(ws_buffer, tick_buffer)
+            if flushed:
+                self.logger.info("Flushed %d WebSocket ticks to disk", flushed)
+
+    async def run_websocket(self, active_markets: list[MarketRecord]) -> None:
+        if not active_markets:
+            return
+
+        token_to_market: dict[str, tuple[MarketRecord, str]] = {}
+        token_ids: list[str] = []
+        for market in active_markets:
+            token_to_market[market.up_token_id] = (market, "up")
+            token_to_market[market.down_token_id] = (market, "down")
+            token_ids.append(market.up_token_id)
+            token_ids.append(market.down_token_id)
+
+        if not token_ids:
+            self.logger.warning("No token IDs available for active markets; skipping WebSocket stream")
+            return
+
+        last_prices = self._initial_last_prices(active_markets)
+        ws_buffer: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        tick_buffer: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+        # Split tokens into shards so each subscription message stays well
+        # below the ~200 KB threshold that causes Polymarket's server to drop
+        # connections every 30-90 s.  Each shard runs as an independent asyncio
+        # task with its own reconnect loop, so only 1/N shards go dark on any
+        # single disconnect rather than all tokens simultaneously.
+        shards = [
+            token_ids[i : i + WS_MAX_TOKENS_PER_SHARD]
+            for i in range(0, len(token_ids), WS_MAX_TOKENS_PER_SHARD)
+        ]
+        n_shards = len(shards)
+        self.logger.info(
+            "Starting WebSocket stream: %d active markets → %d tokens across %d shard(s) "
+            "(≤%d tokens/shard)",
+            len(active_markets), len(token_ids), n_shards, WS_MAX_TOKENS_PER_SHARD,
+        )
+
+        shard_tasks = [
+            asyncio.create_task(
+                self._run_ws_shard(shard, idx, n_shards, token_to_market, last_prices, ws_buffer, tick_buffer)
+            )
+            for idx, shard in enumerate(shards)
+        ]
+        flush_task = asyncio.create_task(self._ws_flush_loop(ws_buffer, tick_buffer))
+        all_tasks = [flush_task, *shard_tasks]
+
+        try:
+            await asyncio.gather(*all_tasks)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            for task in all_tasks:
+                task.cancel()
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+            flushed = self._flush_ws_buffer(ws_buffer, tick_buffer)
+            if flushed:
+                self.logger.info("Final flush on shutdown: %d rows", flushed)
 
     def print_summary(self) -> None:
         self.logger.info("=== FINAL DATASETS ===")
