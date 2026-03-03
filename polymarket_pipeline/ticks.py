@@ -74,6 +74,11 @@ class PolygonTickFetcher:
     # Minimum gap between any two Etherscan V2 API calls (3 req/s free plan)
     _ETHERSCAN_MIN_INTERVAL = 0.42   # slightly >1/3 s to stay safely below 3 req/s
 
+    # Minimum gap between eth_getLogs RPC calls on Alchemy free tier.
+    # eth_getLogs costs 75 CU; free tier budget is 330 CU/s → max 4.4 calls/s.
+    # 0.25 s gives 4 calls/s × 75 CU = 300 CU/s, leaving ~10% headroom.
+    _RPC_LOGS_MIN_INTERVAL = 0.25
+
     def __init__(
         self,
         rpc_url: str | None = None,
@@ -88,6 +93,7 @@ class PolygonTickFetcher:
         self._session = requests.Session()
         self._block_cache: dict[int, int] = {}  # ts → block number
         self._last_etherscan_ts: float = 0.0    # global rate-limit tracker
+        self._last_rpc_logs_ts: float = 0.0       # rate-limit tracker for eth_getLogs
 
     # ------------------------------------------------------------------
     # Public interface
@@ -255,6 +261,17 @@ class PolygonTickFetcher:
         if elapsed < self._ETHERSCAN_MIN_INTERVAL:
             time.sleep(self._ETHERSCAN_MIN_INTERVAL - elapsed)
         self._last_etherscan_ts = time.time()
+
+    def _rate_limit_rpc_logs(self) -> None:
+        """Block until at least _RPC_LOGS_MIN_INTERVAL seconds have passed since
+        the last eth_getLogs RPC call.  eth_getLogs is expensive on Alchemy
+        (75 CU each) so must be paced separately from cheap calls like
+        eth_getBlockByNumber (16 CU each).
+        """
+        elapsed = time.time() - self._last_rpc_logs_ts
+        if elapsed < self._RPC_LOGS_MIN_INTERVAL:
+            time.sleep(self._RPC_LOGS_MIN_INTERVAL - elapsed)
+        self._last_rpc_logs_ts = time.time()
 
     def _ts_to_block_polygonscan(self, target_ts: int) -> int | None:
         """Use the Etherscan V2 ``getblocknobytime`` endpoint to convert a Unix
@@ -448,6 +465,7 @@ class PolygonTickFetcher:
 
         while cur <= end_block:
             chunk_end = min(cur + chunk - 1, end_block)
+            self._rate_limit_rpc_logs()  # honour Alchemy CU budget before every call
             try:
                 logs = self._rpc("eth_getLogs", {
                     "fromBlock": hex(cur),
@@ -456,21 +474,20 @@ class PolygonTickFetcher:
                     "topics":    [ORDER_FILLED_TOPIC],
                 })
                 if logs is None:
-                    # All retries exhausted (e.g. Alchemy 503 rate limit).
-                    # Back off before the next chunk so the provider can recover.
+                    # All retries inside _rpc() exhausted (sustained 503).
+                    # Double the normal interval before the next chunk.
                     self.logger.warning(
                         "eth_getLogs returned no result for blocks %s–%s; "
-                        "backing off 15 s before continuing.",
+                        "backing off 30 s before continuing.",
                         cur, chunk_end,
                     )
-                    time.sleep(15)
+                    time.sleep(30)
                 elif logs:
                     all_logs.extend(logs)
             except Exception as exc:
                 self.logger.warning("eth_getLogs failed (blocks %s–%s): %s", cur, chunk_end, exc)
-                time.sleep(15)
+                time.sleep(30)
             cur = chunk_end + 1
-            time.sleep(0.05)  # gentle pacing: ~20 req/s, well within Alchemy free tier
 
         return all_logs
 
