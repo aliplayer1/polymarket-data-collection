@@ -561,6 +561,12 @@ class PolygonTickFetcher:
             else:
                 block_num = int(block_num)
 
+            log_idx = log.get("logIndex", "0x0")
+            if isinstance(log_idx, str) and log_idx.startswith("0x"):
+                log_idx_int = int(log_idx, 16)
+            else:
+                log_idx_int = int(log_idx)
+
             token_id = up_token if outcome == "Up" else down_token
 
             return {
@@ -575,6 +581,7 @@ class PolygonTickFetcher:
                 "size_usdc":     round(usdc_size, 6),
                 "tx_hash":       log.get("transactionHash", ""),
                 "block_number":  block_num,
+                "log_index":     log_idx_int,
             }
         except Exception as exc:
             self.logger.debug("Failed to decode log: %s  log=%s", exc, str(log)[:120])
