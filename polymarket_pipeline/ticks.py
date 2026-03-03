@@ -594,6 +594,38 @@ class PolygonTickFetcher:
                     json={"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)},
                     timeout=self.timeout,
                 )
+
+                # --- Rate-limit handling (429 / 503) ----------------------------
+                # Alchemy returns 429 for per-second CU overruns and 503 when the
+                # node is temporarily overloaded.  Both responses may carry a
+                # Retry-After header; if present we honour it exactly, otherwise
+                # we use exponential back-off with a longer base than for generic
+                # errors so that the rate limiter has time to refill.
+                if resp.status_code in (429, 503):
+                    retry_after_raw = resp.headers.get("Retry-After")
+                    try:
+                        wait = max(float(retry_after_raw), 1.0) if retry_after_raw else 2 ** attempt * 3
+                    except (TypeError, ValueError):
+                        wait = 2 ** attempt * 3
+                    if attempt < self._MAX_RETRIES:
+                        self.logger.warning(
+                            "RPC call %s rate-limited (HTTP %s, attempt %d/%d), "
+                            "retrying in %.1fs: %s",
+                            method, resp.status_code, attempt, self._MAX_RETRIES, wait,
+                            resp.text[:120],
+                        )
+                        # Reset the logs rate-limit clock so the next eth_getLogs
+                        # call doesn't fire immediately after the back-off expires.
+                        if method == "eth_getLogs":
+                            self._last_rpc_logs_ts = time.time() + wait
+                        time.sleep(wait)
+                        continue
+                    self.logger.warning(
+                        "RPC call %s failed after %d retries: HTTP %s",
+                        method, self._MAX_RETRIES, resp.status_code,
+                    )
+                    return None
+
                 resp.raise_for_status()
                 data = resp.json()
                 if "error" in data:
