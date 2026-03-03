@@ -104,9 +104,11 @@ sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/pip" install --upgrade pip wheel -q
 sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q
 
 # ── 7. systemd service files ──────────────────────────────────────────────────
-cp "$APP_DIR/deploy/polymarket-live.service"        /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-websocket.service"   /etc/systemd/system/
 cp "$APP_DIR/deploy/polymarket-historical.service"  /etc/systemd/system/
 cp "$APP_DIR/deploy/polymarket-historical.timer"    /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-restart.service"     /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-restart.timer"       /etc/systemd/system/
 systemctl daemon-reload
 
 # ── 8. Check credentials before proceeding ────────────────────────────────────
@@ -141,25 +143,29 @@ sudo -u "$SERVICE_USER" bash -c "
 "
 
 # ── 10. Enable and start continuous services ──────────────────────────────────
+systemctl enable --now polymarket-websocket.service
 systemctl enable --now polymarket-historical.timer
-systemctl enable --now polymarket-live.service
+systemctl enable --now polymarket-restart.timer
 
 echo ""
 echo "════════════════════════════════════════════════════════════════════"
 echo "  Setup complete!"
 echo ""
 echo "  Live WebSocket stream:"
-echo "    systemctl status polymarket-live"
-echo "    journalctl -fu polymarket-live"
+echo "    systemctl status polymarket-websocket"
+echo "    journalctl -fu polymarket-websocket"
 echo ""
 echo "  Historical sync (every 6 h) + HF upload:"
 echo "    systemctl status polymarket-historical.timer"
 echo "    journalctl -fu polymarket-historical"
+echo ""
+echo "  Daily WebSocket restart (market re-discovery at 00:05 UTC):"
+echo "    systemctl status polymarket-restart.timer"
 echo ""
 echo "  Data directory: $DATA_DIR"
 echo "  Log file:       $LOG_DIR/pipeline.log"
 echo ""
 echo "  To deploy a code update:"
 echo "    git push  (from your local machine)"
-echo "    ssh root@<server-ip> 'git -C $APP_DIR pull && systemctl restart polymarket-live'"
+echo "    ssh root@<server-ip> 'git -C $APP_DIR pull && systemctl restart polymarket-websocket'"
 echo "════════════════════════════════════════════════════════════════════"

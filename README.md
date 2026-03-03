@@ -53,6 +53,9 @@ cp .env.example .env   # then fill in your keys
 # Full pipeline (1. OHLC Scan -> 2. Tick Backfill -> 3. Hugging Face Upload -> 4. Live WebSocket)
 .venv/bin/python -m polymarket_pipeline --upload
 
+# WebSocket-only (skip historical scan and tick backfill; useful alongside a separate --historical-only process)
+.venv/bin/python -m polymarket_pipeline --websocket-only
+
 # Historical only (safe to re-run; incremental)
 .venv/bin/python -m polymarket_pipeline --historical-only
 
@@ -96,8 +99,9 @@ cp .env.example .env   # then fill in your keys
 | `polymarket_pipeline/__main__.py` | Module runner (`python -m polymarket_pipeline`) |
 | `scripts/tick_backfill.py` | Standalone historical tick backfill (Deprecated: handled natively by `pipeline.py`) |
 | `deploy/setup.sh` | One-shot server provisioner (Ubuntu 22.04/24.04) |
-| `deploy/polymarket-live.service` | systemd unit — continuous WebSocket stream |
-| `deploy/polymarket-historical.service` | systemd unit — historical fetch (one-shot) |
-| `deploy/polymarket-historical.timer` | systemd timer — triggers historical fetch every 6 h |
-| `deploy/polymarket-restart.service` | systemd oneshot unit — restarts the live service |
-| `deploy/polymarket-restart.timer` | systemd timer — restarts the live service daily at 00:05 UTC to discover newly-created markets |
+| `deploy/polymarket-websocket.service` | systemd unit — continuous `--websocket-only` stream |
+| `deploy/polymarket-historical.service` | systemd unit — `--historical-only --upload` one-shot fetch |
+| `deploy/polymarket-historical.timer` | systemd timer — triggers historical fetch + HF upload every 6 h |
+| `deploy/polymarket-restart.service` | systemd oneshot unit — restarts `polymarket-websocket.service` |
+| `deploy/polymarket-restart.timer` | systemd timer — restarts WebSocket service daily at 00:05 UTC to discover newly-created markets |
+| `deploy/polymarket-live.service` | **Legacy** — combined historical + WebSocket service (superseded by the split service pair above) |
