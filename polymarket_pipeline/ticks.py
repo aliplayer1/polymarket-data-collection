@@ -69,7 +69,7 @@ class PolygonTickFetcher:
 
     POLYGONSCAN_LOG_LIMIT = 1_000   # max results per Etherscan page
     POLYGONSCAN_BLOCK_CHUNK = 25    # blocks per getLogs query (CTF is very active)
-    RPC_LOG_CHUNK_BLOCKS  = 1_000   # block range per eth_getLogs call
+    RPC_LOG_CHUNK_BLOCKS  = 10      # block range per eth_getLogs call (Alchemy free tier limit)
 
     # Minimum gap between any two Etherscan V2 API calls (3 req/s free plan)
     _ETHERSCAN_MIN_INTERVAL = 0.42   # slightly >1/3 s to stay safely below 3 req/s
