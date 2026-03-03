@@ -225,8 +225,18 @@ class PolymarketDataPipeline:
 
         return merged_prices[["market_id", "crypto", "timeframe", "timestamp", "up_price", "down_price", "volume", "resolution", "question"]]
 
-    def persist_dataframe(self, timeframe: str, df: pd.DataFrame) -> pd.DataFrame:
-        """Persist a flat DataFrame to normalised Parquet (markets + prices)."""
+    def persist_dataframe(self, timeframe: str, df: pd.DataFrame, *, update_cache: bool = True) -> pd.DataFrame:
+        """Persist a flat DataFrame to normalised Parquet (markets + prices).
+
+        Parameters
+        ----------
+        update_cache:
+            When True (default) the in-memory ``existing_dfs`` cache is updated
+            so incremental fetch decisions stay current.  Pass False from the
+            WebSocket flush path — WebSocket streaming never calls
+            ``_market_start_ts()``, so the cache is dead weight that would grow
+            unboundedly with every 5-second flush.
+        """
         df = df.assign(market_id=lambda d: d["market_id"].astype(str))
         markets_df, prices_df = split_markets_prices(df)
         persist_normalized(
@@ -236,6 +246,9 @@ class PolymarketDataPipeline:
             prices_dir=self._parquet_prices_dir,
             logger=self.logger,
         )
+
+        if not update_cache:
+            return prices_df
 
         # Update in-memory cache for incremental fetch decisions
         existing = self.existing_dfs.get(timeframe, pd.DataFrame())
@@ -363,7 +376,9 @@ class PolymarketDataPipeline:
             if not rows:
                 continue
             new_df = pd.DataFrame(rows)
-            self.persist_dataframe(timeframe, new_df)
+            # update_cache=False: WebSocket never calls _market_start_ts() so
+            # keeping existing_dfs in sync is pointless and leaks memory.
+            self.persist_dataframe(timeframe, new_df, update_cache=False)
             flushed_rows += len(rows)
             buffer[timeframe] = []
 
@@ -652,7 +667,11 @@ class PolymarketDataPipeline:
             output_root = data_dir or PARQUET_DATA_DIR
             os.makedirs(output_root, exist_ok=True)
 
-        self.load_existing_data()
+        # In websocket-only mode skip loading historical price data — we only
+        # need last prices for the initial WS seed, which fall back to the CLOB
+        # API.  Loading the full history wastes hundreds of MB of RAM.
+        if not websocket_only:
+            self.load_existing_data()
 
         # Compute scan cutoff for incremental runs.
         # After a successful scan the checkpoint file holds the max end_ts
