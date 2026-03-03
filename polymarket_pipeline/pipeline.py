@@ -273,8 +273,15 @@ class PolymarketDataPipeline:
             win_start = max(m.start_ts, m.end_ts - window_s)
             windows[(win_start, m.end_ts)].append(m)
 
+        # Flush accumulated ticks to Parquet every this many windows.
+        # Batching amortises the expensive partition read-merge-dedup-write
+        # cycle: 1252 windows × 3 markets = 3 756 persist calls → ~63 calls.
+        _TICK_FLUSH_EVERY = 20
+
         total_ticks = 0
         n_windows = len(windows)
+        pending_ticks: list[dict] = []
+
         for i, ((win_start, win_end), window_markets) in enumerate(windows.items(), 1):
             self.logger.info(
                 "[%d/%d] Fetching on-chain ticks for window %s–%s (%s)",
@@ -289,19 +296,27 @@ class PolymarketDataPipeline:
                     ticks = batch.get(m.market_id, [])
                     if not ticks:
                         continue
-                    ticks_df = pd.DataFrame(ticks)
-                    ticks_df["source"] = "onchain"
-                    persist_ticks(
-                        ticks_df,
-                        ticks_dir=self._parquet_ticks_dir,
-                        logger=self.logger,
-                    )
+                    for t in ticks:
+                        t["source"] = "onchain"
+                    pending_ticks.extend(ticks)
                     total_ticks += len(ticks)
                     self.logger.info("  -> %s %s: %s fills", m.crypto, m.timeframe, len(ticks))
             except Exception as exc:
                 self.logger.error(
                     "Failed on-chain tick fetch for window %s–%s: %s", win_start, win_end, exc,
                 )
+
+            if pending_ticks and (i % _TICK_FLUSH_EVERY == 0 or i == n_windows):
+                ticks_df = pd.DataFrame(pending_ticks)
+                persist_ticks(
+                    ticks_df,
+                    ticks_dir=self._parquet_ticks_dir,
+                    logger=self.logger,
+                )
+                self.logger.info(
+                    "Flushed %d ticks to disk (window %d/%d)", len(pending_ticks), i, n_windows,
+                )
+                pending_ticks = []
 
         self.logger.info("On-chain tick backfill complete: %s total ticks across %s markets", total_ticks, len(markets))
         return total_ticks

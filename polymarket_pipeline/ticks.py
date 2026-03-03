@@ -69,7 +69,13 @@ class PolygonTickFetcher:
 
     POLYGONSCAN_LOG_LIMIT = 1_000   # max results per Etherscan page
     POLYGONSCAN_BLOCK_CHUNK = 25    # blocks per getLogs query (CTF is very active)
-    RPC_LOG_CHUNK_BLOCKS  = 500     # block range per eth_getLogs call (Alchemy supports up to 2000)
+    # eth_getLogs chunk size for the RPC path.
+    # Alchemy enforces a 10 000-result cap per call.  The CTF Exchange emits
+    # OrderFilled events for *all* Polymarket markets, so the aggregate rate is
+    # ~700–1 500 events/block.  25 blocks ≈ 17 000–37 500 events at peak, which
+    # can exceed the cap.  We use 15 blocks as a safe static default and halve
+    # adaptively when the node signals an overflow (see _fetch_logs_rpc).
+    RPC_LOG_CHUNK_BLOCKS  = 15
 
     # Minimum gap between any two Etherscan V2 API calls (3 req/s free plan)
     _ETHERSCAN_MIN_INTERVAL = 0.42   # slightly >1/3 s to stay safely below 3 req/s
@@ -331,13 +337,22 @@ class PolygonTickFetcher:
 
         self.logger.debug("Fetching logs for blocks %s–%s", start_block, end_block)
 
+        # Prefer RPC for log fetching: eth_getLogs returns all results in one
+        # call per chunk (no pagination protocol), so a 15-block chunk costs
+        # one 0.15 s rate-limited call vs. ~3 pages × 0.42 s on Polygonscan.
+        # Polygonscan is still used above for block-number lookups via
+        # _ts_to_block_polygonscan — those are cheap (one call, cached) and
+        # more reliable than the RPC binary-search fallback.
+        if self.rpc_url:
+            return self._fetch_logs_rpc(start_block, end_block)
+
         if self.polygonscan_key:
             logs = self._fetch_logs_polygonscan(start_block, end_block)
             if logs is not None:
                 return logs
-            self.logger.warning("Polygonscan failed; falling back to JSON-RPC")
 
-        return self._fetch_logs_rpc(start_block, end_block)
+        self.logger.error("No RPC URL or Polygonscan key configured; cannot fetch logs")
+        return []
 
     _MAX_RETRIES = 3
 
@@ -454,39 +469,61 @@ class PolygonTickFetcher:
         return all_logs
 
     def _fetch_logs_rpc(self, start_block: int, end_block: int) -> list[dict]:
-        """Fetch OrderFilled logs via eth_getLogs in chunked block ranges."""
+        """Fetch OrderFilled logs via eth_getLogs in chunked block ranges.
+
+        The chunk size starts at RPC_LOG_CHUNK_BLOCKS and halves automatically
+        when the node signals a result-count overflow (Alchemy -32005 /
+        "query returned more than 10 000 results").  This lets the static
+        default be conservative while gracefully handling peak-traffic blocks.
+        """
         if not self.rpc_url:
             self.logger.error("No RPC URL configured; cannot fetch on-chain ticks")
             return []
 
         all_logs: list[dict] = []
-        chunk = self.RPC_LOG_CHUNK_BLOCKS
         cur = start_block
 
         while cur <= end_block:
-            chunk_end = min(cur + chunk - 1, end_block)
-            self._rate_limit_rpc_logs()  # honour Alchemy CU budget before every call
-            try:
-                logs = self._rpc("eth_getLogs", {
-                    "fromBlock": hex(cur),
-                    "toBlock":   hex(chunk_end),
-                    "address":   CTF_EXCHANGE_ADDRESS,
-                    "topics":    [ORDER_FILLED_TOPIC],
-                })
+            chunk = self.RPC_LOG_CHUNK_BLOCKS
+            # Try with the current chunk size; halve on overflow, give up after
+            # 4 halvings (chunk shrinks to 1 block at minimum).
+            for _ in range(4):
+                chunk_end = min(cur + chunk - 1, end_block)
+                self._rate_limit_rpc_logs()
+                try:
+                    logs = self._rpc("eth_getLogs", {
+                        "fromBlock": hex(cur),
+                        "toBlock":   hex(chunk_end),
+                        "address":   CTF_EXCHANGE_ADDRESS,
+                        "topics":    [ORDER_FILLED_TOPIC],
+                    })
+                except Exception as exc:
+                    self.logger.warning("eth_getLogs failed (blocks %s–%s): %s", cur, chunk_end, exc)
+                    logs = None
+
                 if logs is None:
-                    # All retries inside _rpc() exhausted (sustained 503).
-                    # Double the normal interval before the next chunk.
+                    # _rpc() returns None for sustained 429/503 (already backed
+                    # off internally) OR for -32005 overflow.  Try a narrower
+                    # range before giving up.
+                    if chunk > 1:
+                        chunk = max(1, chunk // 2)
+                        self.logger.debug(
+                            "eth_getLogs overflow or error (blocks %s–%s); "
+                            "halving chunk to %d blocks and retrying.",
+                            cur, chunk_end, chunk,
+                        )
+                        continue
                     self.logger.warning(
-                        "eth_getLogs returned no result for blocks %s–%s; "
-                        "backing off 30 s before continuing.",
+                        "eth_getLogs still failing at chunk=1 (blocks %s–%s); skipping.",
                         cur, chunk_end,
                     )
-                    time.sleep(30)
-                elif logs:
+                    chunk_end = cur  # advance by 1 block to avoid infinite loop
+                    break
+
+                if logs:
                     all_logs.extend(logs)
-            except Exception as exc:
-                self.logger.warning("eth_getLogs failed (blocks %s–%s): %s", cur, chunk_end, exc)
-                time.sleep(30)
+                break  # success — advance to the next chunk
+
             cur = chunk_end + 1
 
         return all_logs
