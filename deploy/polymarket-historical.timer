@@ -1,6 +1,5 @@
 [Unit]
 Description=Run Polymarket historical fetch every 6 hours
-Requires=polymarket-historical.service
 
 [Timer]
 # First run 2 minutes after boot (give network time to stabilise)
