@@ -27,6 +27,15 @@ def main() -> None:
         help="Collect historical data only, up to but not including the current active market.",
     )
     parser.add_argument(
+        "--websocket-only",
+        action="store_true",
+        help=(
+            "Skip the historical scan and tick backfill phases entirely; "
+            "go straight to WebSocket streaming for currently-active markets. "
+            "Useful when a separate --historical-only process is already running."
+        ),
+    )
+    parser.add_argument(
         "--markets",
         nargs="+",
         help="List of specific market IDs to collect data for. If not provided, collects for all matching markets.",
@@ -140,6 +149,7 @@ def main() -> None:
         )
         pipeline.run(
             historical_only=args.historical_only,
+            websocket_only=args.websocket_only,
             market_ids=args.markets,
             cryptos=args.crypto,
             timeframes=args.timeframe,

@@ -617,6 +617,7 @@ class PolymarketDataPipeline:
     def run(
         self,
         historical_only: bool = False,
+        websocket_only: bool = False,
         market_ids: list[str] | None = None,
         cryptos: list[str] | None = None,
         timeframes: list[str] | None = None,
@@ -750,53 +751,57 @@ class PolymarketDataPipeline:
                     self.logger.info("Final flush for %s (%s total rows)", tf, len(merged))
                     pending_dfs[tf] = []
 
-        # 1. Process Closed Markets (Streamed)
-        self.logger.info("Fetching and processing closed markets...")
-        fetched_closed = 0
-        test_collected = 0
-        max_end_ts_seen = 0
+        # 1. Process Closed Markets (Streamed) — skipped in websocket-only mode
         closed_markets_for_ticks: list[MarketRecord] = []
-        relevant_batch: list[MarketRecord] = []
+        if websocket_only:
+            self.logger.info("WebSocket-only mode: skipping historical scan.")
+        else:
+            self.logger.info("Fetching and processing closed markets...")
+            fetched_closed = 0
+            test_collected = 0
+            max_end_ts_seen = 0
+            relevant_batch: list[MarketRecord] = []
 
-        for m in self.api.fetch_markets(closed=True, end_ts_min=scan_cutoff_ts if not is_test else None):
-            # In test mode, stop once we have enough markets
-            if is_test and test_collected >= test_limit:
-                self.logger.info("Test limit reached (%s markets). Stopping market scan.", test_limit)
-                break
+            for m in self.api.fetch_markets(closed=True, end_ts_min=scan_cutoff_ts if not is_test else None):
+                # In test mode, stop once we have enough markets
+                if is_test and test_collected >= test_limit:
+                    self.logger.info("Test limit reached (%s markets). Stopping market scan.", test_limit)
+                    break
 
-            fetched_closed += 1
-            if fetched_closed % 500 == 0:
-                self.logger.info("Scanned %d closed markets...", fetched_closed)
+                fetched_closed += 1
+                if fetched_closed % 500 == 0:
+                    self.logger.info("Scanned %d closed markets...", fetched_closed)
 
-            if m.end_ts > max_end_ts_seen:
-                max_end_ts_seen = m.end_ts
+                if m.end_ts > max_end_ts_seen:
+                    max_end_ts_seen = m.end_ts
 
-            # Save checkpoint periodically so progress survives SIGTERM.
-            if not is_test and fetched_closed % 500 == 0 and max_end_ts_seen > 0:
+                # Save checkpoint periodically so progress survives SIGTERM.
+                if not is_test and fetched_closed % 500 == 0 and max_end_ts_seen > 0:
+                    self._save_scan_checkpoint(max_end_ts_seen)
+
+                if is_market_relevant(m):
+                    relevant_batch.append(m)
+                    test_collected += 1
+                    closed_markets_for_ticks.append(m)
+                    if len(relevant_batch) >= _WORKERS:
+                        process_market_batch(relevant_batch)
+                        relevant_batch = []
+
+            if relevant_batch:
+                process_market_batch(relevant_batch)
+
+            # Save checkpoint so the next run can skip already-scanned history.
+            if max_end_ts_seen > 0 and not is_test:
                 self._save_scan_checkpoint(max_end_ts_seen)
+                self.logger.info("Scan checkpoint saved (max end_ts: %s)", max_end_ts_seen)
 
-            if is_market_relevant(m):
-                relevant_batch.append(m)
-                test_collected += 1
-                closed_markets_for_ticks.append(m)
-                if len(relevant_batch) >= _WORKERS:
-                    process_market_batch(relevant_batch)
-                    relevant_batch = []
-
-        if relevant_batch:
-            process_market_batch(relevant_batch)
-            relevant_batch = []
-
-        # Save checkpoint so the next run can skip already-scanned history.
-        if max_end_ts_seen > 0 and not is_test:
-            self._save_scan_checkpoint(max_end_ts_seen)
-            self.logger.info("Scan checkpoint saved (max end_ts: %s)", max_end_ts_seen)
-
-        # 2. Process Active Markets (Streamed & Collected) — skipped in test mode
+        # 2. Process Active Markets (Streamed & Collected) — skipped in test/historical-only mode
         active_markets_for_ws = []
         if is_test:
             self.logger.info("Test mode: skipping active markets and WebSocket streaming.")
-        elif not historical_only:
+        elif historical_only:
+            self.logger.info("Historical-only mode enabled. Skipping active markets.")
+        else:
             self.logger.info("Fetching and processing active markets...")
             fetched_active = 0
             active_batch: list[MarketRecord] = []
@@ -806,22 +811,24 @@ class PolymarketDataPipeline:
                     self.logger.info("Scanned %d active markets...", fetched_active)
 
                 if is_market_relevant(m):
-                    active_batch.append(m)
                     active_markets_for_ws.append(m)
-                    if len(active_batch) >= _WORKERS:
-                        process_market_batch(active_batch)
-                        active_batch = []
+                    if not websocket_only:
+                        # In websocket-only mode skip price history fetch; initial
+                        # prices come from existing Parquet or CLOB last-trade fallback.
+                        active_batch.append(m)
+                        if len(active_batch) >= _WORKERS:
+                            process_market_batch(active_batch)
+                            active_batch = []
 
-            if active_batch:
+            if not websocket_only and active_batch:
                 process_market_batch(active_batch)
-        else:
-            self.logger.info("Historical-only mode enabled. Skipping active markets.")
 
         # Flush any remaining historical data
-        flush_all()
+        if not websocket_only:
+            flush_all()
 
-        # On-chain historical tick backfill
-        if self.tick_fetcher is not None:
+        # On-chain historical tick backfill — skipped in websocket-only mode
+        if not websocket_only and self.tick_fetcher is not None:
             all_markets_for_ticks = closed_markets_for_ticks + active_markets_for_ws
             if all_markets_for_ticks:
                 self.logger.info(
@@ -841,6 +848,8 @@ class PolymarketDataPipeline:
                 "--upload is ignored in test mode (test data is never pushed to Hugging Face). "
                 "Re-run without --test to upload production data."
             )
+        elif upload and websocket_only:
+            self.logger.info("WebSocket-only mode: skipping Hugging Face upload.")
         elif upload:
             self.logger.info("Uploading dataset to Hugging Face Hub...")
             try:
