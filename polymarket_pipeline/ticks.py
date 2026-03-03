@@ -460,7 +460,6 @@ class PolygonTickFetcher:
             except Exception as exc:
                 self.logger.warning("eth_getLogs failed (blocks %s–%s): %s", cur, chunk_end, exc)
             cur = chunk_end + 1
-            time.sleep(0.1)
 
         return all_logs
 
