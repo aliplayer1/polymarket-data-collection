@@ -130,7 +130,9 @@ PRICES_SCHEMA = pa.schema([
     ("timestamp", pa.int32()),
     ("up_price", pa.float32()),
     ("down_price", pa.float32()),
-    # partition columns (crypto, timeframe) are implicit in the directory tree
+    # partition columns (crypto, timeframe) are implicit in the directory tree but Arrow needs to know their exact index type during merge
+    ("crypto", pa.dictionary(pa.int32(), pa.string())),
+    ("timeframe", pa.dictionary(pa.int32(), pa.string())),
 ])
 
 TICKS_SCHEMA = pa.schema([
@@ -148,8 +150,11 @@ TICKS_SCHEMA = pa.schema([
     ("block_number", pa.int32()),
     ("log_index",    pa.int32()),
     ("source",       pa.dictionary(pa.int8(), pa.string())),   # "onchain" / "websocket"
-    # partition columns (crypto, timeframe) are implicit
+    # partition columns (crypto, timeframe) are implicit in the directory tree but Arrow needs to know their exact index type during merge
+    ("crypto", pa.dictionary(pa.int32(), pa.string())),
+    ("timeframe", pa.dictionary(pa.int32(), pa.string())),
 ])
+
 
 
 def _resolution_to_int8(val: Any) -> int:
@@ -351,11 +356,12 @@ def load_prices(prices_dir: str | None = None, filters: list | None = None) -> p
     try:
         dataset = pq.ParquetDataset(path, filters=filters)
         return dataset.read().to_pandas()
-    except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
+    except Exception:
         # Schema mismatch between shards (e.g. old files with crypto/timeframe
         # as embedded dict<int8> vs newer path-encoded files read as dict<int32>).
-        # ArrowTypeError (not ArrowInvalid) is what PyArrow raises for dictionary
-        # index-type incompatibilities; catch both for safety.
+        # We catch Exception to prevent dictionary unification mismatches
+        # (which raise pa.lib.ArrowNotImplementedError in newer PyArrow)
+        # from crashing the pipeline.
         # Fall back to reading each file individually and normalising.
         return _read_hive_partitioned_robust(path, _HIVE_PARTITION_COLS, filters, _PRICES_EMPTY_COLS)
 
@@ -379,7 +385,7 @@ def load_ticks(ticks_dir: str | None = None, filters: list | None = None) -> pd.
     try:
         dataset = pq.ParquetDataset(path, filters=filters)
         return dataset.read().to_pandas()
-    except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
+    except Exception:
         return _read_hive_partitioned_robust(path, _HIVE_PARTITION_COLS, filters, _TICKS_EMPTY_COLS)
 
 
@@ -465,7 +471,7 @@ def persist_ticks(
             .reset_index(drop=True)
         )
         merged = optimise_ticks_df(merged)
-        table = pa.Table.from_pandas(merged, preserve_index=False)
+        table = pa.Table.from_pandas(merged, schema=TICKS_SCHEMA, preserve_index=False)
         _write_partitioned_atomic(table, t_dir, partition_cols=["crypto", "timeframe"])
         log.info("Ticks table written: %s/ (%s rows)", t_dir, len(merged))
 
@@ -545,7 +551,7 @@ def append_ws_ticks_staged(
             else:
                 merged = new_rows
 
-            table = pa.Table.from_pandas(merged, preserve_index=False)
+            table = pa.Table.from_pandas(merged, schema=TICKS_SCHEMA, preserve_index=False)
             _write_parquet_atomic(table, staging_path)
             rows_staged += len(new_rows)
 
@@ -696,7 +702,7 @@ def persist_normalized(
                 .reset_index(drop=True)
             )
             merged_prices = optimise_prices_df(merged_prices)
-            table_p = pa.Table.from_pandas(merged_prices, preserve_index=False)
+            table_p = pa.Table.from_pandas(merged_prices, schema=PRICES_SCHEMA, preserve_index=False)
             _write_partitioned_atomic(table_p, p_dir, partition_cols=["crypto", "timeframe"])
             log.info("Prices table written: %s/ (%s rows)", p_dir, len(merged_prices))
 
