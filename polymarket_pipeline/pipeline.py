@@ -40,6 +40,7 @@ from .retry import api_call_with_retry
 from .storage import (
     append_ticks_only,
     append_ws_ticks_staged,
+    consolidate_ticks,
     load_markets,
     load_prices,
     load_prices_for_timeframe,
@@ -1041,6 +1042,12 @@ class PolymarketDataPipeline:
                 )
                 total_ticks = self.run_historical_tick_backfill(all_markets_for_ticks)
                 self.logger.info("Tick backfill complete: %s fills stored.", total_ticks)
+                # Consolidate shard files one partition at a time (memory-safe)
+                self.logger.info("Consolidating tick shard files...")
+                consolidate_ticks(
+                    ticks_dir=self._parquet_ticks_dir,
+                    logger=self.logger,
+                )
             else:
                 self.logger.info("No markets matched for tick backfill.")
 

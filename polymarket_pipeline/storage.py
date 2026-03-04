@@ -512,17 +512,94 @@ def append_ticks_only(
             ticks_df[col] = ticks_df[col].astype(str)
 
     # Write each (crypto, timeframe) group as a new shard file
+    ticks_df = optimise_ticks_df(ticks_df)
     shard_id = f"{int(time.time())}_{os.getpid()}"
     for (crypto, timeframe), group in ticks_df.groupby(["crypto", "timeframe"], sort=False):
         shard_dir = os.path.join(t_dir, f"crypto={crypto}", f"timeframe={timeframe}")
         os.makedirs(shard_dir, exist_ok=True)
         shard_path = os.path.join(shard_dir, f"backfill_{shard_id}.parquet")
         rows = group.drop(columns=["crypto", "timeframe"]).reset_index(drop=True)
-        rows = optimise_ticks_df(rows)
         table = pa.Table.from_pandas(rows, preserve_index=False)
         pq.write_table(table, shard_path, compression="zstd")
 
     log.info("Ticks appended (no merge): %s/ (%s new rows)", t_dir, len(ticks_df))
+
+
+def consolidate_ticks(
+    *,
+    ticks_dir: str | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Consolidate backfill shard files one partition at a time.
+
+    Walks the ticks directory and, for each (crypto, timeframe) leaf that
+    contains more than one .parquet file, loads *only that partition*,
+    deduplicates, and rewrites a single consolidated file.
+
+    Peak memory is bounded by the largest single partition (typically
+    200–500 MB) rather than the entire ticks dataset (1+ GB).
+    """
+    log = logger or logging.getLogger("polymarket_pipeline")
+    t_dir = ticks_dir or PARQUET_TICKS_DIR
+
+    if not os.path.exists(t_dir):
+        return
+
+    data_root = os.path.dirname(os.path.abspath(t_dir))
+
+    for dirpath, _dirs, fnames in os.walk(t_dir):
+        parquet_files = [f for f in fnames if f.endswith(".parquet")]
+        if len(parquet_files) <= 1:
+            continue  # already consolidated or empty
+
+        rel = os.path.relpath(dirpath, t_dir)
+        log.info("Consolidating partition %s (%d shard files)...", rel, len(parquet_files))
+
+        with _write_lock(data_root):
+            frames = []
+            for fname in parquet_files:
+                fpath = os.path.join(dirpath, fname)
+                try:
+                    t = pq.ParquetFile(fpath).read()
+                    frames.append(t.to_pandas())
+                except Exception as exc:
+                    log.warning("Skipping corrupt shard %s: %s", fpath, exc)
+
+            if not frames:
+                continue
+
+            merged = (
+                pd.concat(frames, ignore_index=True)
+                .drop_duplicates(
+                    subset=["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"],
+                    keep="last",
+                )
+                .sort_values(["market_id", "timestamp_ms"])
+                .reset_index(drop=True)
+            )
+
+            # Write consolidated file, then remove old shards
+            consolidated_path = os.path.join(dirpath, "part-0.parquet")
+            tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
+            try:
+                table = pa.Table.from_pandas(merged, preserve_index=False)
+                pq.write_table(table, tmp_path, compression="zstd")
+                # Remove all old shard files
+                for fname in parquet_files:
+                    try:
+                        os.remove(os.path.join(dirpath, fname))
+                    except OSError:
+                        pass
+                os.replace(tmp_path, consolidated_path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+
+        log.info("  -> %s consolidated: %d rows", rel, len(merged))
+        # Free memory between partitions
+        del frames, merged
+        import gc; gc.collect()
 
 
 _WS_STAGING_FILENAME = "ws_staging.parquet"
