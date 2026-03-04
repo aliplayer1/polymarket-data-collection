@@ -130,9 +130,7 @@ PRICES_SCHEMA = pa.schema([
     ("timestamp", pa.int32()),
     ("up_price", pa.float32()),
     ("down_price", pa.float32()),
-    # partition columns (crypto, timeframe) are implicit in the directory tree but Arrow needs to know their exact index type during merge
-    ("crypto", pa.dictionary(pa.int32(), pa.string())),
-    ("timeframe", pa.dictionary(pa.int32(), pa.string())),
+    # partition columns (crypto, timeframe) are implicit in the directory tree
 ])
 
 TICKS_SCHEMA = pa.schema([
@@ -150,11 +148,8 @@ TICKS_SCHEMA = pa.schema([
     ("block_number", pa.int32()),
     ("log_index",    pa.int32()),
     ("source",       pa.dictionary(pa.int8(), pa.string())),   # "onchain" / "websocket"
-    # partition columns (crypto, timeframe) are implicit in the directory tree but Arrow needs to know their exact index type during merge
-    ("crypto", pa.dictionary(pa.int32(), pa.string())),
-    ("timeframe", pa.dictionary(pa.int32(), pa.string())),
+    # partition columns (crypto, timeframe) are implicit
 ])
-
 
 
 def _resolution_to_int8(val: Any) -> int:
@@ -471,7 +466,7 @@ def persist_ticks(
             .reset_index(drop=True)
         )
         merged = optimise_ticks_df(merged)
-        table = pa.Table.from_pandas(merged, schema=TICKS_SCHEMA, preserve_index=False)
+        table = pa.Table.from_pandas(merged, preserve_index=False)
         _write_partitioned_atomic(table, t_dir, partition_cols=["crypto", "timeframe"])
         log.info("Ticks table written: %s/ (%s rows)", t_dir, len(merged))
 
@@ -539,7 +534,13 @@ def append_ws_ticks_staged(
                     new_rows[col] = new_rows[col].astype(str)
 
             if os.path.exists(staging_path):
-                existing = pq.read_table(staging_path).to_pandas()
+                # Use ParquetFile (not read_table) to bypass Hive partition
+                # discovery.  read_table internally builds a ParquetDataset
+                # which detects the crypto=X/timeframe=Y parent directories
+                # and tries to merge path-inferred dict<int32> indices with
+                # the dict<int8> indices embedded in older staging files,
+                # raising ArrowTypeError.
+                existing = pq.ParquetFile(staging_path).read().to_pandas()
                 merged = (
                     pd.concat([existing, new_rows], ignore_index=True)
                     .drop_duplicates(
@@ -551,7 +552,7 @@ def append_ws_ticks_staged(
             else:
                 merged = new_rows
 
-            table = pa.Table.from_pandas(merged, schema=TICKS_SCHEMA, preserve_index=False)
+            table = pa.Table.from_pandas(merged, preserve_index=False)
             _write_parquet_atomic(table, staging_path)
             rows_staged += len(new_rows)
 
@@ -702,7 +703,7 @@ def persist_normalized(
                 .reset_index(drop=True)
             )
             merged_prices = optimise_prices_df(merged_prices)
-            table_p = pa.Table.from_pandas(merged_prices, schema=PRICES_SCHEMA, preserve_index=False)
+            table_p = pa.Table.from_pandas(merged_prices, preserve_index=False)
             _write_partitioned_atomic(table_p, p_dir, partition_cols=["crypto", "timeframe"])
             log.info("Prices table written: %s/ (%s rows)", p_dir, len(merged_prices))
 
