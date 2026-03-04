@@ -84,6 +84,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--upload-only",
+        action="store_true",
+        help=(
+            "Consolidate tick shard files and upload to Hugging Face Hub, "
+            "without running any data collection. Intended for a dedicated "
+            "upload timer that runs independently of the historical backfill."
+        ),
+    )
+    parser.add_argument(
         "--data-dir",
         type=str,
         default=None,
@@ -142,6 +151,16 @@ def main() -> None:
 
     logger = configure_logging(log_file)
     try:
+        # Upload-only mode: consolidate + upload without any data collection
+        if args.upload_only:
+            from .storage import consolidate_ticks, upload_to_huggingface
+            from .config import PARQUET_TICKS_DIR, PARQUET_DATA_DIR
+            t_dir = os.path.join(data_dir, "ticks") if data_dir else PARQUET_TICKS_DIR
+            logger.info("Upload-only mode: consolidating and uploading...")
+            consolidate_ticks(ticks_dir=t_dir, logger=logger)
+            upload_to_huggingface(repo_id=hf_repo, logger=logger)
+            return
+
         pipeline = PolymarketDataPipeline(
             logger=logger,
             rpc_url=rpc_url,

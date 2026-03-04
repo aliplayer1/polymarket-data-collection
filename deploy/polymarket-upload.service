@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket Tick Consolidation + Hugging Face Upload (one-shot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket
+
+EnvironmentFile=/opt/polymarket/.env
+
+ExecStart=/opt/polymarket/.venv/bin/python -m polymarket_pipeline \
+    --upload-only
+
+# Consolidation + upload should finish well within 30 minutes
+TimeoutStartSec=1800
