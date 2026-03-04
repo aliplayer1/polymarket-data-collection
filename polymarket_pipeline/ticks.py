@@ -77,8 +77,9 @@ class PolygonTickFetcher:
     # adaptively when the node signals an overflow (see _fetch_logs_rpc).
     RPC_LOG_CHUNK_BLOCKS  = 15
 
-    # Minimum gap between any two Etherscan V2 API calls (3 req/s free plan)
-    _ETHERSCAN_MIN_INTERVAL = 0.42   # slightly >1/3 s to stay safely below 3 req/s
+    # Minimum gap between any two Etherscan V2 API calls (3 req/s limit).
+    # 0.42 s gives ~2.4 req/s, safely below the enforced cap.
+    _ETHERSCAN_MIN_INTERVAL = 0.42
 
     # Minimum gap between eth_getLogs RPC calls on Alchemy free tier.
     # eth_getLogs costs 75 CU; free tier throughput is 500 CU/s → max 6.67 calls/s.
