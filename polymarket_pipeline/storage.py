@@ -880,6 +880,11 @@ def upload_to_huggingface(
         )
         log.info("Uploaded %s -> data/markets.parquet", m_path)
 
+    # Patterns to exclude from folder uploads: staging files (actively
+    # written by the WebSocket service), backfill shards (consolidated
+    # into part-0.parquet), and atomic-write temp files.
+    _ignore = ["**/ws_staging.parquet", "**/backfill_*.parquet", "**/*.tmp"]
+
     # Upload prices partition tree
     if os.path.exists(p_dir):
         api.upload_folder(
@@ -887,6 +892,7 @@ def upload_to_huggingface(
             path_in_repo="data/prices",
             repo_id=repo,
             repo_type="dataset",
+            ignore_patterns=_ignore,
         )
         log.info("Uploaded %s/ -> data/prices/", p_dir)
 
@@ -897,6 +903,7 @@ def upload_to_huggingface(
             path_in_repo="data/ticks",
             repo_id=repo,
             repo_type="dataset",
+            ignore_patterns=_ignore,
         )
         log.info("Uploaded %s/ -> data/ticks/", t_dir)
 
