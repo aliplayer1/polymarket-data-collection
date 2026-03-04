@@ -296,9 +296,10 @@ class PolymarketDataPipeline:
             windows[(win_start, m.end_ts)].append(m)
 
         # Flush accumulated ticks to Parquet every this many windows.
-        # Batching amortises the expensive partition read-merge-dedup-write
-        # cycle: 1252 windows × 3 markets = 3 756 persist calls → ~63 calls.
-        _TICK_FLUSH_EVERY = 20
+        # Keep low to limit peak memory: each pending window can hold
+        # thousands of tick dicts, and persist_ticks() loads the existing
+        # partition into RAM for merge.
+        _TICK_FLUSH_EVERY = 5
 
         total_ticks = 0
         n_windows = len(windows)
@@ -1027,6 +1028,10 @@ class PolymarketDataPipeline:
 
         # On-chain historical tick backfill — skipped in websocket-only mode
         if not websocket_only and self.tick_fetcher is not None:
+            # Free cached price DataFrames before tick backfill — they are no
+            # longer needed and can consume hundreds of MB of RAM.
+            self.existing_dfs.clear()
+            import gc; gc.collect()
             all_markets_for_ticks = closed_markets_for_ticks + active_markets_for_ws
             if all_markets_for_ticks:
                 self.logger.info(
