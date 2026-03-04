@@ -1,3 +1,5 @@
+import os
+
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -53,7 +55,7 @@ PARQUET_TEST_PRICES_DIR = f"{PARQUET_TEST_DIR}/prices"
 PARQUET_TEST_TICKS_DIR  = f"{PARQUET_TEST_DIR}/ticks"
 
 # --- Hugging Face Hub ---
-HF_REPO_ID = "polymarket-crypto-updown"  # default, overridable via --hf-repo
+HF_REPO_ID = os.environ.get("HF_REPO_ID", "aliplayer1/polymarket-crypto-updown")
 
 PRICE_SUM_TOLERANCE = 0.15
 MAX_WS_RECONNECT_DELAY_SECONDS = 120
