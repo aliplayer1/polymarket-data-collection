@@ -15,7 +15,7 @@ In addition to the OHLC-style price series, the pipeline collects **individual t
 
 ### On-Chain Backfill
 
-Every Polymarket trade fill is settled on Polygon PoS as an `OrderFilled` event on the CTF Exchange contract (`0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e`). The pipeline queries these events via the **Etherscan V2 unified API** (`api.etherscan.io/v2/api`, chain ID 137) with a fallback to the **native Polygonscan API** (`api.polygonscan.com/api`) or primarily via **direct JSON-RPC using Alchemy**, to pull exact trade data:
+Every Polymarket trade fill is settled on Polygon PoS as an `OrderFilled` event on the CTF Exchange contract (`0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e`). The pipeline queries these events primarily via the **Etherscan V2 unified API** (`api.etherscan.io/v2/api`, chain ID 137), with a fallback to **direct JSON-RPC** (e.g. Alchemy), to pull exact trade data:
 
 - Exact fill timestamp (block timestamp, ~2 s precision)
 - Outcome token (`Up` / `Down`)
@@ -25,7 +25,7 @@ Every Polymarket trade fill is settled on Polygon PoS as an `OrderFilled` event 
 
 **Integrated Execution:** Historical tick backfill is handled by the `--historical-only` phase of the pipeline (run via `polymarket-historical.service` every 6 hours on the server). When running the combined pipeline locally (`python -m polymarket_pipeline`), the backfill runs automatically before the WebSocket phase begins. In the split-service deployment, `polymarket-websocket.service` runs `--websocket-only` concurrently with `polymarket-historical.service`, and a cross-process write lock ensures the two services never corrupt each other's Parquet files.
 
-**Alchemy RPC Acceleration:** While the Etherscan V2 API offers historical events, it imposes strict 3 req/s limits. The codebase is heavily optimized for an **Alchemy JSON-RPC fallback**. Providing a free-tier Alchemy URL in `.env` (`POLYGON_RPC_URL`) removes API throttling delays and leverages 330 CU/s throughput to backfill tens of thousands of trades rapidly in bulk 10-block intervals prior to WebSocket streaming.
+**Polygonscan-First Strategy:** The pipeline prefers the Polygonscan/Etherscan V2 API for historical log queries because Alchemy's free-tier archive nodes frequently return `HTTP 503` / JSON-RPC `-32001` ("Unable to complete request at this time") for cold historical block ranges. Providing a free Polygonscan API key in `.env` (`POLYGONSCAN_API_KEY`) ensures reliable backfill at up to 3 req/s. An Alchemy RPC URL (`POLYGON_RPC_URL`) is still used for block-number lookups and as a fallback if Polygonscan fails.
 
 ### WebSocket Ticks (Live)
 
@@ -212,6 +212,7 @@ Active markets are monitored over a WebSocket connection (`ws-subscriptions-clob
 - **Transport-level retries** — Automatic retries on 502/503/504 gateway errors before application-level retry logic.
 - **Rate-limit handling** — On HTTP 429 responses, the `Retry-After` header is respected; otherwise exponential backoff with random jitter is applied.
 - **Atomic writes** — Parquet files are written to a per-PID `.tmp` path (`{path}.{pid}.tmp`) and then atomically renamed, preventing partial/corrupt files on crash and avoiding collisions between concurrent processes.
+- **Schema-safe staging reads** — WebSocket tick staging files are read with `pq.ParquetFile` (not `pq.read_table`) to bypass PyArrow's Hive partition schema discovery, preventing `dict<int8>` vs `dict<int32>` merge conflicts when reading legacy staging files.
 - **Cross-process write lock** — `storage.py` acquires a `threading.Lock` combined with an `fcntl.flock(LOCK_EX)` advisory lock on `<data_root>/.write.lock` before every read→merge→write cycle. This allows `polymarket-websocket.service` and `polymarket-historical.service` to run side-by-side safely without corrupting shared Parquet files.
 - **Non-blocking WebSocket flush** — The WS flush loop swaps the in-memory buffer atomically and offloads Parquet I/O to a thread pool (`run_in_executor`), so disk writes never block the asyncio event loop and cannot cause ping-timeout disconnects.
 - **Partition-aware I/O** — On each write, only the affected `(crypto, timeframe)` Parquet partitions are loaded from disk for merging. Unrelated partitions are never read or overwritten.

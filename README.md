@@ -93,7 +93,7 @@ cp .env.example .env   # then fill in your keys
 | `polymarket_pipeline/api.py` | Gamma/CLOB API access, connection pooling, price validation |
 | `polymarket_pipeline/storage.py` | Normalised Parquet I/O and Hugging Face Hub upload |
 | `polymarket_pipeline/query.py` | DuckDB SQL query layer over local Parquet files |
-| `polymarket_pipeline/ticks.py` | On-chain tick data fetcher (Polygonscan + RPC fallback) |
+| `polymarket_pipeline/ticks.py` | On-chain tick data fetcher (Polygonscan preferred, RPC fallback) |
 | `polymarket_pipeline/pipeline.py` | Historical + WebSocket ingestion orchestration |
 | `polymarket_pipeline/cli.py` | CLI argument parsing and logging setup |
 | `polymarket_pipeline/__main__.py` | Module runner (`python -m polymarket_pipeline`) |
