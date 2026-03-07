@@ -536,14 +536,16 @@ def consolidate_ticks(
     contains more than one .parquet file, loads *only that partition*,
     deduplicates, and rewrites a single consolidated file.
 
-    Peak memory is bounded by the largest single partition (typically
-    200–500 MB) rather than the entire ticks dataset (1+ GB).
+    Uses DuckDB for out-of-core merge/dedup so peak memory stays well
+    below the full partition size even with many shard files.
     """
     log = logger or logging.getLogger("polymarket_pipeline")
     t_dir = ticks_dir or PARQUET_TICKS_DIR
 
     if not os.path.exists(t_dir):
         return
+
+    import duckdb
 
     data_root = os.path.dirname(os.path.abspath(t_dir))
 
@@ -558,35 +560,27 @@ def consolidate_ticks(
                 continue  # already consolidated or empty
 
             log.info("Consolidating partition %s (%d shard files)...", rel, len(parquet_files))
-            frames = []
-            for fname in parquet_files:
-                fpath = os.path.join(dirpath, fname)
-                try:
-                    t = pq.ParquetFile(fpath).read()
-                    frames.append(t.to_pandas())
-                except Exception as exc:
-                    log.warning("Skipping corrupt shard %s: %s", fpath, exc)
 
-            if not frames:
-                continue
-
-            merged = (
-                pd.concat(frames, ignore_index=True)
-                .drop_duplicates(
-                    subset=["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"],
-                    keep="last",
-                )
-                .sort_values(["market_id", "timestamp_ms"])
-                .reset_index(drop=True)
-            )
-
-            # Write consolidated file, then remove old shards
+            file_paths = [os.path.join(dirpath, f) for f in parquet_files]
             consolidated_path = os.path.join(dirpath, "part-0.parquet")
             tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
+
+            # Paths are from os.listdir (not user input); safe to interpolate.
+            files_sql = ", ".join(f"'{p}'" for p in file_paths)
             try:
-                table = pa.Table.from_pandas(merged, preserve_index=False)
-                pq.write_table(table, tmp_path, compression="zstd")
-                # Remove all old shard files
+                con = duckdb.connect()
+                result = con.execute(f"""
+                    COPY (
+                        SELECT * FROM read_parquet([{files_sql}])
+                        QUALIFY ROW_NUMBER() OVER (
+                            PARTITION BY market_id, timestamp_ms, token_id, tx_hash, log_index
+                        ) = 1
+                        ORDER BY market_id, timestamp_ms
+                    ) TO '{tmp_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                """).fetchone()
+                con.close()
+                nrows = result[0] if result else 0
+
                 for fname in parquet_files:
                     try:
                         os.remove(os.path.join(dirpath, fname))
@@ -598,10 +592,7 @@ def consolidate_ticks(
                     os.remove(tmp_path)
                 raise
 
-        log.info("  -> %s consolidated: %d rows", rel, len(merged))
-        # Free memory between partitions
-        del frames, merged
-        import gc; gc.collect()
+        log.info("  -> %s consolidated: %d rows", rel, nrows)
 
 
 _WS_STAGING_FILENAME = "ws_staging.parquet"
