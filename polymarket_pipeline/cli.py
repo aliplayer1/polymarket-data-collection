@@ -160,4 +160,4 @@ def main() -> None:
             from_date=args.from_date,
         )
     except Exception as exc:
-        logger.error("Pipeline failed: %s", exc)
+        logger.exception("Pipeline failed: %s", exc)
