@@ -36,6 +36,8 @@ All credentials and path overrides can be set in `.env` (loaded automatically vi
 | `HF_HOME` | Path to Hugging Face cache directory. Required for system users without a home directory to store the `hf-xet` deduplication index. |
 | `HF_REPO_ID` | Default Hugging Face repo ID (overridden per-run by `--hf-repo`) |
 | `PM_FLOCK_TIMEOUT` | Cross-process lock timeout in seconds. Defaults to **300** (5 minutes) to accommodate large data uploads. |
+| `PM_DUCKDB_MEMORY_LIMIT` | Override the DuckDB memory limit used during tick consolidation before uploads, e.g. `3GB`. |
+| `PM_DUCKDB_THREADS` | Override the DuckDB thread count used during tick consolidation. Defaults to **1**. |
 | `POLYGONSCAN_API_KEY` | Free API key from [polygonscan.com/myapikey](https://polygonscan.com/myapikey) |
 | `POLYGON_RPC_URL` | Polygon JSON-RPC endpoint for primary high-speed tick backfill. Highly recommended: an Alchemy Free Tier API URL (e.g. `https://polygon-mainnet.g.alchemy.com/v2/...`). |
 | `POLYMARKET_DATA_DIR` | Root directory for Parquet output (overridden per-run by `--data-dir`) |

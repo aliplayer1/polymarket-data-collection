@@ -285,6 +285,95 @@ def _stamp_schema_version(table: pa.Table) -> pa.Table:
 _MIN_FREE_DISK_GB: float = float(os.environ.get("PM_MIN_FREE_DISK_GB", "2.0"))
 
 
+def _read_memory_limit_bytes(path: str) -> int | None:
+    """Read a Linux memory-limit file and return bytes, or None if unavailable."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return None
+    if not raw or raw.lower() == "max":
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if 0 < value < (1 << 60) else None
+
+
+def _detect_effective_memory_limit_bytes() -> int | None:
+    """Best-effort detection of the process memory ceiling in bytes.
+
+    Prefer the tightest Linux cgroup limit when present, otherwise fall back to
+    physical RAM.  This keeps DuckDB tuning aligned with systemd/container caps.
+    """
+    candidates: list[int] = []
+
+    for path in (
+        "/sys/fs/cgroup/memory.max",  # cgroup v2
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",  # cgroup v1
+    ):
+        value = _read_memory_limit_bytes(path)
+        if value is not None:
+            candidates.append(value)
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        page_count = int(os.sysconf("SC_PHYS_PAGES"))
+        if page_size > 0 and page_count > 0:
+            candidates.append(page_size * page_count)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+    return min(candidates) if candidates else None
+
+
+def _get_consolidation_memory_limit() -> str | None:
+    """Return the DuckDB memory limit string for consolidation queries."""
+    override = os.environ.get("PM_DUCKDB_MEMORY_LIMIT")
+    if override:
+        return override
+
+    effective_bytes = _detect_effective_memory_limit_bytes()
+    if effective_bytes is None:
+        return None
+
+    # DuckDB recommends using ~50-60% of total available memory for workloads
+    # that otherwise OOM despite disk spilling.
+    target_mb = max(int(effective_bytes * 0.60 / (1024 * 1024)), 512)
+    return f"{target_mb}MB"
+
+
+def _get_consolidation_threads() -> int:
+    """Return the thread count for DuckDB consolidation queries."""
+    raw = os.environ.get("PM_DUCKDB_THREADS", "1")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid PM_DUCKDB_THREADS={raw!r}: expected a positive integer") from exc
+    if value < 1:
+        raise ValueError(f"Invalid PM_DUCKDB_THREADS={raw!r}: expected a positive integer")
+    return value
+
+
+def _configure_duckdb_for_consolidation(
+    con: Any,
+    *,
+    temp_dir: str,
+) -> tuple[str | None, int]:
+    """Apply low-memory DuckDB settings used by tick consolidation."""
+    con.execute(f"SET temp_directory='{temp_dir}'")
+
+    memory_limit = _get_consolidation_memory_limit()
+    if memory_limit:
+        con.execute(f"SET memory_limit='{memory_limit}'")
+
+    threads = _get_consolidation_threads()
+    con.execute(f"SET threads={threads}")
+    con.execute("SET preserve_insertion_order=false")
+    return memory_limit, threads
+
+
 def _check_disk_space(path: str) -> None:
     """Raise OSError if free disk space at *path*'s mount point is below threshold.
 
@@ -527,6 +616,18 @@ _TICKS_EMPTY_COLS = [
     "market_id", "timestamp_ms", "token_id", "outcome", "side",
     "price", "size_usdc", "tx_hash", "block_number", "log_index", "source", "crypto", "timeframe",
 ]
+_TICKS_DEDUP_COLS = ["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"]
+
+
+def _tick_consolidation_select_sql(sort_key_sql: str) -> str:
+    """Build the SELECT list for DuckDB shard consolidation."""
+    select_exprs = []
+    for col in TICKS_SCHEMA.names:
+        if col in _TICKS_DEDUP_COLS:
+            select_exprs.append(col)
+        else:
+            select_exprs.append(f"arg_max({col}, {sort_key_sql}) AS {col}")
+    return ",\n                            ".join(select_exprs)
 
 
 def load_ticks(ticks_dir: str | None = None, filters: list | None = None) -> pd.DataFrame:
@@ -618,7 +719,7 @@ def persist_ticks(
 
         merged = (
             pd.concat([existing, ticks_df], ignore_index=True)
-            .drop_duplicates(subset=["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"], keep="last")
+            .drop_duplicates(subset=_TICKS_DEDUP_COLS, keep="last")
             .sort_values(["market_id", "timestamp_ms"])
             .reset_index(drop=True)
         )
@@ -720,58 +821,91 @@ def consolidate_ticks(
             _check_disk_space(dirpath)
 
             file_paths = [os.path.join(dirpath, f) for f in parquet_files]
+            file_paths.sort(key=lambda path: (os.path.getmtime(path), path))
             consolidated_path = os.path.join(dirpath, "part-0.parquet")
             tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
 
             # Paths are from os.listdir (not user input); safe to interpolate.
             files_sql = ", ".join(f"'{p}'" for p in file_paths)
+            files_with_order_sql = ", ".join(
+                f"('{path}', {idx})" for idx, path in enumerate(file_paths)
+            )
+            select_sql = _tick_consolidation_select_sql("sort_key")
+            group_by_sql = ", ".join(_TICKS_DEDUP_COLS)
+            temp_dir = os.path.join(dirpath, ".duckdb_tmp")
+            con = None
             try:
-                # Use a dedicated in-memory connection and configure for low memory / disk-spilling
+                # Use a dedicated connection and configure for disk-spilling
+                # plus conservative memory usage inside systemd/cgroup limits.
                 con = duckdb.connect()
-                
-                # Performance / Memory Tuning:
-                # 1. Enable disk-spilling: allow DuckDB to use the disk if RAM is exceeded.
-                temp_dir = os.path.join(dirpath, ".duckdb_tmp")
                 os.makedirs(temp_dir, exist_ok=True)
-                con.execute(f"SET temp_directory='{temp_dir}'")
-                
-                # 2. Limit memory: leave some RAM for the OS and other processes.
-                # The server has 7.5GB total, 6.4GB free. 6GB allows DuckDB to use most of it.
-                con.execute("SET memory_limit='6GB'")
-                
-                # 3. Limit threads: too many threads = too many concurrent memory-intensive tasks.
-                con.execute("SET threads=2")
-
-                # 4. Disable insertion order preservation to save memory during sorting/deduplication.
-                con.execute("SET preserve_insertion_order=false")
+                memory_limit, threads = _configure_duckdb_for_consolidation(
+                    con,
+                    temp_dir=temp_dir,
+                )
+                log.info(
+                    "  -> DuckDB settings: memory_limit=%s threads=%s",
+                    memory_limit or "default",
+                    threads,
+                )
 
                 result = con.execute(f"""
                     COPY (
-                        SELECT * FROM read_parquet([{files_sql}])
-                        QUALIFY ROW_NUMBER() OVER (
-                            PARTITION BY market_id, timestamp_ms, token_id, tx_hash, log_index
-                        ) = 1
-                        ORDER BY market_id, timestamp_ms
+                        WITH source_files(file_path, file_order) AS (
+                            VALUES {files_with_order_sql}
+                        ),
+                        ranked_rows AS (
+                            SELECT
+                                src.market_id,
+                                src.timestamp_ms,
+                                src.token_id,
+                                src.outcome,
+                                src.side,
+                                src.price,
+                                src.size_usdc,
+                                src.tx_hash,
+                                src.block_number,
+                                src.log_index,
+                                src.source,
+                                ((f.file_order::BIGINT << 32) + src.file_row_number::BIGINT) AS sort_key
+                            FROM read_parquet([{files_sql}], filename=true, file_row_number=true) AS src
+                            JOIN source_files AS f ON src.filename = f.file_path
+                        )
+                        -- Intentionally omit a final ORDER BY: the global sort is
+                        -- another blocking operator and was the main OOM trigger.
+                        SELECT
+                            {select_sql}
+                        FROM ranked_rows
+                        GROUP BY {group_by_sql}
                     ) TO '{tmp_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
                 """).fetchone()
-                con.close()
-                
-                # Cleanup temp dir
-                if os.path.exists(temp_dir):
-                    shutil.rmtree(temp_dir)
-                    
                 nrows = result[0] if result else 0
 
+                remove_errors: list[str] = []
                 for fname in parquet_files:
                     try:
                         os.remove(os.path.join(dirpath, fname))
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        remove_errors.append(f"{fname}: {exc}")
+                if remove_errors:
+                    log.warning(
+                        "  -> could not remove %d old shard file(s) in %s; "
+                        "duplicates may remain until the next consolidation: %s",
+                        len(remove_errors),
+                        rel,
+                        "; ".join(remove_errors),
+                    )
                 os.replace(tmp_path, consolidated_path)
             except Exception:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
                 raise
+            finally:
+                try:
+                    if con is not None:
+                        con.close()
+                finally:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
 
         log.info("  -> %s consolidated: %d rows", rel, nrows)
 
@@ -848,10 +982,7 @@ def append_ws_ticks_staged(
                 existing = pq.ParquetFile(staging_path).read().to_pandas()
                 merged = (
                     pd.concat([existing, new_rows], ignore_index=True)
-                    .drop_duplicates(
-                        subset=["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"],
-                        keep="last",
-                    )
+                    .drop_duplicates(subset=_TICKS_DEDUP_COLS, keep="last")
                     .reset_index(drop=True)
                 )
             else:

@@ -59,6 +59,9 @@ cp .env.example .env   # then fill in your keys
 # Historical only (safe to re-run; incremental)
 .venv/bin/python -m polymarket_pipeline --historical-only
 
+# Upload-only (consolidate existing shards + push to Hugging Face; no new fetch)
+.venv/bin/python -m polymarket_pipeline --upload-only
+
 # Filter by asset / timeframe
 .venv/bin/python -m polymarket_pipeline --historical-only --crypto BTC ETH --timeframe 15m 1h
 
@@ -79,6 +82,23 @@ cp .env.example .env   # then fill in your keys
 # Query local data with SQL (tables: markets, prices, ticks)
 .venv/bin/python -m polymarket_pipeline.query "SELECT crypto, COUNT(*) FROM prices GROUP BY 1"
 ```
+
+### Upload Tuning
+
+Before `--upload` or `--upload-only`, the pipeline consolidates tick shard files with DuckDB. On smaller servers — or on hosts where `systemd`/cgroups cap the service below total RAM — you can pin safer settings in `.env`:
+
+```bash
+PM_DUCKDB_MEMORY_LIMIT=3GB
+PM_DUCKDB_THREADS=1
+```
+
+If the upload service logs a DuckDB out-of-memory error, check the effective service memory cap with:
+
+```bash
+systemctl show polymarket-upload.service -p MemoryCurrent -p MemoryMax -p MemoryHigh
+```
+
+See [docs/deployment.md](docs/deployment.md) for the full troubleshooting notes.
 
 ## Structure
 
@@ -102,6 +122,7 @@ cp .env.example .env   # then fill in your keys
 | `deploy/polymarket-websocket.service` | systemd unit — continuous `--websocket-only` stream |
 | `deploy/polymarket-historical.service` | systemd unit — `--historical-only --upload` one-shot fetch |
 | `deploy/polymarket-historical.timer` | systemd timer — triggers historical fetch + HF upload every 6 h |
+| `deploy/polymarket-upload.service` | systemd unit — `--upload-only` one-shot consolidation + Hugging Face upload |
 | `deploy/polymarket-restart.service` | systemd oneshot unit — restarts `polymarket-websocket.service` |
 | `deploy/polymarket-restart.timer` | systemd timer — restarts WebSocket service daily at 00:05 UTC to discover newly-created markets |
 | `deploy/polymarket-live.service` | **Legacy** — combined historical + WebSocket service (superseded by the split service pair above) |

@@ -36,3 +36,8 @@ Thumbs.db
 .claude/
 claude*
 CLAUDE*
+gemini*
+GEMINI*
+.gemini/
+.copilot/
+.github/

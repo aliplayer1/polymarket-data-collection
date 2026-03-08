@@ -113,3 +113,17 @@ sudo chown polymarket:polymarket /opt/polymarket/.cache
 # Add to .env
 HF_HOME=/opt/polymarket/.cache
 ```
+
+#### Tick Consolidation Fails with a DuckDB Out-of-Memory Error
+The upload services (`--upload` / `--upload-only`) consolidate tick shard files before pushing to Hugging Face. If a partition such as `crypto=BTC/timeframe=5-minute` has accumulated many shard files, the consolidation query can still hit the service's effective memory ceiling (often lower than total RAM because of systemd/cgroup limits).
+
+If you see a log like `Out of Memory Error: failed to pin block ...`, check the service-level cap first:
+```bash
+systemctl show polymarket-upload.service -p MemoryCurrent -p MemoryMax -p MemoryHigh
+```
+
+Then, if needed, pin safer DuckDB settings in `/opt/polymarket/.env` and restart the service:
+```bash
+PM_DUCKDB_MEMORY_LIMIT=3GB
+PM_DUCKDB_THREADS=1
+```

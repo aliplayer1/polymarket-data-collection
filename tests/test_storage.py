@@ -20,6 +20,7 @@ from polymarket_pipeline.storage import (
     _write_parquet_atomic,
     _write_partitioned_atomic,
     append_ws_ticks_staged,
+    consolidate_ticks,
     load_markets,
     load_prices,
     load_ticks,
@@ -269,3 +270,57 @@ def test_append_ws_ticks_staged_accumulates(tmp_path):
     staging = os.path.join(ticks_dir, "crypto=BTC", "timeframe=5-minute", "ws_staging.parquet")
     t = pq.read_table(staging)
     assert len(t) == 2
+
+
+def test_consolidate_ticks_merges_shards_and_deduplicates(tmp_path):
+    ticks_dir = tmp_path / "ticks"
+    shard_dir = ticks_dir / "crypto=BTC" / "timeframe=5-minute"
+    shard_dir.mkdir(parents=True)
+
+    shard_a = pd.DataFrame({
+        "market_id": ["m1", "m1"],
+        "timestamp_ms": [1_000, 2_000],
+        "token_id": ["tok1", "tok1"],
+        "outcome": ["Up", "Up"],
+        "side": ["BUY", "BUY"],
+        "price": [0.55, 0.60],
+        "size_usdc": [10.0, 11.0],
+        "tx_hash": ["0xabc", "0xdef"],
+        "block_number": [100, 101],
+        "log_index": [1, 2],
+        "source": ["onchain", "onchain"],
+    })
+    shard_b = pd.DataFrame({
+        "market_id": ["m1", "m2"],
+        "timestamp_ms": [1_000, 3_000],
+        "token_id": ["tok1", "tok9"],
+        "outcome": ["Up", "Down"],
+        "side": ["BUY", "SELL"],
+        "price": [0.57, 0.42],
+        "size_usdc": [12.0, 5.0],
+        "tx_hash": ["0xabc", "0x999"],
+        "block_number": [100, 102],
+        "log_index": [1, 1],
+        "source": ["websocket", "websocket"],
+    })
+
+    shard_a_path = shard_dir / "backfill_a.parquet"
+    shard_b_path = shard_dir / "backfill_b.parquet"
+    pq.write_table(pa.Table.from_pandas(shard_a, preserve_index=False), shard_a_path)
+    pq.write_table(pa.Table.from_pandas(shard_b, preserve_index=False), shard_b_path)
+    os.utime(shard_a_path, (1, 1))
+    os.utime(shard_b_path, (2, 2))
+
+    consolidate_ticks(ticks_dir=str(ticks_dir))
+
+    assert sorted(os.listdir(shard_dir)) == ["part-0.parquet"]
+
+    consolidated = pq.read_table(shard_dir / "part-0.parquet").to_pandas()
+    dedup_keys = ["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"]
+    assert len(consolidated) == 3
+    assert len(consolidated.drop_duplicates(subset=dedup_keys)) == 3
+    assert set(consolidated["market_id"]) == {"m1", "m2"}
+    duplicate_key_row = consolidated[consolidated["tx_hash"] == "0xabc"].iloc[0]
+    assert duplicate_key_row["price"] == pytest.approx(0.57)
+    assert duplicate_key_row["source"] == "websocket"
+    assert not os.path.exists(shard_dir / ".duckdb_tmp")
