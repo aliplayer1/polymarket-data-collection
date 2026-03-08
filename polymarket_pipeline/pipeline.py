@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -237,6 +238,11 @@ class PolymarketDataPipeline:
             WebSocket flush path — WebSocket streaming never calls
             ``_market_start_ts()``, so the cache is dead weight that would grow
             unboundedly with every 5-second flush.
+
+        When ``update_cache=False`` (WebSocket flush path) the markets table
+        write is also skipped (``skip_markets=True``): market metadata is
+        already up-to-date from the startup historical scan, and re-writing
+        ``markets.parquet`` on every 5-second flush cycle is wasteful I/O.
         """
         df = df.assign(market_id=lambda d: d["market_id"].astype(str))
         markets_df, prices_df = split_markets_prices(df)
@@ -246,6 +252,7 @@ class PolymarketDataPipeline:
             markets_path=self._parquet_markets_path,
             prices_dir=self._parquet_prices_dir,
             logger=self.logger,
+            skip_markets=not update_cache,
         )
 
         if not update_cache:
@@ -336,7 +343,23 @@ class PolymarketDataPipeline:
         return total_ticks
 
     def _initial_last_prices(self, active_markets: list[MarketRecord]) -> dict[str, dict[str, float]]:
+        """Seed last-known prices for every active market.
+
+        Uses the in-memory price cache as the fast path (populated by
+        ``load_existing_data``).  Falls back to the CLOB API for markets not
+        in the cache.  CLOB lookups are parallelised with a ThreadPoolExecutor
+        to avoid the sequential ~3 000-call startup delay that previously made
+        ``--websocket-only`` mode take 10–30 minutes to begin streaming.
+        """
         last_prices: dict[str, dict[str, float]] = {}
+        needs_api: list[MarketRecord] = []
+
+        def _parse_price(raw: Any) -> float:
+            if isinstance(raw, dict):
+                return float(raw.get("price") or raw.get("value") or 0.5)
+            return float(raw)
+
+        # Fast path: populate from in-memory cache (populated by load_existing_data)
         for market in active_markets:
             df = self.existing_dfs.get(market.timeframe, pd.DataFrame())
             market_df = df[df["market_id"] == market.market_id] if not df.empty else pd.DataFrame()
@@ -346,49 +369,58 @@ class PolymarketDataPipeline:
                     "up": float(row["up_price"]),
                     "down": float(row["down_price"]),
                 }
-                continue
+            else:
+                needs_api.append(market)
 
+        if not needs_api:
+            return last_prices
+
+        self.logger.info(
+            "Fetching initial prices for %d markets from CLOB API (parallel)...",
+            len(needs_api),
+        )
+
+        def _fetch_one(market: MarketRecord) -> tuple[str, dict[str, float]]:
             try:
-                up_raw = api_call_with_retry(self.client.get_last_trade_price, market.up_token_id, logger=self.logger) or 0.5
+                up_raw   = api_call_with_retry(self.client.get_last_trade_price, market.up_token_id,   logger=self.logger) or 0.5
                 down_raw = api_call_with_retry(self.client.get_last_trade_price, market.down_token_id, logger=self.logger) or 0.5
-                # The CLOB client may return a dict (e.g. {"price": "0.45"}) or a
-                # plain float/string depending on the API version and market age.
-                def _parse_price(raw: Any) -> float:
-                    if isinstance(raw, dict):
-                        return float(raw.get("price") or raw.get("value") or 0.5)
-                    return float(raw)
-                last_prices[market.market_id] = {
-                    "up": _parse_price(up_raw),
-                    "down": _parse_price(down_raw),
-                }
+                return market.market_id, {"up": _parse_price(up_raw), "down": _parse_price(down_raw)}
             except Exception as exc:
                 self.logger.warning("Falling back to 0.5 for market %s: %s", market.market_id, exc)
-                last_prices[market.market_id] = {"up": 0.5, "down": 0.5}
+                return market.market_id, {"up": 0.5, "down": 0.5}
+
+        # Cap concurrency at 20 to stay well within CLOB rate limits.
+        with ThreadPoolExecutor(max_workers=min(20, len(needs_api))) as executor:
+            for mid, prices in executor.map(_fetch_one, needs_api):
+                last_prices[mid] = prices
 
         return last_prices
 
-    def _flush_ws_buffer(
+    def _flush_snapshot(
         self,
-        buffer: dict[str, list[dict[str, Any]]],
-        tick_buffer: dict[str, list[dict[str, Any]]],
+        ws_snapshot: dict[str, list[dict[str, Any]]],
+        tck_snapshot: dict[str, list[dict[str, Any]]],
     ) -> int:
+        """Flush pre-snapshotted buffer dicts to Parquet (runs in a thread).
+
+        Callers must have already swapped the live buffers for fresh empty
+        ones before invoking this, so shard tasks can keep appending without
+        any lock contention.
+        """
         flushed_rows = 0
-        for timeframe, rows in buffer.items():
+        for timeframe, rows in ws_snapshot.items():
             if not rows:
                 continue
             new_df = pd.DataFrame(rows)
-            # update_cache=False: WebSocket never calls _market_start_ts() so
-            # keeping existing_dfs in sync is pointless and leaks memory.
+            # update_cache=False → skip_markets=True inside persist_dataframe:
+            #   Market metadata is already written during the startup historical
+            #   scan; re-writing it on every flush cycle is wasteful I/O.
             self.persist_dataframe(timeframe, new_df, update_cache=False)
             flushed_rows += len(rows)
-            buffer[timeframe] = []
 
-        # Flush tick data
         all_ticks: list[dict[str, Any]] = []
-        for timeframe, rows in tick_buffer.items():
-            if rows:
-                all_ticks.extend(rows)
-                tick_buffer[timeframe] = []
+        for rows in tck_snapshot.values():
+            all_ticks.extend(rows)
         if all_ticks:
             ticks_df = pd.DataFrame(all_ticks)
             persist_ticks(ticks_df, ticks_dir=self._parquet_ticks_dir, logger=self.logger)
@@ -410,8 +442,15 @@ class PolymarketDataPipeline:
         Reconnects on any error with exponential back-off.  Raises
         CancelledError when the task is cancelled by run_websocket so the
         caller can do a final flush.
+
+        Fix #6: tracks disconnect_time so the gap duration is logged on
+        each reconnect, making data gaps visible in the logs.
+        Fix #9: exception type and WebSocket close code are logged separately
+        so shard disconnects can be diagnosed remotely without ambiguity.
         """
         reconnect_attempts = 0
+        disconnect_time: float | None = None
+
         while True:
             try:
                 async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, max_size=None) as ws:
@@ -420,11 +459,21 @@ class PolymarketDataPipeline:
                         "type": "market",
                         "custom_feature_enabled": True,
                     }))
+                    connect_time = time.time()
+                    if disconnect_time is not None:
+                        gap_s = connect_time - disconnect_time
+                        self.logger.info(
+                            "WS shard %d/%d: reconnected after %.1fs gap — price data "
+                            "for this shard's markets will be backfilled by the next "
+                            "historical scan.",
+                            shard_idx + 1, n_shards, gap_s,
+                        )
                     self.logger.info(
                         "WS shard %d/%d: subscribed to %d tokens",
                         shard_idx + 1, n_shards, len(shard_token_ids),
                     )
                     reconnect_attempts = 0
+                    disconnect_time = None
 
                     while True:
                         message = await ws.recv()
@@ -495,12 +544,26 @@ class PolymarketDataPipeline:
 
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
-            except Exception as exc:
+            except websockets.exceptions.ConnectionClosed as exc:
+                # Record disconnect time for gap tracking on next reconnect.
+                disconnect_time = time.time()
                 reconnect_delay = min(10 * (2 ** reconnect_attempts), MAX_WS_RECONNECT_DELAY_SECONDS)
                 reconnect_attempts += 1
                 self.logger.warning(
-                    "WS shard %d/%d disconnected: %s. Reconnecting in %ss...",
-                    shard_idx + 1, n_shards, exc, reconnect_delay,
+                    "WS shard %d/%d: connection closed (code=%s reason=%r). "
+                    "Reconnecting in %ss...",
+                    shard_idx + 1, n_shards,
+                    getattr(exc, "code", "?"), getattr(exc, "reason", ""),
+                    reconnect_delay,
+                )
+                await asyncio.sleep(reconnect_delay)
+            except Exception as exc:
+                disconnect_time = time.time()
+                reconnect_delay = min(10 * (2 ** reconnect_attempts), MAX_WS_RECONNECT_DELAY_SECONDS)
+                reconnect_attempts += 1
+                self.logger.warning(
+                    "WS shard %d/%d: %s — %s. Reconnecting in %ss...",
+                    shard_idx + 1, n_shards, type(exc).__name__, exc, reconnect_delay,
                 )
                 await asyncio.sleep(reconnect_delay)
 
@@ -509,12 +572,57 @@ class PolymarketDataPipeline:
         ws_buffer: dict[str, list[dict[str, Any]]],
         tick_buffer: dict[str, list[dict[str, Any]]],
     ) -> None:
-        """Periodically flush WebSocket buffers to Parquet."""
+        """Periodically flush WebSocket buffers to Parquet.
+
+        Fixes #1 (blocking I/O) and #3 (unused WS_FLUSH_BATCH_SIZE):
+
+        • Parquet writes run in a ThreadPoolExecutor via run_in_executor so
+          the asyncio event loop is never blocked.  The ping/pong machinery
+          and ws.recv() calls in every shard continue processing throughout.
+        • Buffers are swapped atomically before the thread is dispatched, so
+          shard tasks can append without any contention.
+        • Flush fires on time (WS_FLUSH_INTERVAL_SECONDS) *or* size
+          (WS_FLUSH_BATCH_SIZE rows), whichever comes first.
+        """
+        loop = asyncio.get_running_loop()
+        _CHECK_INTERVAL = 1.0   # seconds between threshold checks
+        last_flush_time = loop.time()
+
         while True:
-            await asyncio.sleep(WS_FLUSH_INTERVAL_SECONDS)
-            flushed = self._flush_ws_buffer(ws_buffer, tick_buffer)
+            await asyncio.sleep(_CHECK_INTERVAL)
+
+            total_ws_rows = sum(len(v) for v in ws_buffer.values())
+            elapsed = loop.time() - last_flush_time
+
+            # Skip if neither threshold is met yet
+            if total_ws_rows == 0 and elapsed < WS_FLUSH_INTERVAL_SECONDS:
+                continue
+            if total_ws_rows < WS_FLUSH_BATCH_SIZE and elapsed < WS_FLUSH_INTERVAL_SECONDS:
+                continue
+
+            # Atomic buffer swap — no `await` between snapshot and clear so no
+            # shard task can interleave.  defaultdict creates a fresh list on the
+            # next append after the key is reset.
+            ws_snap: dict[str, list] = {}
+            tck_snap: dict[str, list] = {}
+            for tf in list(ws_buffer.keys()):
+                if ws_buffer[tf]:
+                    ws_snap[tf] = ws_buffer[tf]
+                    ws_buffer[tf] = []
+            for tf in list(tick_buffer.keys()):
+                if tick_buffer[tf]:
+                    tck_snap[tf] = tick_buffer[tf]
+                    tick_buffer[tf] = []
+
+            if not ws_snap and not tck_snap:
+                last_flush_time = loop.time()
+                continue
+
+            last_flush_time = loop.time()
+            # Blocking Parquet I/O runs in a thread; event loop stays free.
+            flushed = await loop.run_in_executor(None, self._flush_snapshot, ws_snap, tck_snap)
             if flushed:
-                self.logger.info("Flushed %d WebSocket ticks to disk", flushed)
+                self.logger.info("Flushed %d WebSocket rows to disk", flushed)
 
     async def run_websocket(self, active_markets: list[MarketRecord]) -> None:
         if not active_markets:
@@ -536,14 +644,22 @@ class PolymarketDataPipeline:
         ws_buffer: dict[str, list[dict[str, Any]]] = defaultdict(list)
         tick_buffer: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
+        # Fix #4: shuffle token IDs before sharding so that high-volume tokens
+        # (which arrive first because fetch_markets sorts by volume24hr DESC)
+        # are spread evenly across shards rather than concentrated in shards 0
+        # and 1.  Without shuffling those shards receive far more events/second,
+        # causing disproportionate server-side pressure and repeated disconnects.
+        shuffled_token_ids = token_ids[:]
+        random.shuffle(shuffled_token_ids)
+
         # Split tokens into shards so each subscription message stays well
         # below the ~200 KB threshold that causes Polymarket's server to drop
         # connections every 30-90 s.  Each shard runs as an independent asyncio
         # task with its own reconnect loop, so only 1/N shards go dark on any
         # single disconnect rather than all tokens simultaneously.
         shards = [
-            token_ids[i : i + WS_MAX_TOKENS_PER_SHARD]
-            for i in range(0, len(token_ids), WS_MAX_TOKENS_PER_SHARD)
+            shuffled_token_ids[i : i + WS_MAX_TOKENS_PER_SHARD]
+            for i in range(0, len(shuffled_token_ids), WS_MAX_TOKENS_PER_SHARD)
         ]
         n_shards = len(shards)
         self.logger.info(
@@ -569,9 +685,14 @@ class PolymarketDataPipeline:
             for task in all_tasks:
                 task.cancel()
             await asyncio.gather(*all_tasks, return_exceptions=True)
-            flushed = self._flush_ws_buffer(ws_buffer, tick_buffer)
-            if flushed:
-                self.logger.info("Final flush on shutdown: %d rows", flushed)
+            # Final synchronous flush — all tasks are done so there is no
+            # concurrent appending; no need for run_in_executor here.
+            final_ws  = {tf: rows for tf, rows in ws_buffer.items()   if rows}
+            final_tck = {tf: rows for tf, rows in tick_buffer.items() if rows}
+            if final_ws or final_tck:
+                flushed = self._flush_snapshot(final_ws, final_tck)
+                if flushed:
+                    self.logger.info("Final flush on shutdown: %d rows", flushed)
 
     def print_summary(self) -> None:
         self.logger.info("=== FINAL DATASETS ===")
@@ -770,8 +891,14 @@ class PolymarketDataPipeline:
                 return False
             if normalized_timeframes and m.timeframe not in normalized_timeframes:
                 return False
-            if scan_cutoff_ts and m.end_ts < scan_cutoff_ts:
-                return False
+            if scan_cutoff_ts:
+                # Prefer closed_ts (what the scan checkpoint tracks) over end_ts
+                # to keep the filter consistent with the pager stop-condition in
+                # api.py, which also uses closedTime.  Fall back to end_ts when
+                # closed_ts is unavailable (e.g. active markets).
+                market_ts = m.closed_ts if m.closed_ts is not None else m.end_ts
+                if market_ts < scan_cutoff_ts:
+                    return False
             return True
 
         # Number of markets whose price histories are fetched concurrently.

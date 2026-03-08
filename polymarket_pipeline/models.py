@@ -17,6 +17,7 @@ class MarketRecord:
     volume: float
     resolution: int | None
     is_active: bool
+    closed_ts: int | None = None  # closedTime from Gamma API; used for incremental scan cutoff
 
     @property
     def up_token_id(self) -> str:

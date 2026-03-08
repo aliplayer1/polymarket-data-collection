@@ -117,6 +117,9 @@ class PolymarketApi:
         if start_ts is None or end_ts is None or start_ts >= end_ts:
             return None
 
+        # closedTime is distinct from endDate and is what the scan checkpoint tracks.
+        closed_ts = parse_iso_timestamp(market.get("closedTime") or market.get("closed_time"))
+
         if not token1_id or not token2_id:
             return None
 
@@ -143,6 +146,7 @@ class PolymarketApi:
             volume=float(market.get("volume", 0) or 0),
             resolution=resolution,
             is_active=is_active,
+            closed_ts=closed_ts,
         )
 
     def fetch_markets(self, *, active: bool = False, closed: bool = False, end_ts_min: int | None = None) -> Iterator[MarketRecord]:
