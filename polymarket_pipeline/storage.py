@@ -69,6 +69,7 @@ TICKS_SCHEMA = pa.schema([
     ("size_usdc",    pa.float32()),
     ("tx_hash",      pa.string()),
     ("block_number", pa.int32()),
+    ("log_index",    pa.int32()),
     ("source",       pa.dictionary(pa.int8(), pa.string())),   # "onchain" / "websocket"
     # partition columns (crypto, timeframe) are implicit
 ])
@@ -154,6 +155,8 @@ def optimise_ticks_df(df: pd.DataFrame) -> pd.DataFrame:
     df["timeframe"]    = df["timeframe"].astype("category")
     if "block_number" in df.columns:
         df["block_number"] = df["block_number"].fillna(0).astype("int32")
+    if "log_index" in df.columns:
+        df["log_index"] = df["log_index"].fillna(0).astype("int32")
     if "tx_hash" not in df.columns:
         df["tx_hash"] = ""
     return df
@@ -194,7 +197,7 @@ def load_prices_for_timeframe(timeframe: str, prices_dir: str | None = None) -> 
 
 _TICKS_EMPTY_COLS = [
     "market_id", "timestamp_ms", "token_id", "outcome", "side",
-    "price", "size_usdc", "tx_hash", "block_number", "source", "crypto", "timeframe",
+    "price", "size_usdc", "tx_hash", "block_number", "log_index", "source", "crypto", "timeframe",
 ]
 
 
@@ -241,7 +244,7 @@ def persist_ticks(
             ticks_df = ticks_df.copy()
             if col in ("tx_hash",):
                 ticks_df[col] = ""
-            elif col in ("block_number",):
+            elif col in ("block_number", "log_index"):
                 ticks_df[col] = 0
             else:
                 ticks_df[col] = None
@@ -266,7 +269,7 @@ def persist_ticks(
 
     merged = (
         pd.concat([existing, ticks_df], ignore_index=True)
-        .drop_duplicates(subset=["market_id", "timestamp_ms", "token_id", "tx_hash"], keep="last")
+        .drop_duplicates(subset=["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"], keep="last")
         .sort_values(["market_id", "timestamp_ms"])
         .reset_index(drop=True)
     )

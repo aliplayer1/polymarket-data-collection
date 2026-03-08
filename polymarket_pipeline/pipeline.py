@@ -196,7 +196,7 @@ class PolymarketDataPipeline:
             direction="backward",
             allow_exact_matches=True,
         )
-        merged_prices = merged_prices.dropna(subset=["price_1", "price_2"])
+        merged_prices = merged_prices.fillna({"price_1": 0.5, "price_2": 0.5})
         if merged_prices.empty:
             return None
 
@@ -464,6 +464,7 @@ class PolymarketDataPipeline:
                                     "size_usdc":    size_usdc,
                                     "tx_hash":      str(event.get("hash") or event.get("tx_hash") or ""),
                                     "block_number": 0,          # not available from WS
+                                    "log_index":    0,          # not available from WS
                                     "source":       "websocket",
                                 }
                             )
