@@ -78,18 +78,18 @@ except ImportError:
 
 
 # Per canonical-path threading locks (in-process thread safety)
-_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_WRITE_LOCKS: dict[str, threading.RLock] = {}
 _WRITE_LOCKS_REGISTRY_LOCK = threading.Lock()
 
 # fcntl deadlock prevention
-_FLOCK_TIMEOUT_SECONDS: float = float(os.environ.get("PM_FLOCK_TIMEOUT", "60"))
+_FLOCK_TIMEOUT_SECONDS: float = float(os.environ.get("PM_FLOCK_TIMEOUT", "300"))
 _FLOCK_POLL_INTERVAL = 0.05   # seconds between LOCK_NB retry attempts
 
 
-def _get_thread_lock(canonical_root: str) -> threading.Lock:
+def _get_thread_lock(canonical_root: str) -> threading.RLock:
     with _WRITE_LOCKS_REGISTRY_LOCK:
         if canonical_root not in _WRITE_LOCKS:
-            _WRITE_LOCKS[canonical_root] = threading.Lock()
+            _WRITE_LOCKS[canonical_root] = threading.RLock()
         return _WRITE_LOCKS[canonical_root]
 
 
@@ -1007,48 +1007,53 @@ def upload_to_huggingface(
     api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True)
     log.info("Hugging Face repo: https://huggingface.co/datasets/%s", repo)
 
-    # Consolidate any shard/staging files before uploading so that
-    # all data is in the main partition files.  Skip if the caller already
-    # ran consolidation in this session (skip_consolidate=True).
-    if not skip_consolidate and os.path.exists(t_dir):
-        consolidate_ticks(ticks_dir=t_dir, logger=log)
+    # Use the cross-process lock to ensure the dataset is stable during upload.
+    # Holding the lock prevents the WebSocket service from flushing/deleting
+    # files while the HF uploader is scanning the partition tree.
+    data_root = os.path.dirname(os.path.abspath(m_path))
+    with _write_lock(data_root):
+        # Consolidate any shard/staging files before uploading so that
+        # all data is in the main partition files.  Skip if the caller already
+        # ran consolidation in this session (skip_consolidate=True).
+        if not skip_consolidate and os.path.exists(t_dir):
+            consolidate_ticks(ticks_dir=t_dir, logger=log)
 
-    # Upload markets table
-    if os.path.exists(m_path):
-        api.upload_file(
-            path_or_fileobj=m_path,
-            path_in_repo="data/markets.parquet",
-            repo_id=repo,
-            repo_type="dataset",
-        )
-        log.info("Uploaded %s -> data/markets.parquet", m_path)
+        # Upload markets table
+        if os.path.exists(m_path):
+            api.upload_file(
+                path_or_fileobj=m_path,
+                path_in_repo="data/markets.parquet",
+                repo_id=repo,
+                repo_type="dataset",
+            )
+            log.info("Uploaded %s -> data/markets.parquet", m_path)
 
-    # Patterns to exclude from folder uploads: staging files (actively
-    # written by the WebSocket service), backfill shards (consolidated
-    # into part-0.parquet), and atomic-write temp files.
-    _ignore = ["**/ws_staging.parquet", "**/backfill_*.parquet", "**/*.tmp"]
+        # Patterns to exclude from folder uploads: staging files (actively
+        # written by the WebSocket service), backfill shards (consolidated
+        # into part-0.parquet), and atomic-write temp files.
+        _ignore = ["**/ws_staging.parquet", "**/backfill_*.parquet", "**/*.tmp"]
 
-    # Upload prices partition tree
-    if os.path.exists(p_dir):
-        api.upload_folder(
-            folder_path=p_dir,
-            path_in_repo="data/prices",
-            repo_id=repo,
-            repo_type="dataset",
-            ignore_patterns=_ignore,
-        )
-        log.info("Uploaded %s/ -> data/prices/", p_dir)
+        # Upload prices partition tree
+        if os.path.exists(p_dir):
+            api.upload_folder(
+                folder_path=p_dir,
+                path_in_repo="data/prices",
+                repo_id=repo,
+                repo_type="dataset",
+                ignore_patterns=_ignore,
+            )
+            log.info("Uploaded %s/ -> data/prices/", p_dir)
 
-    # Upload ticks partition tree
-    if os.path.exists(t_dir):
-        api.upload_folder(
-            folder_path=t_dir,
-            path_in_repo="data/ticks",
-            repo_id=repo,
-            repo_type="dataset",
-            ignore_patterns=_ignore,
-        )
-        log.info("Uploaded %s/ -> data/ticks/", t_dir)
+        # Upload ticks partition tree
+        if os.path.exists(t_dir):
+            api.upload_folder(
+                folder_path=t_dir,
+                path_in_repo="data/ticks",
+                repo_id=repo,
+                repo_type="dataset",
+                ignore_patterns=_ignore,
+            )
+            log.info("Uploaded %s/ -> data/ticks/", t_dir)
 
     log.info("Upload complete.")
 
