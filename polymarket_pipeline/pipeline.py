@@ -648,6 +648,8 @@ class PolymarketDataPipeline:
                 return False
             if normalized_timeframes and m.timeframe not in normalized_timeframes:
                 return False
+            if scan_cutoff_ts and m.end_ts < scan_cutoff_ts:
+                return False
             return True
 
         # Helper to process a batch of markets
