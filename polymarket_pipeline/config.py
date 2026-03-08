@@ -23,6 +23,11 @@ PAGE_SIZE = 500
 PRICE_HISTORY_CHUNK_SECONDS = 7 * 24 * 60 * 60
 WS_FLUSH_INTERVAL_SECONDS = 5
 WS_FLUSH_BATCH_SIZE = 200
+# Max token IDs per WebSocket connection.  Polymarket silently drops connections
+# whose subscription message exceeds ~200 KB.  1300+ active markets produce
+# 2600+ token IDs (~200 KB) in a single message → server drops every 30-90 s.
+# 500 tokens ≈ 38 KB per shard; with ~6 shards all connections stay stable.
+WS_MAX_TOKENS_PER_SHARD = 500
 
 TIME_FRAMES = ("5-minute", "15-minute", "1-hour", "4-hour")
 
