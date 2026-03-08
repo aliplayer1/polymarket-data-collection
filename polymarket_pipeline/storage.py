@@ -736,11 +736,14 @@ def consolidate_ticks(
                 con.execute(f"SET temp_directory='{temp_dir}'")
                 
                 # 2. Limit memory: leave some RAM for the OS and other processes.
-                # Since the server has ~7.5GB total, 4GB is a safe limit.
-                con.execute("SET memory_limit='4GB'")
+                # The server has 7.5GB total, 6.4GB free. 6GB allows DuckDB to use most of it.
+                con.execute("SET memory_limit='6GB'")
                 
                 # 3. Limit threads: too many threads = too many concurrent memory-intensive tasks.
-                con.execute("SET threads=4")
+                con.execute("SET threads=2")
+
+                # 4. Disable insertion order preservation to save memory during sorting/deduplication.
+                con.execute("SET preserve_insertion_order=false")
 
                 result = con.execute(f"""
                     COPY (
