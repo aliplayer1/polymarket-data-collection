@@ -56,15 +56,17 @@ mkdir -p "$DATA_DIR" "$LOG_DIR"
 chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" "$LOG_DIR"
 
 # ── 4. Clone or update code from GitHub ───────────────────────────────────────
+# Run git as root (this script already runs as root) to avoid credential
+# prompts that a nologin system user cannot answer.
+# Allow root to operate on a directory owned by the service user.
+git config --global --add safe.directory "$APP_DIR"
 if [ -d "$APP_DIR/.git" ]; then
     echo "Updating existing repository..."
-    sudo -u "$SERVICE_USER" git -C "$APP_DIR" pull --ff-only
+    git -C "$APP_DIR" pull --ff-only
 else
-    # Remove the directory if it exists but isn't a git repo (e.g. from a
-    # failed previous run), then clone fresh.
     rm -rf "$APP_DIR"
     echo "Cloning repository..."
-    sudo -u "$SERVICE_USER" git clone "$REPO_URL" "$APP_DIR"
+    git clone "$REPO_URL" "$APP_DIR"
 fi
 chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
 

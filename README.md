@@ -1,9 +1,10 @@
 # Polymarket Data Pipeline
 
-Modular pipeline for collecting historical and real-time Polymarket crypto up/down market data, with normalised Parquet storage and Hugging Face Hub integration. Designed to run unattended on a cloud instance (OCI, AWS, etc.) and accumulate datasets suitable for training intramarket ML / scalping models.
+Modular pipeline for collecting historical and real-time Polymarket crypto up/down market data, with normalised Parquet storage and Hugging Face Hub integration. Designed to run unattended on a cloud server and accumulate datasets suitable for training intramarket ML / scalping models.
 
 ## Table of Contents
 
+- [Server Management](#server-management)
 - [Quick Reference](#quick-reference)
 - [Structure](#structure)
 - [Setup](#setup)
@@ -11,9 +12,10 @@ Modular pipeline for collecting historical and real-time Polymarket crypto up/do
   - [CLI Options](#cli-options)
   - [Environment Variables](#environment-variables)
   - [Examples](#examples)
-- [Cloud Deployment (Oracle Cloud Free Tier)](#cloud-deployment-oracle-cloud-free-tier)
+- [Cloud Deployment (Hetzner)](#cloud-deployment-hetzner)
   - [Architecture](#architecture)
   - [Quick Start](#quick-start)
+  - [Deploying Code Updates](#deploying-code-updates)
 - [Tick-Level Trade Data](#tick-level-trade-data)
   - [Sources](#sources)
   - [On-Chain Backfill](#on-chain-backfill)
@@ -34,9 +36,35 @@ Modular pipeline for collecting historical and real-time Polymarket crypto up/do
   - [Real-Time Streaming](#real-time-streaming)
   - [Reliability Features](#reliability-features)
 
+## Server Management
+
+> Essential commands for managing the live deployment on the Hetzner server.
+
+```bash
+# Check service status
+ssh hetzner-root 'systemctl status polymarket-live polymarket-historical.timer'
+
+# Follow live logs
+ssh hetzner-root 'journalctl -fu polymarket-live'
+
+# Check last historical sync run
+ssh hetzner-root 'journalctl -u polymarket-historical --since "24h ago"'
+
+# Check disk usage
+ssh hetzner-root 'du -sh /opt/polymarket/data/'
+
+# Deploy a code update
+git push
+ssh hetzner-root 'git -C /opt/polymarket pull && systemctl restart polymarket-live'
+
+# Restart services manually
+ssh hetzner-root 'systemctl restart polymarket-live'
+ssh hetzner-root 'systemctl restart polymarket-historical.timer'
+```
+
 ## Quick Reference
 
-> Common commands for returning users. See [Usage](#usage) for the full option reference.
+> Common commands for local development. See [Usage](#usage) for the full option reference.
 
 ```bash
 # First-time setup
@@ -56,7 +84,7 @@ cp .env.example .env   # then fill in your keys
 # Limit initial backfill to the last 12 months (faster first run)
 .venv/bin/python -m polymarket_pipeline --historical-only --from-date 2025-02-28
 
-# Write to a specific directory (e.g. block volume) and log to file
+# Write to a specific directory and log to file
 .venv/bin/python -m polymarket_pipeline \
     --data-dir /mnt/data/polymarket \
     --log-file /var/log/polymarket/pipeline.log
@@ -75,7 +103,6 @@ cp .env.example .env   # then fill in your keys
 
 | File | Purpose |
 | ------ | --------- |
-| `test.py` | Compatibility entrypoint |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Environment variable template |
 | `polymarket_pipeline/config.py` | Constants and runtime configuration |
@@ -89,7 +116,7 @@ cp .env.example .env   # then fill in your keys
 | `polymarket_pipeline/pipeline.py` | Historical + WebSocket ingestion orchestration |
 | `polymarket_pipeline/cli.py` | CLI argument parsing and logging setup |
 | `polymarket_pipeline/__main__.py` | Module runner (`python -m polymarket_pipeline`) |
-| `deploy/setup.sh` | One-shot OCI provisioner (Ubuntu 22.04) |
+| `deploy/setup.sh` | One-shot server provisioner (Ubuntu 22.04/24.04) |
 | `deploy/polymarket-live.service` | systemd unit — continuous WebSocket stream |
 | `deploy/polymarket-historical.service` | systemd unit — historical fetch (one-shot) |
 | `deploy/polymarket-historical.timer` | systemd timer — triggers historical fetch every 6 h |
@@ -123,11 +150,7 @@ cp .env.example .env
 ## Usage
 
 ```bash
-# Via module runner
 .venv/bin/python -m polymarket_pipeline [OPTIONS]
-
-# Via compatibility entrypoint
-.venv/bin/python test.py [OPTIONS]
 ```
 
 ### CLI Options
@@ -139,11 +162,11 @@ cp .env.example .env
 | `--markets ID ...` | list | Restrict collection to specific market IDs |
 | `--crypto SYMBOL ...` | list | Filter by cryptocurrency symbol: `BTC`, `ETH`, `SOL` |
 | `--timeframe TF ...` | list | Filter by timeframe: `5m`, `15m`, `1h`, `4h` |
-| `--from-date YYYY-MM-DD` | str | Only scan markets that closed on or after this date. Useful for the initial backfill. On subsequent runs the cutoff is auto-detected from a saved checkpoint — you normally don't need this flag. |
+| `--from-date YYYY-MM-DD` | str | Only scan markets that closed on or after this date. On subsequent runs the cutoff is auto-detected from a saved checkpoint — you normally don't need this flag. |
 | `--upload` | flag | Upload the Parquet dataset to Hugging Face Hub after collection |
-| `--hf-repo USER/REPO` | str | Hugging Face dataset repo ID (default: `polymarket-crypto-updown`) |
-| `--data-dir PATH` | str | Root directory for Parquet output. Defaults to `data/` relative to the working directory. Set to an absolute path (e.g. `/mnt/data/polymarket`) on a cloud instance. Overrides `POLYMARKET_DATA_DIR` env var. |
-| `--log-file PATH` | str | Append log output to a file in addition to stdout. Parent directories are created automatically. Overrides `POLYMARKET_LOG_FILE` env var. |
+| `--hf-repo USER/REPO` | str | Hugging Face dataset repo ID (overrides `HF_REPO_ID` env var) |
+| `--data-dir PATH` | str | Root directory for Parquet output. Defaults to `data/`. Overrides `POLYMARKET_DATA_DIR` env var. |
+| `--log-file PATH` | str | Append log output to a file in addition to stdout. Overrides `POLYMARKET_LOG_FILE` env var. |
 | `--polygonscan-key KEY` | str | Polygonscan API key for on-chain tick backfill (overrides `POLYGONSCAN_API_KEY` env var) |
 | `--rpc-url URL` | str | Polygon JSON-RPC endpoint for tick backfill fallback (overrides `POLYGON_RPC_URL` env var) |
 
@@ -153,10 +176,10 @@ All credentials and path overrides can be set in `.env` (loaded automatically vi
 
 | Variable | Description |
 | --------- | ------------- |
-| `POLYGONSCAN_API_KEY` | Free API key from [polygonscan.com/myapikey](https://polygonscan.com/myapikey) |
-| `POLYGON_RPC_URL` | Polygon JSON-RPC endpoint — fallback for tick backfill. Defaults to `https://polygon-bor-rpc.publicnode.com` in `.env.example`. Avoid `polygon-rpc.com` (returns 401). |
 | `HF_TOKEN` | Hugging Face write token for `--upload` (from [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)) |
 | `HF_REPO_ID` | Default Hugging Face repo ID (overridden per-run by `--hf-repo`) |
+| `POLYGONSCAN_API_KEY` | Free API key from [polygonscan.com/myapikey](https://polygonscan.com/myapikey) |
+| `POLYGON_RPC_URL` | Polygon JSON-RPC endpoint — fallback for tick backfill. Defaults to `https://polygon-bor-rpc.publicnode.com`. |
 | `POLYMARKET_DATA_DIR` | Root directory for Parquet output (overridden per-run by `--data-dir`) |
 | `POLYMARKET_LOG_FILE` | Log file path (overridden per-run by `--log-file`) |
 
@@ -180,7 +203,7 @@ Collect and upload to Hugging Face Hub:
 .venv/bin/python -m polymarket_pipeline --historical-only --upload --hf-repo myuser/polymarket-data
 ```
 
-Write data to a specific directory (e.g. a mounted block volume):
+Write data to a specific directory:
 
 ```bash
 .venv/bin/python -m polymarket_pipeline --data-dir /mnt/data/polymarket --log-file /var/log/polymarket/pipeline.log
@@ -192,34 +215,20 @@ Test mode — collect 10 markets and validate the output:
 .venv/bin/python -m polymarket_pipeline --test 10
 ```
 
-Test mode with filters applied:
+## Cloud Deployment (Hetzner)
 
-```bash
-.venv/bin/python -m polymarket_pipeline --test 5 --crypto BTC --timeframe 1h
-```
-
-Run with on-chain tick backfill (requires a Polygonscan API key in `.env` or via flag):
-
-```bash
-.venv/bin/python -m polymarket_pipeline --crypto BTC
-```
-
-## Cloud Deployment (Oracle Cloud Free Tier)
-
-The `deploy/` directory contains everything needed to run the pipeline continuously on a free **Oracle Cloud Infrastructure (OCI)** instance.
+The `deploy/` directory contains everything needed to run the pipeline continuously on a **Hetzner CAX21** instance (Ubuntu 22.04/24.04, ARM64). The same setup works on any Ubuntu 22.04+ server.
 
 ### Architecture
 
 ```text
-OCI VM.Standard.A1.Flex (4 OCPU / 24 GB RAM — Always Free)
+Hetzner CAX21 (4 vCPU ARM64 / 8 GB RAM / 80 GB SSD)
   ├── polymarket-live.service      → 24/7 WebSocket stream, auto-restart
-  └── polymarket-historical.timer  → historical re-fetch every 6 h + HF upload
+  └── polymarket-historical.timer  → incremental historical re-fetch every 6 h + HF upload
 
-  Block Volume (200 GB — Always Free)
-  └── /mnt/data/polymarket/
-        ├── markets.parquet
-        ├── prices/   (Hive-partitioned)
-        └── ticks/    (Hive-partitioned)
+  /opt/polymarket/          ← app code (cloned from GitHub)
+  /opt/polymarket/data/     ← Parquet data storage
+  /var/log/polymarket/      ← log files
 
   Hugging Face Hub dataset repo
   └── updated every 6 h via --upload
@@ -227,28 +236,58 @@ OCI VM.Standard.A1.Flex (4 OCPU / 24 GB RAM — Always Free)
 
 ### Quick Start
 
-1. Create an **OCI VM.Standard.A1.Flex** instance (Ubuntu 22.04) with a **200 GB Block Volume** attached.
-1. Push this repo to GitHub and update the clone URL in `deploy/setup.sh`.
-1. SSH into the instance and run the provisioner as root:
+1. **Push this repo to GitHub** (must be a public repo for unauthenticated HTTPS clone, or use a PAT).
+
+2. **Copy your `.env` to the server:**
 
 ```bash
-sudo bash setup.sh
+scp .env root@<server-ip>:/tmp/polymarket.env
 ```
 
-1. Edit `/opt/polymarket/.env` with your credentials, then restart the services:
+1. **Copy and run the provisioner as root:**
 
 ```bash
-sudo systemctl restart polymarket-live polymarket-historical.timer
+scp deploy/setup.sh root@<server-ip>:/tmp/setup.sh
+ssh root@<server-ip> 'bash /tmp/setup.sh'
 ```
 
-1. Verify:
+`setup.sh` will:
+
+- Install system packages and Python
+- Create the `polymarket` service user
+- Clone the repo to `/opt/polymarket`
+- Install the Python virtual environment and dependencies
+- Install the systemd service and timer files
+- Run the **initial full historical backfill** in the foreground (10–60 minutes)
+- Enable and start both services automatically
+
+1. **Verify the services are running:**
 
 ```bash
-sudo journalctl -fu polymarket-live
-sudo systemctl list-timers polymarket-historical.timer
+ssh root@<server-ip> 'systemctl status polymarket-live polymarket-historical.timer'
+ssh root@<server-ip> 'journalctl -fu polymarket-live'
 ```
 
-See `deploy/setup.sh` for the full provisioning details.
+### Deploying Code Updates
+
+```bash
+# Push changes from local machine
+git push
+
+# Pull and restart on the server
+ssh hetzner-root 'git -C /opt/polymarket pull && systemctl restart polymarket-live'
+```
+
+If you changed a service or timer file:
+
+```bash
+ssh hetzner-root 'git -C /opt/polymarket pull && \
+  cp /opt/polymarket/deploy/polymarket-live.service /etc/systemd/system/ && \
+  cp /opt/polymarket/deploy/polymarket-historical.service /etc/systemd/system/ && \
+  cp /opt/polymarket/deploy/polymarket-historical.timer /etc/systemd/system/ && \
+  systemctl daemon-reload && \
+  systemctl restart polymarket-live'
+```
 
 ## Tick-Level Trade Data
 
@@ -298,8 +337,7 @@ Deduplication is applied on `(market_id, timestamp_ms, token_id, tx_hash)` so re
 
 ## Test Mode
 
-The `--test N` flag provides a safe, non-destructive way to verify the data collection
-pipeline end-to-end before running a full backfill.
+The `--test N` flag provides a safe, non-destructive way to verify the data collection pipeline end-to-end before running a full backfill.
 
 **What it does:**
 
@@ -409,22 +447,17 @@ The `--upload` flag pushes the local Parquet dataset to a Hugging Face Hub datas
 
 ### Authentication
 
-Set the `HF_TOKEN` environment variable in `.env`:
+Set `HF_TOKEN` and `HF_REPO_ID` in `.env`:
 
 ```bash
 HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
-```
-
-Or log in interactively (one-time):
-
-```bash
-huggingface-cli login
+HF_REPO_ID=myuser/polymarket-data
 ```
 
 ### Upload
 
 ```bash
-# Upload to the default repo
+# Upload using HF_REPO_ID from .env
 .venv/bin/python -m polymarket_pipeline --historical-only --upload
 
 # Upload to a specific repo
@@ -489,4 +522,4 @@ Active markets are monitored over a WebSocket connection (`ws-subscriptions-clob
 - **Atomic writes** — Parquet files are written to a `.tmp` path and then atomically renamed, preventing partial/corrupt files on crash.
 - **Partition-aware I/O** — On each write, only the affected `(crypto, timeframe)` Parquet partitions are loaded from disk for merging. Unrelated partitions are never read or overwritten.
 - **Price validation** — Out-of-range prices (outside [0, 1]) are filtered during fetch and logged as warnings.
-- **Incremental scan checkpoint** — After each completed closed-market scan, the pipeline writes `data/.scan_checkpoint` with the highest `end_ts` seen. On subsequent runs this is read automatically and the market scan stops as soon as it reaches pages older than `checkpoint − 2 days`. The initial full scan (Polymarket has 26 k+ markets) takes ~60 s; every 6-hourly OCI run after that takes 2–5 s. Pass `--from-date YYYY-MM-DD` to override the cutoff manually for the initial backfill.
+- **Incremental scan checkpoint** — After each completed closed-market scan, the pipeline writes `data/.scan_checkpoint` with the highest `end_ts` seen. On subsequent runs this is read automatically and the market scan stops as soon as it reaches pages older than `checkpoint − 2 days`. The initial full scan takes ~60 s; every 6-hourly run after that takes 2–5 s. Pass `--from-date YYYY-MM-DD` to override the cutoff manually.
