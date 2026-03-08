@@ -251,6 +251,84 @@ def load_markets(markets_path: str | None = None) -> pd.DataFrame:
     return pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution"])
 
 
+def _read_hive_partitioned_robust(
+    path: str,
+    partition_cols: list[str],
+    filters: list | None,
+    empty_cols: list[str],
+) -> pd.DataFrame:
+    """File-by-file fallback for Hive-partitioned Parquet directories.
+
+    Used when ``pq.ParquetDataset.read()`` raises ``ArrowInvalid`` due to
+    dictionary index-type mismatches across shards — e.g. old files that have
+    ``crypto`` / ``timeframe`` embedded as ``dict<int8>`` data columns next to
+    newer files written by ``_write_partitioned_atomic`` where those columns
+    are path-encoded (read back by PyArrow as ``dict<int32>``).
+
+    Each file is read in isolation with ``pq.read_table``, any partition
+    columns present in the file data are dropped, and the correct string
+    values are re-injected from the directory path.  Partition-level filter
+    pruning is applied before reading so unneeded directories are skipped.
+    """
+    # Build per-OR-group partition equality maps from the DNF filter list.
+    # Filters format: [[("col","=","val"), ...], ...]  (OR of AND-groups).
+    allowed: list[dict[str, str]] | None = None
+    if filters:
+        allowed = []
+        for and_group in filters:
+            group: dict[str, str] = {}
+            for item in and_group:
+                col, op, val = item[0], item[1], item[2]
+                if op == "=" and col in partition_cols:
+                    group[col] = str(val)
+            allowed.append(group)
+
+    frames: list[pd.DataFrame] = []
+    for dirpath, _dirs, fnames in os.walk(path):
+        parquet_files = [f for f in fnames if f.endswith(".parquet")]
+        if not parquet_files:
+            continue
+
+        # Extract partition column values from the directory path segments.
+        partition_values: dict[str, str] = {}
+        rel = os.path.relpath(dirpath, path)
+        for segment in rel.replace("\\", "/").split("/"):
+            if "=" in segment:
+                k, v = segment.split("=", 1)
+                partition_values[k] = v
+
+        # Skip directories that don't match any OR-group.
+        if allowed is not None:
+            if not any(
+                all(partition_values.get(col) == val for col, val in grp.items())
+                for grp in allowed
+            ):
+                continue
+
+        for fname in parquet_files:
+            try:
+                t = pq.read_table(os.path.join(dirpath, fname))
+            except Exception:
+                continue
+            # Drop partition columns present in the file data (old-format files).
+            for col in partition_cols:
+                if col in t.schema.names:
+                    t = t.remove_column(t.schema.get_field_index(col))
+            df = t.to_pandas()
+            # Re-add partition columns as plain strings from the directory path.
+            for col, val in partition_values.items():
+                df[col] = val
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(columns=empty_cols)
+    return pd.concat(frames, ignore_index=True)
+
+
+_PRICES_EMPTY_COLS = ["market_id", "timestamp", "up_price", "down_price", "crypto", "timeframe"]
+_HIVE_PARTITION_COLS = ["crypto", "timeframe"]
+
+
 def load_prices(prices_dir: str | None = None, filters: list | None = None) -> pd.DataFrame:
     """Load the prices table from a Hive-partitioned Parquet directory.
 
@@ -258,18 +336,24 @@ def load_prices(prices_dir: str | None = None, filters: list | None = None) -> p
     ----------
     prices_dir : path to the partitioned directory.
     filters : optional PyArrow filter expression list,
-              e.g. [("crypto", "=", "BTC"), ("timeframe", "=", "1-hour")]
+              e.g. [[("crypto", "=", "BTC"), ("timeframe", "=", "1-hour")]]
     """
     path = prices_dir or PARQUET_PRICES_DIR
     if not os.path.exists(path):
-        return pd.DataFrame(columns=["market_id", "timestamp", "up_price", "down_price", "crypto", "timeframe"])
-    dataset = pq.ParquetDataset(path, filters=filters)
-    return dataset.read().to_pandas()
+        return pd.DataFrame(columns=_PRICES_EMPTY_COLS)
+    try:
+        dataset = pq.ParquetDataset(path, filters=filters)
+        return dataset.read().to_pandas()
+    except pa.lib.ArrowInvalid:
+        # Schema mismatch between shards (e.g. old files with crypto/timeframe
+        # as embedded dict<int8> vs newer path-encoded files read as dict<int32>).
+        # Fall back to reading each file individually and normalising.
+        return _read_hive_partitioned_robust(path, _HIVE_PARTITION_COLS, filters, _PRICES_EMPTY_COLS)
 
 
 def load_prices_for_timeframe(timeframe: str, prices_dir: str | None = None) -> pd.DataFrame:
     """Convenience: load prices filtered to a single timeframe."""
-    return load_prices(prices_dir, filters=[("timeframe", "=", timeframe)])
+    return load_prices(prices_dir, filters=[[("timeframe", "=", timeframe)]])
 
 
 _TICKS_EMPTY_COLS = [
@@ -283,8 +367,11 @@ def load_ticks(ticks_dir: str | None = None, filters: list | None = None) -> pd.
     path = ticks_dir or PARQUET_TICKS_DIR
     if not os.path.exists(path):
         return pd.DataFrame(columns=_TICKS_EMPTY_COLS)
-    dataset = pq.ParquetDataset(path, filters=filters)
-    return dataset.read().to_pandas()
+    try:
+        dataset = pq.ParquetDataset(path, filters=filters)
+        return dataset.read().to_pandas()
+    except pa.lib.ArrowInvalid:
+        return _read_hive_partitioned_robust(path, _HIVE_PARTITION_COLS, filters, _TICKS_EMPTY_COLS)
 
 
 def load_ticks_for_market(

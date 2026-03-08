@@ -13,6 +13,7 @@ This document covers all pipeline execution arguments, `.env` configurations, an
 | Flag | Type | Description |
 | ------ | ------ | ------------- |
 | `--historical-only` | flag | Collect historical closed markets only; skip active markets and WebSocket streaming |
+| `--websocket-only` | flag | Skip the historical scan and tick backfill phases; go straight to WebSocket streaming for currently-active markets. Useful when a separate `--historical-only` process is already running. |
 | `--test N` | int | **Test mode**: collect N historical markets into isolated output, then run a validation report |
 | `--markets ID ...` | list | Restrict collection to specific market IDs |
 | `--crypto SYMBOL ...` | list | Filter by cryptocurrency symbol: `BTC`, `ETH`, `SOL` |
@@ -50,6 +51,12 @@ Historical backfill only, filtered by asset and timeframe:
 
 ```bash
 .venv/bin/python -m polymarket_pipeline --historical-only --crypto BTC ETH --timeframe 15m 1h
+```
+
+WebSocket-only stream (used alongside a concurrent `--historical-only` service):
+
+```bash
+.venv/bin/python -m polymarket_pipeline --websocket-only
 ```
 
 Collect and upload to Hugging Face Hub:
