@@ -870,6 +870,11 @@ def upload_to_huggingface(
     api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True)
     log.info("Hugging Face repo: https://huggingface.co/datasets/%s", repo)
 
+    # Consolidate any shard/staging files before uploading so that
+    # all data is in the main partition files.
+    if os.path.exists(t_dir):
+        consolidate_ticks(ticks_dir=t_dir, logger=log)
+
     # Upload markets table
     if os.path.exists(m_path):
         api.upload_file(
