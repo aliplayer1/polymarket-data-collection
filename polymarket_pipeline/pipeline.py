@@ -622,26 +622,28 @@ class PolymarketDataPipeline:
         self.load_existing_data()
 
         # Compute scan cutoff for incremental runs.
-        # After a successful full scan the checkpoint file holds the max end_ts
+        # After a successful scan the checkpoint file holds the max end_ts
         # seen.  Subsequent runs only need to scan markets that closed after
         # (checkpoint - 2 days), skipping the thousands of already-seen pages.
+        # Priority: checkpoint > --from-date > full scan (no cutoff).
         scan_cutoff_ts: int | None = None
         if not is_test:
-            if from_date:
+            checkpoint = self._load_scan_checkpoint()
+            if checkpoint is not None:
+                scan_cutoff_ts = checkpoint - 2 * 86400  # 2-day lookback buffer
+                cutoff_date = datetime.fromtimestamp(scan_cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                self.logger.info(
+                    "Incremental scan: re-checking markets from %s onwards (checkpoint=%s)",
+                    cutoff_date, checkpoint,
+                )
+            elif from_date:
                 try:
                     scan_cutoff_ts = int(datetime.strptime(from_date, "%Y-%m-%d").timestamp())
-                    self.logger.info("Scan limited to markets closing on or after %s", from_date)
+                    self.logger.info("No checkpoint found; scan limited to markets closing on or after %s", from_date)
                 except ValueError:
                     self.logger.warning("Invalid --from-date value '%s'; scanning all markets", from_date)
             else:
-                checkpoint = self._load_scan_checkpoint()
-                if checkpoint is not None:
-                    scan_cutoff_ts = checkpoint - 2 * 86400  # 2-day lookback buffer
-                    cutoff_date = datetime.fromtimestamp(scan_cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d")
-                    self.logger.info(
-                        "Incremental scan: re-checking markets from %s onwards (checkpoint=%s)",
-                        cutoff_date, checkpoint,
-                    )
+                self.logger.info("No checkpoint and no --from-date; scanning all closed markets")
 
         # Normalize timeframe arguments (e.g. "5m" to "5-minute")
         normalized_timeframes = []
@@ -736,6 +738,10 @@ class PolymarketDataPipeline:
 
             if m.end_ts > max_end_ts_seen:
                 max_end_ts_seen = m.end_ts
+
+            # Save checkpoint periodically so progress survives SIGTERM.
+            if not is_test and fetched_closed % 500 == 0 and max_end_ts_seen > 0:
+                self._save_scan_checkpoint(max_end_ts_seen)
 
             if is_market_relevant(m):
                 relevant_batch.append(m)
