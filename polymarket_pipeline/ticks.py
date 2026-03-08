@@ -357,35 +357,33 @@ class PolygonTickFetcher:
 
         self.logger.debug("Fetching logs for blocks %s–%s", start_block, end_block)
 
-        # Prefer RPC for log fetching: eth_getLogs returns all results in one
-        # call per chunk (no pagination protocol), so a 15-block chunk costs
-        # one 0.5 s rate-limited call vs. ~3 pages × 0.42 s on Polygonscan.
-        # Polygonscan is still used above for block-number lookups via
-        # _ts_to_block_polygonscan — those are cheap (one call, cached) and
-        # more reliable than the RPC binary-search fallback.
+        # Prefer Polygonscan for log fetching: Alchemy's free-tier archive
+        # nodes frequently return HTTP 503 / JSON-RPC -32001 ("Unable to
+        # complete request at this time") for cold historical block ranges,
+        # burning ~60-70 s per window in futile retries before falling back.
+        # Polygonscan's free tier handles historical getLogs reliably.
         #
-        # _fetch_logs_rpc returns None (not []) when blocks had to be skipped
-        # due to persistent node errors; in that case fall through to Polygonscan.
-        if self.rpc_url:
-            logs = self._fetch_logs_rpc(start_block, end_block)
-            if logs is not None:
-                return logs
-            if self.polygonscan_key:
-                self.logger.warning(
-                    "RPC log fetch had persistent failures; falling back to Polygonscan "
-                    "(blocks %s–%s)", start_block, end_block,
-                )
-            else:
-                self.logger.error(
-                    "RPC log fetch failed and no Polygonscan key configured; "
-                    "returning partial results for blocks %s–%s", start_block, end_block,
-                )
-                return []
-
+        # RPC is kept as a fallback for when Polygonscan is unavailable or
+        # when no Polygonscan key is configured.
         if self.polygonscan_key:
             logs = self._fetch_logs_polygonscan(start_block, end_block)
             if logs is not None:
                 return logs
+            if self.rpc_url:
+                self.logger.warning(
+                    "Polygonscan log fetch failed; falling back to RPC "
+                    "(blocks %s–%s)", start_block, end_block,
+                )
+
+        if self.rpc_url:
+            logs = self._fetch_logs_rpc(start_block, end_block)
+            if logs is not None:
+                return logs
+            self.logger.error(
+                "RPC log fetch failed; "
+                "returning partial results for blocks %s–%s", start_block, end_block,
+            )
+            return []
 
         self.logger.error("No RPC URL or Polygonscan key configured; cannot fetch logs")
         return []
