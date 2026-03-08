@@ -1,0 +1,21 @@
+Mar 03 22:03:04 polymarket-data-collection python[1485560]: 2026-03-03 22:03:04,288 | INFO | HTTP Request: GET https://clob.polymarket.com/last-trade-price?token_id=35030421135827769109592633161076314186654237575290478183395763703609694750966 "HTTP/2 200 OK"
+Mar 03 22:03:04 polymarket-data-collection python[1485560]: 2026-03-03 22:03:04,294 | INFO | HTTP Request: GET https://clob.polymarket.com/last-trade-price?token_id=108362445229251912070720083957916899480646776820545091279753529973091842175798 "HTTP/2 200 OK"
+Mar 03 22:03:04 polymarket-data-collection python[1485560]: 2026-03-03 22:03:04,328 | INFO | HTTP Request: GET https://clob.polymarket.com/last-trade-price?token_id=23215269639628147416789716429401707653633268013653013422198162393028584384359 "HTTP/2 200 OK"
+Mar 03 22:03:04 polymarket-data-collection python[1485560]: 2026-03-03 22:03:04,334 | INFO | Starting WebSocket stream: 1325 active markets → 2650 tokens across 6 shard(s) (≤500 tokens/shard)
+Mar 03 22:03:04 polymarket-data-collection python[1485560]: 2026-03-03 22:03:04,610 | INFO | WS shard 1/6: subscribed to 500 tokens
+Mar 03 22:03:04 polymarket-data-collection python[1485560]: 2026-03-03 22:03:04,626 | INFO | WS shard 5/6: subscribed to 500 tokens
+Mar 03 22:03:04 polymarket-data-collection python[1485560]: 2026-03-03 22:03:04,630 | INFO | WS shard 6/6: subscribed to 150 tokens
+Mar 03 22:03:04 polymarket-data-collection python[1485560]: 2026-03-03 22:03:04,632 | INFO | WS shard 4/6: subscribed to 500 tokens
+Mar 03 22:03:04 polymarket-data-collection python[1485560]: 2026-03-03 22:03:04,635 | INFO | WS shard 2/6: subscribed to 500 tokens
+Mar 03 22:03:04 polymarket-data-collection python[1485560]: 2026-03-03 22:03:04,637 | INFO | WS shard 3/6: subscribed to 500 tokens
+Mar 03 22:03:09 polymarket-data-collection python[1485560]: 2026-03-03 22:03:09,766 | INFO | Prices table written: data/prices/ (395266 rows)
+Mar 03 22:03:09 polymarket-data-collection python[1485560]: 2026-03-03 22:03:09,917 | INFO | Prices table written: data/prices/ (124861 rows)
+Mar 03 22:03:10 polymarket-data-collection python[1485560]: 2026-03-03 22:03:10,150 | INFO | Prices table written: data/prices/ (242781 rows)
+Mar 03 22:03:10 polymarket-data-collection python[1485560]: 2026-03-03 22:03:10,614 | INFO | Prices table written: data/prices/ (495869 rows)
+Mar 03 22:03:11 polymarket-data-collection python[1485560]: 2026-03-03 22:03:11,004 | INFO | Prices table written: data/prices/ (395270 rows)
+Mar 03 22:03:11 polymarket-data-collection python[1485560]: 2026-03-03 22:03:11,132 | INFO | Prices table written: data/prices/ (124865 rows)
+Mar 03 22:03:11 polymarket-data-collection python[1485560]: 2026-03-03 22:03:11,342 | INFO | Prices table written: data/prices/ (242783 rows)
+Mar 03 22:03:11 polymarket-data-collection python[1485560]: 2026-03-03 22:03:11,639 | INFO | Prices table written: data/prices/ (348549 rows)
+Mar 03 22:03:11 polymarket-data-collection python[1485560]: 2026-03-03 22:03:11,650 | ERROR | Pipeline failed: Unable to merge: Field crypto has incompatible types: dictionary<values=string, indices=int8, ordered=0> vs dictionary<values=string, indices=int32, ordered=0>
+Mar 03 22:03:11 polymarket-data-collection systemd[1]: polymarket-websocket.service: Deactivated successfully.
+Mar 03 22:03:11 polymarket-data-collection systemd[1]: polymarket-websocket.service: Consumed 18.000s CPU time.
