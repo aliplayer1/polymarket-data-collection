@@ -38,6 +38,7 @@ from .config import (
 from .models import MarketRecord
 from .retry import api_call_with_retry
 from .storage import (
+    append_ticks_only,
     append_ws_ticks_staged,
     load_markets,
     load_prices,
@@ -331,7 +332,7 @@ class PolymarketDataPipeline:
 
             if pending_ticks and (i % _TICK_FLUSH_EVERY == 0 or i == n_windows):
                 ticks_df = pd.DataFrame(pending_ticks)
-                persist_ticks(
+                append_ticks_only(
                     ticks_df,
                     ticks_dir=self._parquet_ticks_dir,
                     logger=self.logger,

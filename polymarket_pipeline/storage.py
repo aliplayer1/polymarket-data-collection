@@ -44,6 +44,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 from typing import Any
 
@@ -469,6 +470,59 @@ def persist_ticks(
         table = pa.Table.from_pandas(merged, preserve_index=False)
         _write_partitioned_atomic(table, t_dir, partition_cols=["crypto", "timeframe"])
         log.info("Ticks table written: %s/ (%s rows)", t_dir, len(merged))
+
+
+def append_ticks_only(
+    ticks_df: pd.DataFrame,
+    *,
+    ticks_dir: str | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Append new tick rows to disk WITHOUT loading existing data.
+
+    Writes each (crypto, timeframe) group as a separate shard file within
+    the Hive-partitioned directory tree.  This avoids loading the full
+    existing tick dataset into RAM (which can be 1+ GB), preventing OOM
+    during the historical tick backfill.
+
+    Deduplication is deferred to the next ``persist_ticks()`` call (which
+    happens on the regular 6-hour timer run).
+    """
+    if ticks_df.empty:
+        return
+
+    log = logger or logging.getLogger("polymarket_pipeline")
+    t_dir = ticks_dir or PARQUET_TICKS_DIR
+
+    # Ensure required columns are present with defaults
+    for col in _TICKS_EMPTY_COLS:
+        if col not in ticks_df.columns:
+            ticks_df = ticks_df.copy()
+            if col in ("tx_hash",):
+                ticks_df[col] = ""
+            elif col in ("block_number", "log_index"):
+                ticks_df[col] = 0
+            else:
+                ticks_df[col] = None
+
+    # Flatten category columns
+    for col in ("outcome", "side", "source", "crypto", "timeframe"):
+        if col in ticks_df.columns and hasattr(ticks_df[col], "cat"):
+            ticks_df = ticks_df.copy()
+            ticks_df[col] = ticks_df[col].astype(str)
+
+    # Write each (crypto, timeframe) group as a new shard file
+    shard_id = f"{int(time.time())}_{os.getpid()}"
+    for (crypto, timeframe), group in ticks_df.groupby(["crypto", "timeframe"], sort=False):
+        shard_dir = os.path.join(t_dir, f"crypto={crypto}", f"timeframe={timeframe}")
+        os.makedirs(shard_dir, exist_ok=True)
+        shard_path = os.path.join(shard_dir, f"backfill_{shard_id}.parquet")
+        rows = group.drop(columns=["crypto", "timeframe"]).reset_index(drop=True)
+        rows = optimise_ticks_df(rows)
+        table = pa.Table.from_pandas(rows, preserve_index=False)
+        pq.write_table(table, shard_path, compression="zstd")
+
+    log.info("Ticks appended (no merge): %s/ (%s new rows)", t_dir, len(ticks_df))
 
 
 _WS_STAGING_FILENAME = "ws_staging.parquet"
