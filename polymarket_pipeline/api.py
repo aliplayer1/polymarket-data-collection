@@ -149,7 +149,7 @@ class PolymarketApi:
         offset = 0
 
         while True:
-            order_field = "closedTime" if closed else "volume24hr"
+            order_field = "closed_time" if closed else "volume_24hr"
             params: dict[str, Any] = {
                 "limit": PAGE_SIZE,
                 "offset": offset,
