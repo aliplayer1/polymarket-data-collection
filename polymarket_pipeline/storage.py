@@ -726,7 +726,22 @@ def consolidate_ticks(
             # Paths are from os.listdir (not user input); safe to interpolate.
             files_sql = ", ".join(f"'{p}'" for p in file_paths)
             try:
+                # Use a dedicated in-memory connection and configure for low memory / disk-spilling
                 con = duckdb.connect()
+                
+                # Performance / Memory Tuning:
+                # 1. Enable disk-spilling: allow DuckDB to use the disk if RAM is exceeded.
+                temp_dir = os.path.join(dirpath, ".duckdb_tmp")
+                os.makedirs(temp_dir, exist_ok=True)
+                con.execute(f"SET temp_directory='{temp_dir}'")
+                
+                # 2. Limit memory: leave some RAM for the OS and other processes.
+                # Since the server has ~7.5GB total, 4GB is a safe limit.
+                con.execute("SET memory_limit='4GB'")
+                
+                # 3. Limit threads: too many threads = too many concurrent memory-intensive tasks.
+                con.execute("SET threads=4")
+
                 result = con.execute(f"""
                     COPY (
                         SELECT * FROM read_parquet([{files_sql}])
@@ -737,6 +752,11 @@ def consolidate_ticks(
                     ) TO '{tmp_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
                 """).fetchone()
                 con.close()
+                
+                # Cleanup temp dir
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                    
                 nrows = result[0] if result else 0
 
                 for fname in parquet_files:
