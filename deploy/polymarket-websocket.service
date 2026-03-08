@@ -1,0 +1,30 @@
+[Unit]
+Description=Polymarket WebSocket Live Tick Stream
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket
+
+EnvironmentFile=/opt/polymarket/.env
+
+# Subscribe to all active markets immediately; skip historical scan and
+# tick backfill (those are handled by polymarket-historical.service/timer).
+ExecStart=/opt/polymarket/.venv/bin/python -m polymarket_pipeline \
+    --websocket-only
+
+Restart=always
+RestartSec=30
+
+# Allow time to flush the WebSocket buffer on graceful stop
+TimeoutStopSec=60
+
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
