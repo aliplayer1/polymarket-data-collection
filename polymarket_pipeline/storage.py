@@ -556,8 +556,8 @@ def consolidate_ticks(
             # Snapshot file list INSIDE the lock to prevent TOCTOU races
             # with append_ws_ticks_staged() running in the WS service.
             parquet_files = [f for f in os.listdir(dirpath) if f.endswith(".parquet")]
-            if len(parquet_files) <= 1:
-                continue  # already consolidated or empty
+            if not parquet_files or parquet_files == ["part-0.parquet"]:
+                continue  # empty, or already a single consolidated file
 
             log.info("Consolidating partition %s (%d shard files)...", rel, len(parquet_files))
 
