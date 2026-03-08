@@ -320,11 +320,17 @@ class PolymarketDataPipeline:
                 continue
 
             try:
-                up_price = api_call_with_retry(self.client.get_last_trade_price, market.up_token_id, logger=self.logger) or 0.5
-                down_price = api_call_with_retry(self.client.get_last_trade_price, market.down_token_id, logger=self.logger) or 0.5
+                up_raw = api_call_with_retry(self.client.get_last_trade_price, market.up_token_id, logger=self.logger) or 0.5
+                down_raw = api_call_with_retry(self.client.get_last_trade_price, market.down_token_id, logger=self.logger) or 0.5
+                # The CLOB client may return a dict (e.g. {"price": "0.45"}) or a
+                # plain float/string depending on the API version and market age.
+                def _parse_price(raw: Any) -> float:
+                    if isinstance(raw, dict):
+                        return float(raw.get("price") or raw.get("value") or 0.5)
+                    return float(raw)
                 last_prices[market.market_id] = {
-                    "up": float(up_price),
-                    "down": float(down_price),
+                    "up": _parse_price(up_raw),
+                    "down": _parse_price(down_raw),
                 }
             except Exception as exc:
                 self.logger.warning("Falling back to 0.5 for market %s: %s", market.market_id, exc)
