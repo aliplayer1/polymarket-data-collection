@@ -71,6 +71,9 @@ class PolygonTickFetcher:
     POLYGONSCAN_BLOCK_CHUNK = 25    # blocks per getLogs query (CTF is very active)
     RPC_LOG_CHUNK_BLOCKS  = 1_000   # block range per eth_getLogs call
 
+    # Minimum gap between any two Etherscan V2 API calls (3 req/s free plan)
+    _ETHERSCAN_MIN_INTERVAL = 0.42   # slightly >1/3 s to stay safely below 3 req/s
+
     def __init__(
         self,
         rpc_url: str | None = None,
@@ -84,6 +87,7 @@ class PolygonTickFetcher:
         self.logger = logger or logging.getLogger("polymarket_pipeline.ticks")
         self._session = requests.Session()
         self._block_cache: dict[int, int] = {}  # ts → block number
+        self._last_etherscan_ts: float = 0.0    # global rate-limit tracker
 
     # ------------------------------------------------------------------
     # Public interface
@@ -241,11 +245,23 @@ class PolygonTickFetcher:
 
         return low
 
-    def _ts_to_block_polygonscan(self, target_ts: int) -> int | None:
-        """Use Etherscan/Polygonscan ``getblocknobytime`` to convert a timestamp to a block.
+    def _rate_limit_etherscan(self) -> None:
+        """Block until at least _ETHERSCAN_MIN_INTERVAL seconds have passed since
+        the last Etherscan V2 call, then update the timestamp.  All Etherscan V2
+        requests must call this *before* issuing the HTTP request so that
+        ``getblocknobytime`` and ``getLogs`` share a single global token bucket.
+        """
+        elapsed = time.time() - self._last_etherscan_ts
+        if elapsed < self._ETHERSCAN_MIN_INTERVAL:
+            time.sleep(self._ETHERSCAN_MIN_INTERVAL - elapsed)
+        self._last_etherscan_ts = time.time()
 
-        Tries the unified Etherscan V2 API first, then falls back to the
-        native Polygonscan API if V2 fails.
+    def _ts_to_block_polygonscan(self, target_ts: int) -> int | None:
+        """Use the Etherscan V2 ``getblocknobytime`` endpoint to convert a Unix
+        timestamp to the nearest Polygon block number.
+
+        The native Polygonscan V1 API (api.polygonscan.com) is deprecated and
+        returns an error on all endpoints; only Etherscan V2 is used here.
         """
         params = {
             "chainid":   POLYGON_CHAIN_ID,
@@ -255,22 +271,17 @@ class PolygonTickFetcher:
             "closest":   "before",
             "apikey":    self.polygonscan_key,
         }
-
-        for use_native in (False, True):
-            label = "Polygonscan native" if use_native else "Etherscan V2"
-            data = self._etherscan_get(params, use_native=use_native)
-            if data is not None:
-                status = str(data.get("status"))
-                result = str(data.get("result", ""))
-                if status == "1" and result.isdigit():
-                    time.sleep(0.4)  # respect 3 req/s free-plan limit
-                    return int(result)
-                self.logger.debug(
-                    "%s getblocknobytime: status=%s message=%s result=%s",
-                    label, status, data.get("message"), result[:200],
-                )
-            time.sleep(0.4)
-
+        self._rate_limit_etherscan()
+        data = self._etherscan_get(params, use_native=False)
+        if data is not None:
+            status = str(data.get("status"))
+            result = str(data.get("result", ""))
+            if status == "1" and result.isdigit():
+                return int(result)
+            self.logger.debug(
+                "Etherscan V2 getblocknobytime: status=%s message=%s result=%s",
+                status, data.get("message"), result[:200],
+            )
         return None
 
     def _get_latest_block_info(self) -> tuple[int | None, int]:
@@ -350,7 +361,7 @@ class PolygonTickFetcher:
         return None
 
     def _fetch_logs_polygonscan(self, start_block: int, end_block: int) -> list[dict] | None:
-        """Fetch OrderFilled logs via Etherscan V2 or native Polygonscan API.
+        """Fetch OrderFilled logs via the Etherscan V2 API.
 
         The CTF Exchange contract emits events for ALL Polymarket trades, so
         even a small block range can contain thousands of logs.  The API
@@ -358,19 +369,12 @@ class PolygonTickFetcher:
         we chunk the request into ``POLYGONSCAN_BLOCK_CHUNK``-block segments
         and paginate within each segment.
 
-        Tries the unified Etherscan V2 endpoint first; on failure, retries
-        with the native Polygonscan API.
+        The native Polygonscan V1 API (api.polygonscan.com) is deprecated and
+        always returns an error, so only the Etherscan V2 endpoint is used.
         """
-        for use_native in (False, True):
-            label = "Polygonscan native" if use_native else "Etherscan V2"
-            result = self._fetch_logs_polygonscan_endpoint(
-                start_block, end_block, use_native=use_native, label=label,
-            )
-            if result is not None:
-                return result
-            self.logger.debug("%s getLogs failed; trying next endpoint...", label)
-
-        return None
+        return self._fetch_logs_polygonscan_endpoint(
+            start_block, end_block, use_native=False, label="Etherscan V2",
+        )
 
     def _fetch_logs_polygonscan_endpoint(
         self,
@@ -401,6 +405,7 @@ class PolygonTickFetcher:
                     "offset":     self.POLYGONSCAN_LOG_LIMIT,
                     "apikey":     self.polygonscan_key,
                 }
+                self._rate_limit_etherscan()
                 data = self._etherscan_get(params, use_native=use_native)
                 if data is None:
                     return None
@@ -426,10 +431,8 @@ class PolygonTickFetcher:
                 if page * self.POLYGONSCAN_LOG_LIMIT > 10_000:
                     self.logger.debug("%s pagination cap reached for blocks %s–%s", label, cur, chunk_end)
                     break
-                time.sleep(0.4)   # 3 req/s free-plan rate limit
 
             cur = chunk_end + 1
-            time.sleep(0.4)   # rate limit between chunks
 
         return all_logs
 
