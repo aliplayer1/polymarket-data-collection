@@ -85,6 +85,11 @@ _WRITE_LOCKS_REGISTRY_LOCK = threading.Lock()
 _FLOCK_TIMEOUT_SECONDS: float = float(os.environ.get("PM_FLOCK_TIMEOUT", "300"))
 _FLOCK_POLL_INTERVAL = 0.05   # seconds between LOCK_NB retry attempts
 
+# Thread-local storage to track lock recursion depth.  This allows _write_lock
+# to be reentrant within the same thread, preventing self-deadlocks when
+# nested calls (e.g. upload_to_huggingface -> consolidate_ticks) occur.
+_LOCK_STATE = threading.local()
+
 
 def _get_thread_lock(canonical_root: str) -> threading.RLock:
     with _WRITE_LOCKS_REGISTRY_LOCK:
@@ -170,9 +175,26 @@ def _write_lock(data_root: str):
     - PID-stamps the lock file so waiters can detect and clear stale locks.
     - Raises ``TimeoutError`` (not an infinite hang) if the lock cannot be
       acquired within ``_FLOCK_TIMEOUT_SECONDS``.
+    - REENTRANT: Uses thread-local state to detect if this thread already holds
+      the lock for the given path, allowing nested calls without deadlock.
     """
     canonical = os.path.abspath(data_root)
     thread_lock = _get_thread_lock(canonical)
+
+    if not hasattr(_LOCK_STATE, "depths"):
+        _LOCK_STATE.depths = {}
+
+    depth = _LOCK_STATE.depths.get(canonical, 0)
+    if depth > 0:
+        # Already held by this thread — just increment and yield
+        _LOCK_STATE.depths[canonical] = depth + 1
+        try:
+            yield
+        finally:
+            _LOCK_STATE.depths[canonical] = depth
+        return
+
+    # Not held — acquire both thread and file locks
     lock_path = os.path.join(canonical, ".write.lock")
     os.makedirs(canonical, exist_ok=True)
 
@@ -184,7 +206,12 @@ def _write_lock(data_root: str):
         try:
             if _HAVE_FCNTL:
                 _acquire_flock(fd, lock_path)
-            yield
+
+            _LOCK_STATE.depths[canonical] = 1
+            try:
+                yield
+            finally:
+                _LOCK_STATE.depths[canonical] = 0
         finally:
             if _HAVE_FCNTL:
                 try:
