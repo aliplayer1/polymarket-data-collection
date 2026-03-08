@@ -75,9 +75,9 @@ class PolygonTickFetcher:
     _ETHERSCAN_MIN_INTERVAL = 0.42   # slightly >1/3 s to stay safely below 3 req/s
 
     # Minimum gap between eth_getLogs RPC calls on Alchemy free tier.
-    # eth_getLogs costs 75 CU; free tier budget is 330 CU/s → max 4.4 calls/s.
-    # 0.25 s gives 4 calls/s × 75 CU = 300 CU/s, leaving ~10% headroom.
-    _RPC_LOGS_MIN_INTERVAL = 0.25
+    # eth_getLogs costs 75 CU; free tier throughput is 500 CU/s → max 6.67 calls/s.
+    # 0.15 s gives ~6.6 calls/s × 75 CU = 495 CU/s, leaving ~1% headroom.
+    _RPC_LOGS_MIN_INTERVAL = 0.15
 
     def __init__(
         self,
