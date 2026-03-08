@@ -1,0 +1,6 @@
+[Unit]
+Description=Restart Polymarket Live service to pick up new markets
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart polymarket-live.service
