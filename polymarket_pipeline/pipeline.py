@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
@@ -249,34 +249,44 @@ class PolymarketDataPipeline:
             )
             return 0
 
-        total_ticks = 0
-        for i, market in enumerate(markets, 1):
-            window_seconds = TIMEFRAME_SECONDS.get(market.timeframe, 300)
-            start_ts = max(market.start_ts, market.end_ts - window_seconds)
-            end_ts   = market.end_ts
+        # Group markets by their prediction-window (start_ts, end_ts).
+        # BTC/ETH/SOL markets at the same time slot share identical block ranges,
+        # so one eth_getLogs fetch covers all three instead of three separate calls.
+        windows: dict[tuple[int, int], list[MarketRecord]] = defaultdict(list)
+        for m in markets:
+            window_s = TIMEFRAME_SECONDS.get(m.timeframe, 300)
+            win_start = max(m.start_ts, m.end_ts - window_s)
+            windows[(win_start, m.end_ts)].append(m)
 
+        total_ticks = 0
+        n_windows = len(windows)
+        for i, ((win_start, win_end), window_markets) in enumerate(windows.items(), 1):
             self.logger.info(
-                "[%s/%s] Fetching on-chain ticks for market %s (%s %s, %s–%s)",
-                i, len(markets), market.market_id, market.crypto, market.timeframe,
-                start_ts, end_ts,
+                "[%d/%d] Fetching on-chain ticks for window %s–%s (%s)",
+                i, n_windows, win_start, win_end,
+                ", ".join(f"{m.crypto}/{m.timeframe}" for m in window_markets),
             )
             try:
-                ticks = self.tick_fetcher.get_ticks_for_market(market, start_ts, end_ts)
-                if not ticks:
-                    self.logger.info("  -> No on-chain fills found")
-                    continue
-
-                ticks_df = pd.DataFrame(ticks)
-                ticks_df["source"] = "onchain"
-                persist_ticks(
-                    ticks_df,
-                    ticks_dir=self._parquet_ticks_dir,
-                    logger=self.logger,
+                batch = self.tick_fetcher.get_ticks_for_markets_batch(
+                    window_markets, win_start, win_end,
                 )
-                total_ticks += len(ticks)
-                self.logger.info("  -> %s on-chain ticks stored", len(ticks))
+                for m in window_markets:
+                    ticks = batch.get(m.market_id, [])
+                    if not ticks:
+                        continue
+                    ticks_df = pd.DataFrame(ticks)
+                    ticks_df["source"] = "onchain"
+                    persist_ticks(
+                        ticks_df,
+                        ticks_dir=self._parquet_ticks_dir,
+                        logger=self.logger,
+                    )
+                    total_ticks += len(ticks)
+                    self.logger.info("  -> %s %s: %s fills", m.crypto, m.timeframe, len(ticks))
             except Exception as exc:
-                self.logger.error("Failed on-chain tick fetch for market %s: %s", market.market_id, exc)
+                self.logger.error(
+                    "Failed on-chain tick fetch for window %s–%s: %s", win_start, win_end, exc,
+                )
 
         self.logger.info("On-chain tick backfill complete: %s total ticks across %s markets", total_ticks, len(markets))
         return total_ticks
@@ -652,29 +662,42 @@ class PolymarketDataPipeline:
                 return False
             return True
 
-        # Helper to process a batch of markets
+        # Number of markets whose price histories are fetched concurrently.
+        # Each market makes 2 CLOB API calls (one per token) so this results in
+        # 2 * _WORKERS concurrent HTTP requests.  Keep conservative to avoid
+        # overwhelming the CLOB endpoint.
+        _WORKERS = 5
+
         pending_dfs: dict[str, list[pd.DataFrame]] = {tf: [] for tf in TIME_FRAMES}
         self.processed_count = 0
-        
-        def process_market(m: MarketRecord) -> None:
-            self.processed_count += 1
-            if self.processed_count % 10 == 0:
-                self.logger.info("Processed %d relevant markets so far...", self.processed_count)
 
-            try:
-                market_df = self.build_market_dataframe(m)
-                if market_df is not None and not market_df.empty:
-                    pending_dfs[m.timeframe].append(market_df)
-                    self.logger.info("  -> Fetched %s rows", len(market_df))
-                    
-                    # Flush if batch gets big
-                    if len(pending_dfs[m.timeframe]) >= 10:
-                        combined = pd.concat(pending_dfs[m.timeframe], ignore_index=True)
-                        merged = self.persist_dataframe(m.timeframe, combined)
-                        self.logger.info("Flushed batch for %s (%s total rows)", m.timeframe, len(merged))
-                        pending_dfs[m.timeframe] = []
-            except Exception as exc:
-                self.logger.error("Failed to process market %s: %s", m.market_id, exc)
+        def _flush_if_needed() -> None:
+            for tf in list(pending_dfs.keys()):
+                if len(pending_dfs[tf]) >= 10:
+                    combined = pd.concat(pending_dfs[tf], ignore_index=True)
+                    merged = self.persist_dataframe(tf, combined)
+                    self.logger.info("Flushed batch for %s (%s total rows)", tf, len(merged))
+                    pending_dfs[tf] = []
+
+        def process_market_batch(batch: list[MarketRecord]) -> None:
+            """Fetch price histories for *batch* concurrently, then persist serially."""
+            with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                future_to_market = {
+                    executor.submit(self.build_market_dataframe, m): m for m in batch
+                }
+                for future in as_completed(future_to_market):
+                    m = future_to_market[future]
+                    self.processed_count += 1
+                    if self.processed_count % 10 == 0:
+                        self.logger.info("Processed %d relevant markets so far...", self.processed_count)
+                    try:
+                        market_df = future.result()
+                        if market_df is not None and not market_df.empty:
+                            pending_dfs[m.timeframe].append(market_df)
+                            self.logger.info("  -> Fetched %s rows", len(market_df))
+                    except Exception as exc:
+                        self.logger.error("Failed to process market %s: %s", m.market_id, exc)
+            _flush_if_needed()
 
         def flush_all():
             for tf, dfs in pending_dfs.items():
@@ -690,6 +713,8 @@ class PolymarketDataPipeline:
         test_collected = 0
         max_end_ts_seen = 0
         closed_markets_for_ticks: list[MarketRecord] = []
+        relevant_batch: list[MarketRecord] = []
+
         for m in self.api.fetch_markets(closed=True, end_ts_min=scan_cutoff_ts if not is_test else None):
             # In test mode, stop once we have enough markets
             if is_test and test_collected >= test_limit:
@@ -704,9 +729,16 @@ class PolymarketDataPipeline:
                 max_end_ts_seen = m.end_ts
 
             if is_market_relevant(m):
-                process_market(m)
+                relevant_batch.append(m)
                 test_collected += 1
                 closed_markets_for_ticks.append(m)
+                if len(relevant_batch) >= _WORKERS:
+                    process_market_batch(relevant_batch)
+                    relevant_batch = []
+
+        if relevant_batch:
+            process_market_batch(relevant_batch)
+            relevant_batch = []
 
         # Save checkpoint so the next run can skip already-scanned history.
         if max_end_ts_seen > 0 and not is_test:
@@ -720,14 +752,21 @@ class PolymarketDataPipeline:
         elif not historical_only:
             self.logger.info("Fetching and processing active markets...")
             fetched_active = 0
+            active_batch: list[MarketRecord] = []
             for m in self.api.fetch_markets(active=True):
                 fetched_active += 1
                 if fetched_active % 500 == 0:
-                     self.logger.info("Scanned %d active markets...", fetched_active)
+                    self.logger.info("Scanned %d active markets...", fetched_active)
 
                 if is_market_relevant(m):
-                    process_market(m)
+                    active_batch.append(m)
                     active_markets_for_ws.append(m)
+                    if len(active_batch) >= _WORKERS:
+                        process_market_batch(active_batch)
+                        active_batch = []
+
+            if active_batch:
+                process_market_batch(active_batch)
         else:
             self.logger.info("Historical-only mode enabled. Skipping active markets.")
 

@@ -89,6 +89,63 @@ class PolygonTickFetcher:
     # Public interface
     # ------------------------------------------------------------------
 
+    def get_ticks_for_markets_batch(
+        self,
+        markets: list[MarketRecord],
+        start_ts: int,
+        end_ts: int,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Fetch logs once for a shared block range and distribute to multiple markets.
+
+        More efficient than calling get_ticks_for_market() separately when several
+        markets share the same time window (e.g. BTC/ETH/SOL at the same 5-min slot),
+        because the expensive eth_getLogs query is issued only once.
+
+        Returns a dict mapping market_id → list of tick dicts.
+        """
+        result: dict[str, list[dict[str, Any]]] = {m.market_id: [] for m in markets}
+
+        # Build token_id → market lookup for O(1) dispatch
+        token_to_market: dict[str, MarketRecord] = {}
+        for m in markets:
+            token_to_market[m.up_token_id] = m
+            token_to_market[m.down_token_id] = m
+
+        raw_logs = self._fetch_logs(start_ts, end_ts)
+        if not raw_logs:
+            return result
+
+        for log in raw_logs:
+            # Quick pre-filter: read the first two 32-byte words (maker/taker asset IDs)
+            # before paying the cost of a full _decode_log call.
+            data = log.get("data", "")[2:]
+            if len(data) < 2 * 64:
+                continue
+            try:
+                maker_asset = str(int(data[0:64], 16))
+                taker_asset = str(int(data[64:128], 16))
+            except (ValueError, IndexError):
+                continue
+
+            m = token_to_market.get(maker_asset) or token_to_market.get(taker_asset)
+            if m is None:
+                continue
+
+            tick = self._decode_log(log, m, up_token=m.up_token_id, down_token=m.down_token_id)
+            if tick is not None:
+                result[m.market_id].append(tick)
+
+        for mid, ticks in result.items():
+            ticks.sort(key=lambda t: t["timestamp_ms"])
+            self.logger.info(
+                "On-chain ticks for market %s: %s fills (up=%s down=%s)",
+                mid, len(ticks),
+                sum(1 for t in ticks if t["outcome"] == "Up"),
+                sum(1 for t in ticks if t["outcome"] == "Down"),
+            )
+
+        return result
+
     def get_ticks_for_market(
         self,
         market: MarketRecord,
