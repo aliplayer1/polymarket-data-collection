@@ -30,6 +30,11 @@ WS_FLUSH_BATCH_SIZE = 200
 # 2600+ token IDs (~200 KB) in a single message → server drops every 30-90 s.
 # 500 tokens ≈ 38 KB per shard; with ~6 shards all connections stay stable.
 WS_MAX_TOKENS_PER_SHARD = 500
+# Hard cap on total in-memory WS+tick buffer rows across all timeframes.
+# If the flush loop falls behind (slow disk / lock contention), the buffer
+# would grow unboundedly and eventually OOM.  When this cap is hit the oldest
+# half of each buffer is evicted and an ERROR is logged.
+WS_BUFFER_MAX_ROWS = 50_000
 
 TIME_FRAMES = ("5-minute", "15-minute", "1-hour")
 

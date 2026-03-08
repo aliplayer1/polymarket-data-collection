@@ -33,10 +33,13 @@ def _minutes_from_time_range(question: str) -> int | None:
 
 def extract_timeframe(question: str) -> str | None:
     q = question.lower()
-    if "5 min" in q or "5-minute" in q:
-        return "5-minute"
+    # Check longer prefixes BEFORE shorter ones to prevent substring false matches:
+    # "15 min" contains "5 min" as a trailing substring, so "5 min" must not be
+    # checked first.  Same principle applies to "4 hour" vs "1 hour".
     if "15 min" in q or "15-minute" in q:
         return "15-minute"
+    if "5 min" in q or "5-minute" in q:
+        return "5-minute"
     if "4 hour" in q or "4-hour" in q:
         return "4-hour"
     if "1 hour" in q or "hourly" in q or "hour" in q:

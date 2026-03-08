@@ -30,6 +30,7 @@ from .config import (
     PRICE_SUM_TOLERANCE,
     TIME_FRAMES,
     TIMEFRAME_SECONDS,
+    WS_BUFFER_MAX_ROWS,
     WS_FLUSH_BATCH_SIZE,
     WS_FLUSH_INTERVAL_SECONDS,
     WS_MAX_TOKENS_PER_SHARD,
@@ -485,6 +486,25 @@ class PolymarketDataPipeline:
                         message = await ws.recv()
                         payload = json.loads(message)
                         events = payload if isinstance(payload, list) else [payload]
+
+                        # Guard against unbounded buffer growth if the flush loop
+                        # falls behind (slow disk / lock contention).  Check once
+                        # per message batch, not per event, to avoid O(n) overhead.
+                        total_buffered = (
+                            sum(len(v) for v in ws_buffer.values())
+                            + sum(len(v) for v in tick_buffer.values())
+                        )
+                        if total_buffered >= WS_BUFFER_MAX_ROWS:
+                            for _buf in (ws_buffer, tick_buffer):
+                                for _tf in list(_buf.keys()):
+                                    _rows = _buf[_tf]
+                                    if _rows:
+                                        _buf[_tf] = _rows[len(_rows) // 2:]
+                            self.logger.error(
+                                "WS shard %d/%d: buffer at capacity (%d rows) — "
+                                "evicted oldest half; flush loop may be stuck",
+                                shard_idx + 1, n_shards, total_buffered,
+                            )
 
                         for event in events:
                             if event.get("event_type") != "last_trade_price":
@@ -1070,6 +1090,8 @@ class PolymarketDataPipeline:
                     prices_dir=self._parquet_prices_dir,
                     ticks_dir=self._parquet_ticks_dir,
                     logger=self.logger,
+                    # consolidate_ticks already ran above — skip redundant re-scan
+                    skip_consolidate=True,
                 )
             except Exception as exc:
                 self.logger.error("Hugging Face upload failed (non-fatal): %s", exc)

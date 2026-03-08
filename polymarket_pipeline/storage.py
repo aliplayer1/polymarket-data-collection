@@ -40,6 +40,7 @@ via ``_write_partitioned_atomic()``, which deletes all previous shards (includin
 
 from __future__ import annotations
 
+import errno as _errno
 import logging
 import os
 import shutil
@@ -80,12 +81,80 @@ except ImportError:
 _WRITE_LOCKS: dict[str, threading.Lock] = {}
 _WRITE_LOCKS_REGISTRY_LOCK = threading.Lock()
 
+# fcntl deadlock prevention
+_FLOCK_TIMEOUT_SECONDS: float = float(os.environ.get("PM_FLOCK_TIMEOUT", "60"))
+_FLOCK_POLL_INTERVAL = 0.05   # seconds between LOCK_NB retry attempts
+
 
 def _get_thread_lock(canonical_root: str) -> threading.Lock:
     with _WRITE_LOCKS_REGISTRY_LOCK:
         if canonical_root not in _WRITE_LOCKS:
             _WRITE_LOCKS[canonical_root] = threading.Lock()
         return _WRITE_LOCKS[canonical_root]
+
+
+def _acquire_flock(fd: Any, lock_path: str) -> None:
+    """Acquire LOCK_EX with stale-PID detection and a hard timeout.
+
+    Unlike plain ``flock(LOCK_EX)``, this function never blocks indefinitely:
+    - Uses ``LOCK_EX | LOCK_NB`` and retries on EACCES/EAGAIN.
+    - Reads the PID stamp written by the current holder and checks liveness
+      via ``os.kill(pid, 0)``.  If the holder process is dead (stale lock),
+      the stamp is cleared and acquisition retries immediately — the OS
+      already released the flock when the process exited.
+    - Raises ``TimeoutError`` after ``_FLOCK_TIMEOUT_SECONDS`` so a live but
+      stuck process never permanently blocks the pipeline.
+    """
+    deadline = time.monotonic() + _FLOCK_TIMEOUT_SECONDS
+    stale_cleared = False
+
+    while True:
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            # Acquired: stamp with our PID so future waiters can detect us as stale if we die.
+            try:
+                fd.seek(0)
+                fd.truncate()
+                fd.write(str(os.getpid()))
+                fd.flush()
+            except OSError:
+                pass  # best-effort PID stamp — the lock itself is already held
+            return
+        except OSError as exc:
+            if exc.errno not in (_errno.EACCES, _errno.EAGAIN):
+                raise  # unexpected OS error — propagate immediately
+
+        # Lock is held by another descriptor.  Check if holder is still alive.
+        if not stale_cleared:
+            try:
+                fd.seek(0)
+                content = fd.read().strip()
+                if content:
+                    holder_pid = int(content)
+                    try:
+                        os.kill(holder_pid, 0)   # signal 0 = existence check only
+                    except ProcessLookupError:
+                        # Holder process is dead.  Its file descriptors were closed by
+                        # the OS on termination, which released the flock automatically.
+                        # Clear the stale PID stamp and retry immediately.
+                        try:
+                            fd.seek(0)
+                            fd.truncate()
+                            fd.flush()
+                        except OSError:
+                            pass
+                        stale_cleared = True
+                        continue  # retry flock acquisition without sleeping
+            except (OSError, ValueError):
+                pass  # can't read PID — just wait with normal backoff
+
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"_write_lock: could not acquire {lock_path!r} within "
+                f"{_FLOCK_TIMEOUT_SECONDS:.0f}s — another process may be holding "
+                "the lock for an unusually long time"
+            )
+        time.sleep(_FLOCK_POLL_INTERVAL)
 
 
 @contextmanager
@@ -95,6 +164,12 @@ def _write_lock(data_root: str):
     Acquires both a threading.Lock (in-process) and an fcntl file lock
     (cross-process) before yielding, so the caller can safely execute the
     full read → merge → write cycle without racing another thread or process.
+
+    Improvements over naive ``flock(LOCK_EX)``:
+    - Uses LOCK_NB with timeout — never hangs forever if the holder dies.
+    - PID-stamps the lock file so waiters can detect and clear stale locks.
+    - Raises ``TimeoutError`` (not an infinite hang) if the lock cannot be
+      acquired within ``_FLOCK_TIMEOUT_SECONDS``.
     """
     canonical = os.path.abspath(data_root)
     thread_lock = _get_thread_lock(canonical)
@@ -102,14 +177,20 @@ def _write_lock(data_root: str):
     os.makedirs(canonical, exist_ok=True)
 
     with thread_lock:
-        fd = open(lock_path, "w")
+        # Open for r+w without truncating so any existing PID stamp remains
+        # readable by _acquire_flock during LOCK_NB retry attempts.
+        raw_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.fdopen(raw_fd, "r+")
         try:
             if _HAVE_FCNTL:
-                _fcntl.flock(fd, _fcntl.LOCK_EX)
+                _acquire_flock(fd, lock_path)
             yield
         finally:
             if _HAVE_FCNTL:
-                _fcntl.flock(fd, _fcntl.LOCK_UN)
+                try:
+                    _fcntl.flock(fd, _fcntl.LOCK_UN)
+                except OSError:
+                    pass
             fd.close()
 
 
@@ -151,6 +232,54 @@ TICKS_SCHEMA = pa.schema([
     ("source",       pa.dictionary(pa.int8(), pa.string())),   # "onchain" / "websocket"
     # partition columns (crypto, timeframe) are implicit
 ])
+
+
+# ---------------------------------------------------------------------------
+# Schema versioning — embed in every Parquet file's metadata
+# ---------------------------------------------------------------------------
+
+# Increment this when any schema column is added, removed, or its type changes.
+# The version is stored as ``b"schema_version"`` in each Parquet file's
+# key-value metadata so consumers can detect and handle schema evolution.
+STORAGE_SCHEMA_VERSION = 2
+
+
+def _stamp_schema_version(table: pa.Table) -> pa.Table:
+    """Embed STORAGE_SCHEMA_VERSION in the Arrow table's Parquet metadata."""
+    metadata = dict(table.schema.metadata or {})
+    metadata[b"schema_version"] = str(STORAGE_SCHEMA_VERSION).encode()
+    return table.replace_schema_metadata(metadata)
+
+
+# ---------------------------------------------------------------------------
+# Disk space guard
+# ---------------------------------------------------------------------------
+
+_MIN_FREE_DISK_GB: float = float(os.environ.get("PM_MIN_FREE_DISK_GB", "2.0"))
+
+
+def _check_disk_space(path: str) -> None:
+    """Raise OSError if free disk space at *path*'s mount point is below threshold.
+
+    Called before every atomic Parquet write to fail fast with a clear error
+    rather than producing a corrupted partial file when the disk is almost full.
+    The threshold defaults to 2 GB and can be adjusted via ``PM_MIN_FREE_DISK_GB``.
+    """
+    check_path = path if os.path.isdir(path) else (os.path.dirname(os.path.abspath(path)) or ".")
+    try:
+        usage = shutil.disk_usage(check_path)
+        free_gb = usage.free / (1024 ** 3)
+        if free_gb < _MIN_FREE_DISK_GB:
+            raise OSError(
+                f"Insufficient disk space for Parquet write: "
+                f"{free_gb:.2f} GB free at {check_path!r}, "
+                f"need ≥ {_MIN_FREE_DISK_GB:.1f} GB.  "
+                "Free up space or lower PM_MIN_FREE_DISK_GB."
+            )
+    except OSError:
+        raise
+    except Exception:
+        pass  # disk_usage not supported on this platform — skip check
 
 
 def _resolution_to_int8(val: Any) -> int:
@@ -512,6 +641,7 @@ def append_ticks_only(
             ticks_df[col] = ticks_df[col].astype(str)
 
     # Write each (crypto, timeframe) group as a new shard file
+    _check_disk_space(os.path.dirname(os.path.abspath(t_dir)) or ".")
     ticks_df = optimise_ticks_df(ticks_df)
     shard_id = f"{int(time.time())}_{os.getpid()}"
     for (crypto, timeframe), group in ticks_df.groupby(["crypto", "timeframe"], sort=False):
@@ -519,7 +649,7 @@ def append_ticks_only(
         os.makedirs(shard_dir, exist_ok=True)
         shard_path = os.path.join(shard_dir, f"backfill_{shard_id}.parquet")
         rows = group.drop(columns=["crypto", "timeframe"]).reset_index(drop=True)
-        table = pa.Table.from_pandas(rows, preserve_index=False)
+        table = _stamp_schema_version(pa.Table.from_pandas(rows, preserve_index=False))
         pq.write_table(table, shard_path, compression="zstd")
 
     log.info("Ticks appended (no merge): %s/ (%s new rows)", t_dir, len(ticks_df))
@@ -560,6 +690,7 @@ def consolidate_ticks(
                 continue  # empty, or already a single consolidated file
 
             log.info("Consolidating partition %s (%d shard files)...", rel, len(parquet_files))
+            _check_disk_space(dirpath)
 
             file_paths = [os.path.join(dirpath, f) for f in parquet_files]
             consolidated_path = os.path.join(dirpath, "part-0.parquet")
@@ -689,7 +820,10 @@ def append_ws_ticks_staged(
 
 def _write_parquet_atomic(table: pa.Table, path: str) -> None:
     """Atomically write a single Parquet file using a per-PID temp path."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    dest_dir = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(dest_dir, exist_ok=True)
+    _check_disk_space(dest_dir)
+    table = _stamp_schema_version(table)
     # Per-PID suffix prevents concurrent processes from colliding on the same tmp path.
     tmp_path = f"{path}.{os.getpid()}.tmp"
     try:
@@ -711,6 +845,8 @@ def _write_partitioned_atomic(table: pa.Table, root_dir: str, partition_cols: li
     cycle; the per-PID tmp is defence-in-depth against any unforeseen
     path where the lock is not held.
     """
+    _check_disk_space(os.path.dirname(os.path.abspath(root_dir)) or ".")
+    table = _stamp_schema_version(table)
     tmp_dir = f"{root_dir}.tmp.{os.getpid()}"
     try:
         if os.path.exists(tmp_dir):
@@ -843,11 +979,19 @@ def upload_to_huggingface(
     prices_dir: str | None = None,
     ticks_dir: str | None = None,
     logger: logging.Logger | None = None,
+    skip_consolidate: bool = False,
 ) -> None:
     """Upload the local Parquet dataset to the Hugging Face Hub.
 
     Requires a valid HF_TOKEN environment variable or ``huggingface-cli login``.
     Creates the repo as a *dataset* repo if it doesn't exist.
+
+    Parameters
+    ----------
+    skip_consolidate:
+        When True, skip the ``consolidate_ticks()`` call.  Pass this when the
+        caller has already consolidated ticks in the same run to avoid a
+        redundant full-partition scan.
     """
     from huggingface_hub import HfApi
 
@@ -864,8 +1008,9 @@ def upload_to_huggingface(
     log.info("Hugging Face repo: https://huggingface.co/datasets/%s", repo)
 
     # Consolidate any shard/staging files before uploading so that
-    # all data is in the main partition files.
-    if os.path.exists(t_dir):
+    # all data is in the main partition files.  Skip if the caller already
+    # ran consolidation in this session (skip_consolidate=True).
+    if not skip_consolidate and os.path.exists(t_dir):
         consolidate_ticks(ticks_dir=t_dir, logger=log)
 
     # Upload markets table
@@ -906,3 +1051,14 @@ def upload_to_huggingface(
         log.info("Uploaded %s/ -> data/ticks/", t_dir)
 
     log.info("Upload complete.")
+
+    # Write a sync checkpoint so callers can track when the last successful
+    # upload occurred and avoid redundant re-uploads.
+    checkpoint_path = os.path.join(
+        os.path.dirname(os.path.abspath(m_path)), ".hf_sync_checkpoint"
+    )
+    try:
+        with open(checkpoint_path, "w") as _f:
+            _f.write(str(int(time.time())))
+    except OSError as e:
+        log.warning("Could not write HF sync checkpoint to %s: %s", checkpoint_path, e)

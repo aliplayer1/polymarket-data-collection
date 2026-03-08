@@ -49,6 +49,16 @@ class PolymarketApi:
     def _request_json(self, url: str, params: dict[str, Any]) -> Any:
         def _fetch() -> Any:
             response = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+            # Detect Cloudflare WAF / CDN blocks before raise_for_status so we
+            # can raise a descriptive error rather than a generic HTTP 403/503.
+            # WAF responses return HTML with Content-Type: text/html even when the
+            # client expects JSON, which would cause a silent JSON parse failure.
+            ct = response.headers.get("content-type", "")
+            if response.status_code in (403, 429, 503) and "text/html" in ct:
+                snippet = response.text[:300].replace("\n", " ")
+                raise RuntimeError(
+                    f"WAF/CDN block at {url!r} (status={response.status_code}): {snippet!r}"
+                )
             response.raise_for_status()
             return response.json()
 
@@ -79,6 +89,14 @@ class PolymarketApi:
         timeframe = extract_timeframe(question)
         crypto = extract_crypto(question)
         if not timeframe or not crypto:
+            # This market matches the keyword filter ("up or down") but we couldn't
+            # parse the timeframe or crypto from the question text.  Log at WARNING
+            # so schema/format changes are visible in production logs rather than
+            # silently dropped.  Search logs for "UNPARSEABLE_MARKET" to audit.
+            self.logger.warning(
+                "UNPARSEABLE_MARKET market_id=%s timeframe=%r crypto=%r question=%r",
+                market.get("id", "?"), timeframe, crypto, question[:150],
+            )
             return None
 
         tokens = market.get("tokens", [])
@@ -101,6 +119,12 @@ class PolymarketApi:
             token1_id = str(clob_token_ids[0])
             token2_id = str(clob_token_ids[1])
         else:
+            # Expected token structure not found — could indicate an API schema change.
+            self.logger.debug(
+                "Market %s: unexpected token structure (tokens=%d, outcomes=%d, "
+                "clobTokenIds=%d) — skipping",
+                market.get("id", "?"), len(tokens), len(outcomes), len(clob_token_ids),
+            )
             return None
 
         start_iso = market.get("start_date") or market.get("startDate")
