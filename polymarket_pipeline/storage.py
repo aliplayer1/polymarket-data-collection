@@ -22,6 +22,20 @@ Protection is two-layered:
      processes on the same host.  On non-Unix platforms (no `fcntl`) the file lock
      degrades to a no-op; the thread lock alone is still sufficient for in-process
      safety.
+
+WebSocket tick staging
+----------------------
+The live WebSocket service uses `append_ws_ticks_staged()` instead of `persist_ticks()`
+for its 5-second flush cycle.  This avoids loading the full consolidated ticks partition
+(potentially millions of rows) just to append a small WS batch.  Instead, each
+(crypto, timeframe) shard gets a lightweight ``ws_staging.parquet`` sidecar that
+accumulates at most a few hours of WS fills (typically < 1 MB per partition).
+
+The next `persist_ticks()` call (i.e. the --historical-only pass, every 6 h) reads
+every *.parquet file in the partition via ``pq.ParquetDataset`` — including the
+staging file — merges them all, deduplicates, and writes a single consolidated file
+via ``_write_partitioned_atomic()``, which deletes all previous shards (including
+``ws_staging.parquet``) as part of its atomic rename step.
 """
 
 from __future__ import annotations
@@ -358,6 +372,88 @@ def persist_ticks(
         table = pa.Table.from_pandas(merged, preserve_index=False)
         _write_partitioned_atomic(table, t_dir, partition_cols=["crypto", "timeframe"])
         log.info("Ticks table written: %s/ (%s rows)", t_dir, len(merged))
+
+
+_WS_STAGING_FILENAME = "ws_staging.parquet"
+
+
+def append_ws_ticks_staged(
+    ticks_df: pd.DataFrame,
+    *,
+    ticks_dir: str | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Append WebSocket ticks to a lightweight per-partition staging file.
+
+    Unlike ``persist_ticks()``, this function never reads the main consolidated
+    ticks partition (which may contain millions of rows).  It only reads and
+    rewrites the small ``ws_staging.parquet`` sidecar for each affected
+    (crypto, timeframe) shard.  That staging file accumulates at most a few
+    hours of WebSocket trade events — typically well under 1 MB per partition.
+
+    Staging files are absorbed automatically the next time ``persist_ticks()``
+    runs: ``pq.ParquetDataset`` reads every *.parquet file in the partition
+    directory (including ``ws_staging.parquet``), and ``_write_partitioned_atomic``
+    then removes it when it rewrites the consolidated file.
+    """
+    if ticks_df.empty:
+        return
+
+    log = logger or logging.getLogger("polymarket_pipeline")
+    t_dir = ticks_dir or PARQUET_TICKS_DIR
+
+    # Ensure required columns are present with defaults
+    for col in _TICKS_EMPTY_COLS:
+        if col not in ticks_df.columns:
+            ticks_df = ticks_df.copy()
+            if col in ("tx_hash",):
+                ticks_df[col] = ""
+            elif col in ("block_number", "log_index"):
+                ticks_df[col] = 0
+            else:
+                ticks_df[col] = None
+
+    # Flatten category columns so concat/dedup don't choke on dtype mismatches
+    for col in ("outcome", "side", "source", "crypto", "timeframe"):
+        if col in ticks_df.columns and hasattr(ticks_df[col], "cat"):
+            ticks_df = ticks_df.copy()
+            ticks_df[col] = ticks_df[col].astype(str)
+
+    data_root = os.path.dirname(os.path.abspath(t_dir))
+    rows_staged = 0
+
+    with _write_lock(data_root):
+        for (crypto, timeframe), group in ticks_df.groupby(
+            ["crypto", "timeframe"], sort=False
+        ):
+            shard_dir = os.path.join(t_dir, f"crypto={crypto}", f"timeframe={timeframe}")
+            os.makedirs(shard_dir, exist_ok=True)
+            staging_path = os.path.join(shard_dir, _WS_STAGING_FILENAME)
+
+            # Strip partition columns — they are encoded in the directory path
+            new_rows = group.drop(columns=["crypto", "timeframe"]).reset_index(drop=True)
+            for col in ("outcome", "side", "source"):
+                if col in new_rows.columns and hasattr(new_rows[col], "cat"):
+                    new_rows[col] = new_rows[col].astype(str)
+
+            if os.path.exists(staging_path):
+                existing = pq.read_table(staging_path).to_pandas()
+                merged = (
+                    pd.concat([existing, new_rows], ignore_index=True)
+                    .drop_duplicates(
+                        subset=["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"],
+                        keep="last",
+                    )
+                    .reset_index(drop=True)
+                )
+            else:
+                merged = new_rows
+
+            table = pa.Table.from_pandas(merged, preserve_index=False)
+            _write_parquet_atomic(table, staging_path)
+            rows_staged += len(new_rows)
+
+    log.info("WS ticks staged: %d new rows to %s/", rows_staged, t_dir)
 
 
 # ---------------------------------------------------------------------------
