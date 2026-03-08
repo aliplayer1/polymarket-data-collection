@@ -1,98 +1,159 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
-# setup.sh — One-shot provisioning script for OCI Ubuntu 22.04 instance
+# setup.sh — One-shot provisioning for a Hetzner Ubuntu 22.04/24.04 server
 #
-# Run as root:  sudo bash setup.sh
-# Or as ubuntu: bash setup.sh  (will sudo as needed)
+# Prerequisites (run these locally before this script):
+#   1. Push your code to GitHub (see deployment guide in README)
+#   2. Copy your .env to the server:
+#        scp .env root@<server-ip>:/tmp/polymarket.env
+#
+# Then, on the server as root:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/YOURUSER/YOURREPO/main/deploy/setup.sh)
+#
+# Or if you've already cloned/copied setup.sh to the server:
+#   bash /path/to/setup.sh
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  EDIT THIS before running                                               │
+# └─────────────────────────────────────────────────────────────────────────┘
+REPO_URL="https://github.com/YOURUSER/YOURREPO.git"   # ← your GitHub repo
+
 APP_DIR=/opt/polymarket
-DATA_DIR=/mnt/data/polymarket
+DATA_DIR=/opt/polymarket/data
 LOG_DIR=/var/log/polymarket
-PYTHON=python3.11   # Ubuntu 22.04 ships 3.10; install 3.11 from deadsnakes
+SERVICE_USER=polymarket
 
 # ── 1. System packages ────────────────────────────────────────────────────────
 apt-get update -qq
-apt-get install -y --no-install-recommends \
-    software-properties-common git curl \
-    python3.11 python3.11-venv python3.11-dev \
-    build-essential libssl-dev libffi-dev
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    git curl build-essential libssl-dev libffi-dev \
+    python3 python3-venv python3-dev python3-pip lsb-release
 
-# ── 2. Block volume mount (edit DEVICE as needed) ─────────────────────────────
-DEVICE=/dev/sdb          # change to the device shown by `lsblk`
-if [ -b "$DEVICE" ]; then
-    if ! blkid "$DEVICE" | grep -q ext4; then
-        echo "Formatting $DEVICE as ext4..."
-        mkfs.ext4 -L polymarket-data "$DEVICE"
-    fi
-    mkdir -p "$DATA_DIR"
-    if ! grep -q "$DEVICE" /etc/fstab; then
-        echo "LABEL=polymarket-data  $DATA_DIR  ext4  defaults,nofail  0  2" >> /etc/fstab
-    fi
-    mount -a
-fi
-mkdir -p "$DATA_DIR"
-chown ubuntu:ubuntu "$DATA_DIR"
-
-# ── 3. Log directory ──────────────────────────────────────────────────────────
-mkdir -p "$LOG_DIR"
-chown ubuntu:ubuntu "$LOG_DIR"
-
-# ── 4. App directory + code ───────────────────────────────────────────────────
-mkdir -p "$APP_DIR"
-chown ubuntu:ubuntu "$APP_DIR"
-
-# Clone or update repo
-if [ -d "$APP_DIR/.git" ]; then
-    sudo -u ubuntu git -C "$APP_DIR" pull
+# On Ubuntu 22.04 the default python3 is 3.10; install 3.11 for compatibility.
+UBUNTU_VER=$(lsb_release -rs 2>/dev/null || echo "24.04")
+if [[ "$UBUNTU_VER" == "22.04" ]]; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        software-properties-common
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        python3.11 python3.11-venv python3.11-dev
+    PYTHON=python3.11
 else
-    sudo -u ubuntu git clone \
-        https://github.com/yourusername/polymarket-data-pipeline.git "$APP_DIR"
+    # Ubuntu 24.04+ ships python3.12
+    PYTHON=python3
 fi
 
-# ── 5. Python virtual environment ─────────────────────────────────────────────
-sudo -u ubuntu $PYTHON -m venv "$APP_DIR/.venv"
-sudo -u ubuntu "$APP_DIR/.venv/bin/pip" install --upgrade pip wheel
-sudo -u ubuntu "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt"
+# ── 2. Service user ───────────────────────────────────────────────────────────
+if ! id "$SERVICE_USER" &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
+fi
 
-# ── 6. Environment file (edit with your real keys before running) ─────────────
-if [ ! -f "$APP_DIR/.env" ]; then
-    cat > "$APP_DIR/.env" <<'EOF'
-# Polygon on-chain ticks (optional but recommended)
-POLYGON_RPC_URL=
-POLYGONSCAN_API_KEY=
+# ── 3. Directories ────────────────────────────────────────────────────────────
+mkdir -p "$APP_DIR" "$DATA_DIR" "$LOG_DIR"
+chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR" "$DATA_DIR" "$LOG_DIR"
 
-# Hugging Face upload
+# ── 4. Clone or update code from GitHub ───────────────────────────────────────
+if [ -d "$APP_DIR/.git" ]; then
+    echo "Updating existing repository..."
+    sudo -u "$SERVICE_USER" git -C "$APP_DIR" pull --ff-only
+else
+    echo "Cloning repository..."
+    sudo -u "$SERVICE_USER" git clone "$REPO_URL" "$APP_DIR"
+fi
+
+# ── 5. Install .env (copied from local machine before running this script) ────
+ENV_FILE="$APP_DIR/.env"
+if [ -f /tmp/polymarket.env ] && [ ! -f "$ENV_FILE" ]; then
+    mv /tmp/polymarket.env "$ENV_FILE"
+    chown "$SERVICE_USER:$SERVICE_USER" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    echo "Installed .env from /tmp/polymarket.env"
+elif [ ! -f "$ENV_FILE" ]; then
+    # Create a blank template so the user knows what to fill in
+    cat > "$ENV_FILE" <<'EOF'
+# ── Hugging Face (required for --upload) ─────────────────────────────────────
 HF_TOKEN=
 HF_REPO_ID=yourusername/polymarket-crypto-updown
 
-# Override these if needed
-POLYMARKET_DATA_DIR=/mnt/data/polymarket
+# ── Polygon on-chain tick data (optional but recommended) ─────────────────────
+POLYGON_RPC_URL=https://polygon-bor-rpc.publicnode.com
+POLYGONSCAN_API_KEY=
+
+# ── Pipeline paths ─────────────────────────────────────────────────────────────
+POLYMARKET_DATA_DIR=/opt/polymarket/data
 POLYMARKET_LOG_FILE=/var/log/polymarket/pipeline.log
 EOF
-    chown ubuntu:ubuntu "$APP_DIR/.env"
-    chmod 600 "$APP_DIR/.env"
-    echo ">>> Edit $APP_DIR/.env with your credentials before starting services."
+    chown "$SERVICE_USER:$SERVICE_USER" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
 fi
 
-# ── 7. systemd services ───────────────────────────────────────────────────────
+# ── 6. Python virtual environment ─────────────────────────────────────────────
+if [ ! -d "$APP_DIR/.venv" ]; then
+    sudo -u "$SERVICE_USER" $PYTHON -m venv "$APP_DIR/.venv"
+fi
+sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/pip" install --upgrade pip wheel -q
+sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q
+
+# ── 7. systemd service files ──────────────────────────────────────────────────
 cp "$APP_DIR/deploy/polymarket-live.service"        /etc/systemd/system/
 cp "$APP_DIR/deploy/polymarket-historical.service"  /etc/systemd/system/
 cp "$APP_DIR/deploy/polymarket-historical.timer"    /etc/systemd/system/
-
 systemctl daemon-reload
 
-systemctl enable polymarket-historical.timer
-systemctl start  polymarket-historical.timer
+# ── 8. Check credentials before proceeding ────────────────────────────────────
+HF_TOKEN_VAL=$(grep -E '^HF_TOKEN=' "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]')
+if [ -z "$HF_TOKEN_VAL" ]; then
+    echo ""
+    echo "════════════════════════════════════════════════════════════════════"
+    echo "  IMPORTANT: .env credentials are not set."
+    echo ""
+    echo "  Copy your local .env to the server, then re-run this script:"
+    echo "    scp .env root@<server-ip>:/tmp/polymarket.env"
+    echo "    bash $0"
+    echo ""
+    echo "  Or edit directly on the server:"
+    echo "    nano $ENV_FILE"
+    echo "    # Set HF_TOKEN and HF_REPO_ID, then re-run this script"
+    echo "════════════════════════════════════════════════════════════════════"
+    exit 0
+fi
 
-systemctl enable polymarket-live.service
-systemctl start  polymarket-live.service
+# ── 9. Initial full historical backfill ───────────────────────────────────────
+echo ""
+echo "Running initial historical backfill — this may take 10–60 minutes..."
+echo "Logs → $LOG_DIR/pipeline.log"
+echo ""
+sudo -u "$SERVICE_USER" bash -c "
+    set -a
+    source '$ENV_FILE'
+    set +a
+    cd '$APP_DIR'
+    .venv/bin/python -m polymarket_pipeline --historical-only --upload
+"
+
+# ── 10. Enable and start continuous services ──────────────────────────────────
+systemctl enable --now polymarket-historical.timer
+systemctl enable --now polymarket-live.service
 
 echo ""
-echo "=== Setup complete ==="
-echo "  Live stream:      systemctl status polymarket-live"
-echo "  Historical timer: systemctl status polymarket-historical.timer"
-echo "  Logs (live):      journalctl -fu polymarket-live"
-echo "  Logs (hist):      tail -f /var/log/polymarket/historical.log"
-echo "  Data directory:   $DATA_DIR"
+echo "════════════════════════════════════════════════════════════════════"
+echo "  Setup complete!"
+echo ""
+echo "  Live WebSocket stream:"
+echo "    systemctl status polymarket-live"
+echo "    journalctl -fu polymarket-live"
+echo ""
+echo "  Historical sync (every 6 h) + HF upload:"
+echo "    systemctl status polymarket-historical.timer"
+echo "    journalctl -fu polymarket-historical"
+echo ""
+echo "  Data directory: $DATA_DIR"
+echo "  Log file:       $LOG_DIR/pipeline.log"
+echo ""
+echo "  To deploy a code update:"
+echo "    git push  (from your local machine)"
+echo "    ssh root@<server-ip> 'git -C $APP_DIR pull && systemctl restart polymarket-live'"
+echo "════════════════════════════════════════════════════════════════════"

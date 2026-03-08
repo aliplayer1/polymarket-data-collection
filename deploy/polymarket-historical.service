@@ -1,25 +1,22 @@
 [Unit]
-Description=Polymarket Historical Data Fetch (one-shot)
-Documentation=https://github.com/yourusername/polymarket-data-pipeline
+Description=Polymarket Historical Data Sync + Hugging Face Upload (one-shot)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-
-# Keep exit status across timer restarts so failed runs surface in journalctl
 RemainAfterExit=no
-
-User=ubuntu
-Group=ubuntu
+User=polymarket
+Group=polymarket
 WorkingDirectory=/opt/polymarket
 
 EnvironmentFile=/opt/polymarket/.env
 
+# Incremental scan (checkpoint-based; typically 1-2 pages after the first run)
+# then uploads all Parquet data to Hugging Face Hub.
 ExecStart=/opt/polymarket/.venv/bin/python -m polymarket_pipeline \
     --historical-only \
-    --upload \
-    --data-dir /mnt/data/polymarket \
-    --log-file /var/log/polymarket/historical.log
+    --upload
 
-TimeoutStartSec=3600
+# Allow up to 2 h for an unusually large backfill run
+TimeoutStartSec=7200
