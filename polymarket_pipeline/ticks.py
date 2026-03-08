@@ -82,8 +82,9 @@ class PolygonTickFetcher:
 
     # Minimum gap between eth_getLogs RPC calls on Alchemy free tier.
     # eth_getLogs costs 75 CU; free tier throughput is 500 CU/s → max 6.67 calls/s.
-    # 0.15 s gives ~6.6 calls/s × 75 CU = 495 CU/s, leaving ~1% headroom.
-    _RPC_LOGS_MIN_INTERVAL = 0.15
+    # 0.5 s gives 2 calls/s × 75 CU = 150 CU/s, leaving 70% headroom to avoid
+    # sustained HTTP 503 "node overload" errors.
+    _RPC_LOGS_MIN_INTERVAL = 0.5
 
     def __init__(
         self,
@@ -100,6 +101,25 @@ class PolygonTickFetcher:
         self._block_cache: dict[int, int] = {}  # ts → block number
         self._last_etherscan_ts: float = 0.0    # global rate-limit tracker
         self._last_rpc_logs_ts: float = 0.0       # rate-limit tracker for eth_getLogs
+
+    @property
+    def _masked_rpc_url(self) -> str:
+        """RPC URL with the API key replaced by <key> for safe logging.
+
+        Alchemy URLs have the form ``.../v2/<key>``; we mask everything after
+        the last ``/`` so the key never appears in log files.
+        """
+        if not self.rpc_url:
+            return "<no rpc_url>"
+        idx = self.rpc_url.rfind("/")
+        return (self.rpc_url[: idx + 1] + "<key>") if idx >= 0 else "<rpc_url>"
+
+    def _sanitize_exc(self, exc: Exception) -> str:
+        """Return str(exc) with the raw RPC URL (containing API key) masked."""
+        msg = str(exc)
+        if self.rpc_url and self.rpc_url in msg:
+            msg = msg.replace(self.rpc_url, self._masked_rpc_url)
+        return msg
 
     # ------------------------------------------------------------------
     # Public interface
@@ -339,12 +359,28 @@ class PolygonTickFetcher:
 
         # Prefer RPC for log fetching: eth_getLogs returns all results in one
         # call per chunk (no pagination protocol), so a 15-block chunk costs
-        # one 0.15 s rate-limited call vs. ~3 pages × 0.42 s on Polygonscan.
+        # one 0.5 s rate-limited call vs. ~3 pages × 0.42 s on Polygonscan.
         # Polygonscan is still used above for block-number lookups via
         # _ts_to_block_polygonscan — those are cheap (one call, cached) and
         # more reliable than the RPC binary-search fallback.
+        #
+        # _fetch_logs_rpc returns None (not []) when blocks had to be skipped
+        # due to persistent node errors; in that case fall through to Polygonscan.
         if self.rpc_url:
-            return self._fetch_logs_rpc(start_block, end_block)
+            logs = self._fetch_logs_rpc(start_block, end_block)
+            if logs is not None:
+                return logs
+            if self.polygonscan_key:
+                self.logger.warning(
+                    "RPC log fetch had persistent failures; falling back to Polygonscan "
+                    "(blocks %s–%s)", start_block, end_block,
+                )
+            else:
+                self.logger.error(
+                    "RPC log fetch failed and no Polygonscan key configured; "
+                    "returning partial results for blocks %s–%s", start_block, end_block,
+                )
+                return []
 
         if self.polygonscan_key:
             logs = self._fetch_logs_polygonscan(start_block, end_block)
@@ -468,20 +504,25 @@ class PolygonTickFetcher:
 
         return all_logs
 
-    def _fetch_logs_rpc(self, start_block: int, end_block: int) -> list[dict]:
+    def _fetch_logs_rpc(self, start_block: int, end_block: int) -> list[dict] | None:
         """Fetch OrderFilled logs via eth_getLogs in chunked block ranges.
 
         The chunk size starts at RPC_LOG_CHUNK_BLOCKS and halves automatically
         when the node signals a result-count overflow (Alchemy -32005 /
         "query returned more than 10 000 results").  This lets the static
         default be conservative while gracefully handling peak-traffic blocks.
+
+        Returns ``None`` (instead of an empty list) when one or more blocks had
+        to be skipped due to persistent RPC failures, so the caller can fall
+        back to Polygonscan rather than silently returning incomplete data.
         """
         if not self.rpc_url:
             self.logger.error("No RPC URL configured; cannot fetch on-chain ticks")
-            return []
+            return None
 
         all_logs: list[dict] = []
         cur = start_block
+        had_failure = False
 
         while cur <= end_block:
             chunk = self.RPC_LOG_CHUNK_BLOCKS
@@ -498,7 +539,7 @@ class PolygonTickFetcher:
                         "topics":    [ORDER_FILLED_TOPIC],
                     })
                 except Exception as exc:
-                    self.logger.warning("eth_getLogs failed (blocks %s–%s): %s", cur, chunk_end, exc)
+                    self.logger.warning("eth_getLogs failed (blocks %s–%s): %s", cur, chunk_end, self._sanitize_exc(exc))
                     logs = None
 
                 if logs is None:
@@ -517,6 +558,7 @@ class PolygonTickFetcher:
                         "eth_getLogs still failing at chunk=1 (blocks %s–%s); skipping.",
                         cur, chunk_end,
                     )
+                    had_failure = True
                     chunk_end = cur  # advance by 1 block to avoid infinite loop
                     break
 
@@ -526,7 +568,9 @@ class PolygonTickFetcher:
 
             cur = chunk_end + 1
 
-        return all_logs
+        # Return None when blocks were skipped so _fetch_logs can fall back to
+        # Polygonscan rather than returning silently incomplete data.
+        return None if had_failure else all_logs
 
     # ------------------------------------------------------------------
     # Log decoding
@@ -688,16 +732,17 @@ class PolygonTickFetcher:
                     return None
                 return data.get("result")
             except requests.exceptions.RequestException as exc:
+                safe_exc = self._sanitize_exc(exc)
                 if attempt < self._MAX_RETRIES:
                     wait = 2 ** attempt
                     self.logger.warning(
                         "RPC call %s (attempt %d/%d), retrying in %ds: %s",
-                        method, attempt, self._MAX_RETRIES, wait, exc,
+                        method, attempt, self._MAX_RETRIES, wait, safe_exc,
                     )
                     time.sleep(wait)
                 else:
-                    self.logger.warning("RPC call %s failed after %d retries: %s", method, self._MAX_RETRIES, exc)
+                    self.logger.warning("RPC call %s failed after %d retries: %s", method, self._MAX_RETRIES, safe_exc)
             except Exception as exc:
-                self.logger.warning("RPC call %s failed: %s", method, exc)
+                self.logger.warning("RPC call %s failed: %s", method, self._sanitize_exc(exc))
                 break
         return None

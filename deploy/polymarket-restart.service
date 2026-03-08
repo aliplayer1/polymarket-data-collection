@@ -1,5 +1,5 @@
 [Unit]
-Description=Restart Polymarket Live service to pick up new markets
+Description=Restart Polymarket WebSocket service to pick up new markets
 
 [Service]
 Type=oneshot
