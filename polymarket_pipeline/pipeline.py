@@ -111,10 +111,15 @@ class PolymarketDataPipeline:
         prediction period: [end_ts - timeframe_seconds, end_ts].  This avoids
         collecting the long pre-trading dormant phase where prices sit flat at
         the default ~0.5 opening value and no meaningful trading has occurred.
+
+        Note: we do NOT clip by market.start_ts because Polymarket's Gamma API
+        sets startDate unreliably close to endDate for recently-closed markets
+        (sometimes only 30–100 s before), which would collapse the fetch window
+        to near-zero and return 0 price rows from the CLOB API.
         """
         window_seconds = TIMEFRAME_SECONDS.get(market.timeframe, 300)
-        # Start of the actual prediction window (never before market open)
-        prediction_start = max(market.start_ts, market.end_ts - window_seconds)
+        # Always fetch the last [window_seconds] before resolution.
+        prediction_start = market.end_ts - window_seconds
 
         existing_df = self.existing_dfs.get(market.timeframe, pd.DataFrame())
         if existing_df.empty:
