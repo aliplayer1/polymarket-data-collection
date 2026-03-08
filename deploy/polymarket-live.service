@@ -2,6 +2,8 @@
 Description=Polymarket Live WebSocket Data Stream
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -19,8 +21,6 @@ ExecStart=/opt/polymarket/.venv/bin/python -m polymarket_pipeline --upload
 # Restart on any failure; back off up to 30 s between attempts
 Restart=always
 RestartSec=30
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # Allow time to flush the WebSocket buffer on graceful stop
 TimeoutStopSec=60
