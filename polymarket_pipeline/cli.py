@@ -153,12 +153,19 @@ def main() -> None:
     try:
         # Upload-only mode: consolidate + upload without any data collection
         if args.upload_only:
-            from .storage import consolidate_ticks, upload_to_huggingface
-            from .config import PARQUET_TICKS_DIR, PARQUET_DATA_DIR
-            t_dir = os.path.join(data_dir, "ticks") if data_dir else PARQUET_TICKS_DIR
+            from .storage import upload_to_huggingface
+            from .config import PARQUET_DATA_DIR, PARQUET_MARKETS_PATH, PARQUET_PRICES_DIR, PARQUET_TICKS_DIR
+            markets_path = os.path.join(data_dir, "markets.parquet") if data_dir else PARQUET_MARKETS_PATH
+            prices_dir   = os.path.join(data_dir, "prices")          if data_dir else PARQUET_PRICES_DIR
+            ticks_dir    = os.path.join(data_dir, "ticks")           if data_dir else PARQUET_TICKS_DIR
             logger.info("Upload-only mode: consolidating and uploading...")
-            consolidate_ticks(ticks_dir=t_dir, logger=logger)
-            upload_to_huggingface(repo_id=hf_repo, logger=logger)
+            upload_to_huggingface(
+                repo_id=hf_repo,
+                markets_path=markets_path,
+                prices_dir=prices_dir,
+                ticks_dir=ticks_dir,
+                logger=logger,
+            )
             return
 
         pipeline = PolymarketDataPipeline(

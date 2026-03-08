@@ -34,3 +34,5 @@ test_output_parquet/
 .DS_Store
 Thumbs.db
 .claude/
+claude*
+CLAUDE*
