@@ -31,7 +31,7 @@ WS_FLUSH_BATCH_SIZE = 200
 # 500 tokens ≈ 38 KB per shard; with ~6 shards all connections stay stable.
 WS_MAX_TOKENS_PER_SHARD = 500
 
-TIME_FRAMES = ("5-minute", "15-minute", "1-hour", "4-hour")
+TIME_FRAMES = ("5-minute", "15-minute", "1-hour")
 
 # Duration of each prediction window in seconds.  The price fetch for a closed
 # market is limited to [end_ts - window_seconds, end_ts] so that we only
