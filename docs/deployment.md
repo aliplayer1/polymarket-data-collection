@@ -36,13 +36,18 @@ The `deploy/` directory contains everything needed to run the pipeline continuou
 
 ### Architecture
 
-The pipeline runs as two complementary services that operate concurrently and are safe to run side-by-side (protected by a cross-process write lock on the Parquet data directory):
+The pipeline runs as two complementary services that operate concurrently and are safe to run side-by-side.  They are protected by a two-layered locking mechanism:
+1.  **In-process**: `threading.RLock` prevents thread-level races.
+2.  **Cross-process**: An `fcntl` exclusive lock on `data/.write.lock` prevents process-level races between the WebSocket service and the historical/upload service.
+
+The cross-process lock has a **5-minute (300 s)** timeout.  The `polymarket-historical.service` (specifically the `--upload` phase) holds this lock for the duration of the Hugging Face upload to ensure the dataset is stable and no files are deleted/replaced by the WebSocket service during the scan.
 
 ```text
 Hetzner CAX21 (4 vCPU ARM64 / 8 GB RAM / 80 GB SSD)
   ├── polymarket-websocket.service  → 24/7 WebSocket tick stream (--websocket-only), auto-restart
   ├── polymarket-historical.timer   → incremental historical fetch + HF upload every 6 h
   └── polymarket-restart.timer      → restarts WebSocket service daily at 00:05 UTC (new market discovery)
+```
 
   /opt/polymarket/          ← app code (cloned from GitHub)
   /opt/polymarket/data/     ← Parquet data storage
@@ -94,25 +99,17 @@ ssh root@<server-ip> 'systemctl list-units "polymarket*"'
 ssh root@<server-ip> 'journalctl -fu polymarket-websocket'
 ```
 
-### Deploying Code Updates
+### Troubleshooting
 
+#### Hugging Face Upload Crashes (os error 2)
+The `polymarket` system user is created without a home directory. If the Hugging Face `upload_folder` (specifically the `hf-xet` backend) cannot find a writable home to store its deduplication index, it may crash with an `I/O error (os error 2)`.
+
+To fix this, ensure you have a writable cache directory and point to it in your `.env`:
 ```bash
-# Push changes from local machine
-git push
+# Create the cache directory
+sudo mkdir -p /opt/polymarket/.cache
+sudo chown polymarket:polymarket /opt/polymarket/.cache
 
-# Pull and restart the WebSocket service on the server
-ssh hetzner-root 'cd /opt/polymarket && git pull origin main && systemctl restart polymarket-websocket.service'
-```
-
-If you changed a service or timer file, copy the updated files and reload systemd:
-
-```bash
-ssh hetzner-root 'git -C /opt/polymarket pull && \
-  cp /opt/polymarket/deploy/polymarket-websocket.service  /etc/systemd/system/ && \
-  cp /opt/polymarket/deploy/polymarket-historical.service /etc/systemd/system/ && \
-  cp /opt/polymarket/deploy/polymarket-historical.timer   /etc/systemd/system/ && \
-  cp /opt/polymarket/deploy/polymarket-restart.service    /etc/systemd/system/ && \
-  cp /opt/polymarket/deploy/polymarket-restart.timer      /etc/systemd/system/ && \
-  systemctl daemon-reload && \
-  systemctl restart polymarket-websocket.service'
+# Add to .env
+HF_HOME=/opt/polymarket/.cache
 ```
