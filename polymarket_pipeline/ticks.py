@@ -455,11 +455,22 @@ class PolygonTickFetcher:
                     "address":   CTF_EXCHANGE_ADDRESS,
                     "topics":    [ORDER_FILLED_TOPIC],
                 })
-                if logs:
+                if logs is None:
+                    # All retries exhausted (e.g. Alchemy 503 rate limit).
+                    # Back off before the next chunk so the provider can recover.
+                    self.logger.warning(
+                        "eth_getLogs returned no result for blocks %s–%s; "
+                        "backing off 15 s before continuing.",
+                        cur, chunk_end,
+                    )
+                    time.sleep(15)
+                elif logs:
                     all_logs.extend(logs)
             except Exception as exc:
                 self.logger.warning("eth_getLogs failed (blocks %s–%s): %s", cur, chunk_end, exc)
+                time.sleep(15)
             cur = chunk_end + 1
+            time.sleep(0.05)  # gentle pacing: ~20 req/s, well within Alchemy free tier
 
         return all_logs
 
