@@ -307,7 +307,14 @@ def _read_hive_partitioned_robust(
 
         for fname in parquet_files:
             try:
-                t = pq.read_table(os.path.join(dirpath, fname))
+                # Use ParquetFile (not read_table) to bypass Hive path inference.
+                # pq.read_table internally builds a ParquetDataset which detects
+                # the crypto=X/timeframe=Y directory segments and tries to merge
+                # the path-inferred schema (dict<int32>) with the embedded schema
+                # in old-format files (dict<int8>), raising ArrowTypeError.
+                # pq.ParquetFile reads the raw file bytes without any path-based
+                # partitioning logic, so it returns the actual embedded schema.
+                t = pq.ParquetFile(os.path.join(dirpath, fname)).read()
             except Exception:
                 continue
             # Drop partition columns present in the file data (old-format files).
@@ -344,9 +351,11 @@ def load_prices(prices_dir: str | None = None, filters: list | None = None) -> p
     try:
         dataset = pq.ParquetDataset(path, filters=filters)
         return dataset.read().to_pandas()
-    except pa.lib.ArrowInvalid:
+    except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
         # Schema mismatch between shards (e.g. old files with crypto/timeframe
         # as embedded dict<int8> vs newer path-encoded files read as dict<int32>).
+        # ArrowTypeError (not ArrowInvalid) is what PyArrow raises for dictionary
+        # index-type incompatibilities; catch both for safety.
         # Fall back to reading each file individually and normalising.
         return _read_hive_partitioned_robust(path, _HIVE_PARTITION_COLS, filters, _PRICES_EMPTY_COLS)
 
@@ -370,7 +379,7 @@ def load_ticks(ticks_dir: str | None = None, filters: list | None = None) -> pd.
     try:
         dataset = pq.ParquetDataset(path, filters=filters)
         return dataset.read().to_pandas()
-    except pa.lib.ArrowInvalid:
+    except (pa.lib.ArrowInvalid, pa.lib.ArrowTypeError):
         return _read_hive_partitioned_robust(path, _HIVE_PARTITION_COLS, filters, _TICKS_EMPTY_COLS)
 
 
