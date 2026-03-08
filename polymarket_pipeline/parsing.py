@@ -9,6 +9,13 @@ TIME_RANGE_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 
+# Matches single-hour format: "Bitcoin Up or Down - March 1, 10AM ET"
+# No end time means the market covers exactly one hour.
+SINGLE_HOUR_PATTERN = re.compile(
+    r"\b\d{1,2}(?:AM|PM)\s+ET\b",
+    flags=re.IGNORECASE,
+)
+
 
 def _minutes_from_time_range(question: str) -> int | None:
     match = TIME_RANGE_PATTERN.search(question)
@@ -44,6 +51,10 @@ def extract_timeframe(question: str) -> str | None:
         return "1-hour"
     if range_minutes == 240:
         return "4-hour"
+
+    # Single-hour format: "Bitcoin Up or Down - March 1, 10AM ET" (no end time).
+    if SINGLE_HOUR_PATTERN.search(question):
+        return "1-hour"
 
     return None
 
