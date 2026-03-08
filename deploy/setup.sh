@@ -18,7 +18,7 @@ set -euo pipefail
 # ┌─────────────────────────────────────────────────────────────────────────┐
 # │  EDIT THIS before running                                               │
 # └─────────────────────────────────────────────────────────────────────────┘
-REPO_URL="https://github.com/YOURUSER/YOURREPO.git"   # ← your GitHub repo
+REPO_URL="https://github.com/aliplayer1/polymarket-data-collection.git"   # GitHub repo
 
 APP_DIR=/opt/polymarket
 DATA_DIR=/opt/polymarket/data
