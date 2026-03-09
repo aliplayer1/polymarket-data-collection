@@ -5,8 +5,8 @@ emitted by the CTF Exchange contract (OrderFilled event).  This module queries
 those events to reconstruct a per-market trade tick series with:
 
   timestamp_ms  -  block timestamp converted to milliseconds
-  token_id      -  ERC-1155 outcome token (maps to Up/Down)
-  outcome       -  "Up" or "Down"
+  token_id      -  ERC-1155 outcome token (maps to the market's binary sides)
+  outcome       -  market outcome label (e.g. "Up", "Down", "Yes", "No")
   side          -  "BUY" or "SELL" (from taker perspective)
   price         -  fill price in [0, 1]
   size_usdc     -  USDC notional of the fill
@@ -41,6 +41,7 @@ from .config import (
     POLYGONSCAN_NATIVE_API,
     POLYGON_CHAIN_ID,
 )
+from .phases.shared import build_binary_tick_row
 from .models import MarketRecord
 
 
@@ -141,6 +142,7 @@ class PolygonTickFetcher:
         Returns a dict mapping market_id → list of tick dicts.
         """
         result: dict[str, list[dict[str, Any]]] = {m.market_id: [] for m in markets}
+        markets_by_id = {m.market_id: m for m in markets}
 
         # Build token_id → market lookup for O(1) dispatch
         token_to_market: dict[str, MarketRecord] = {}
@@ -173,12 +175,16 @@ class PolygonTickFetcher:
                 result[m.market_id].append(tick)
 
         for mid, ticks in result.items():
+            market = markets_by_id[mid]
             ticks.sort(key=lambda t: t["timestamp_ms"])
             self.logger.info(
-                "On-chain ticks for market %s: %s fills (up=%s down=%s)",
-                mid, len(ticks),
-                sum(1 for t in ticks if t["outcome"] == "Up"),
-                sum(1 for t in ticks if t["outcome"] == "Down"),
+                "On-chain ticks for market %s: %s fills (%s=%s %s=%s)",
+                mid,
+                len(ticks),
+                market.up_outcome,
+                sum(1 for t in ticks if t["outcome"] == market.up_outcome),
+                market.down_outcome,
+                sum(1 for t in ticks if t["outcome"] == market.down_outcome),
             )
 
         return result
@@ -211,11 +217,13 @@ class PolygonTickFetcher:
 
         ticks.sort(key=lambda t: t["timestamp_ms"])
         self.logger.info(
-            "On-chain ticks for market %s: %s fills (up=%s down=%s)",
+            "On-chain ticks for market %s: %s fills (%s=%s %s=%s)",
             market.market_id,
             len(ticks),
-            sum(1 for t in ticks if t["outcome"] == "Up"),
-            sum(1 for t in ticks if t["outcome"] == "Down"),
+            market.up_outcome,
+            sum(1 for t in ticks if t["outcome"] == market.up_outcome),
+            market.down_outcome,
+            sum(1 for t in ticks if t["outcome"] == market.down_outcome),
         )
         return ticks
 
@@ -598,19 +606,19 @@ class PolygonTickFetcher:
             taker_asset_s = str(taker_asset)
 
             if maker_asset_s == up_token:
-                outcome, side = "Up", "SELL"   # maker sold Up → BUY from taker's view
+                outcome_side, side = "up", "SELL"
                 outcome_amt_raw = maker_amt_raw
                 usdc_amt_raw    = taker_amt_raw
             elif taker_asset_s == up_token:
-                outcome, side = "Up", "BUY"
+                outcome_side, side = "up", "BUY"
                 outcome_amt_raw = taker_amt_raw
                 usdc_amt_raw    = maker_amt_raw
             elif maker_asset_s == down_token:
-                outcome, side = "Down", "SELL"
+                outcome_side, side = "down", "SELL"
                 outcome_amt_raw = maker_amt_raw
                 usdc_amt_raw    = taker_amt_raw
             elif taker_asset_s == down_token:
-                outcome, side = "Down", "BUY"
+                outcome_side, side = "down", "BUY"
                 outcome_amt_raw = taker_amt_raw
                 usdc_amt_raw    = maker_amt_raw
             else:
@@ -647,22 +655,21 @@ class PolygonTickFetcher:
             else:
                 log_idx_int = int(log_idx)
 
-            token_id = up_token if outcome == "Up" else down_token
+            token_id = market.token_id_for_side(outcome_side)
 
-            return {
-                "timestamp_ms":  block_ts * 1000,   # block precision (Polygon ~2s)
-                "market_id":     market.market_id,
-                "crypto":        market.crypto,
-                "timeframe":     market.timeframe,
-                "token_id":      token_id,
-                "outcome":       outcome,
-                "side":          side,
-                "price":         round(price, 6),
-                "size_usdc":     round(usdc_size, 6),
-                "tx_hash":       log.get("transactionHash", ""),
-                "block_number":  block_num,
-                "log_index":     log_idx_int,
-            }
+            return build_binary_tick_row(
+                market,
+                timestamp_ms=block_ts * 1000,
+                token_id=token_id,
+                outcome_side=outcome_side,
+                trade_side=side,
+                price=round(price, 6),
+                size_usdc=round(usdc_size, 6),
+                tx_hash=str(log.get("transactionHash", "")),
+                block_number=block_num,
+                log_index=log_idx_int,
+                source="onchain",
+            )
         except Exception as exc:
             self.logger.debug("Failed to decode log: %s  log=%s", exc, str(log)[:120])
             return None

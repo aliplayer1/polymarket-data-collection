@@ -3,8 +3,6 @@ import random
 import time
 from typing import Any, Callable
 
-from requests.exceptions import HTTPError
-
 
 def _parse_retry_after(exc: Exception) -> float | None:
     """Extract Retry-After value from a 429 response, if present."""

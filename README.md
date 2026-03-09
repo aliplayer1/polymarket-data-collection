@@ -1,6 +1,6 @@
 # Polymarket Data Pipeline
 
-Modular pipeline for collecting historical and real-time Polymarket crypto up/down market data, with normalised Parquet storage and Hugging Face Hub integration. Designed to run unattended on a cloud server and accumulate datasets suitable for training intramarket ML / scalping models.
+Modular pipeline for collecting historical and real-time Polymarket prediction market data, with normalised Parquet storage and Hugging Face Hub integration. The current dataset targets Polymarket crypto up/down markets, and the market-matching/parsing logic is now centralized so additional binary market families can be added with localized changes instead of touching the full pipeline.
 
 ---
 
@@ -50,7 +50,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # then fill in your keys
 
-# Full pipeline (1. OHLC Scan -> 2. Tick Backfill -> 3. Hugging Face Upload -> 4. Live WebSocket)
+# Full pipeline (1. Historical market scan + price history -> 2. Tick Backfill -> 3. Hugging Face Upload -> 4. Live WebSocket)
 .venv/bin/python -m polymarket_pipeline --upload
 
 # WebSocket-only (skip historical scan and tick backfill; useful alongside a separate --historical-only process)
@@ -79,6 +79,15 @@ cp .env.example .env   # then fill in your keys
 # Smoke-test — collect 10 markets into isolated output and validate
 .venv/bin/python -m polymarket_pipeline --test 10
 
+# Unit/regression tests
+.venv/bin/python -m pytest -q
+
+# Lint the repo
+.venv/bin/python -m ruff check polymarket_pipeline tests
+
+# Run a single test
+.venv/bin/python -m pytest tests/test_market_normalization.py::test_normalize_gamma_market_classifies_reversed_token_order -q
+
 # Query local data with SQL (tables: markets, prices, ticks)
 .venv/bin/python -m polymarket_pipeline.query "SELECT crypto, COUNT(*) FROM prices GROUP BY 1"
 ```
@@ -100,6 +109,52 @@ systemctl show polymarket-upload.service -p MemoryCurrent -p MemoryMax -p Memory
 
 See [docs/deployment.md](docs/deployment.md) for the full troubleshooting notes.
 
+## Architecture at a Glance
+
+The runtime is organized into five layers:
+
+1. **Externalized market definitions** (`polymarket_pipeline/market_definitions.json`, `polymarket_pipeline/markets.py`)  
+   Supported market families, asset aliases, timeframe aliases, and binary outcome vocabulary now live in bundled JSON-backed definitions instead of being hardcoded across multiple modules.
+
+2. **Normalization + settings** (`polymarket_pipeline/market_normalization.py`, `polymarket_pipeline/settings.py`)  
+   Raw Gamma payloads are converted into canonical `MarketRecord` objects, while CLI/env configuration is merged into typed runtime settings and run options once at startup.
+
+3. **Providers** (`polymarket_pipeline/providers.py`, `api.py`, `ticks.py`)  
+   Fetching concerns are expressed through small protocols so Gamma/CLOB price history, last-trade lookups, and tick backfill sources can be swapped or stubbed cleanly in tests.
+
+4. **Pipeline phases** (`polymarket_pipeline/pipeline.py`, `polymarket_pipeline/phases/`)  
+   `pipeline.py` is now a thin orchestrator over dedicated price-history, tick-backfill, and WebSocket phases, plus shared builders for the binary storage schema.
+
+5. **Persistence/query** (`storage.py`, `query.py`)  
+   Stores markets, prices, and ticks in Hive-partitioned Parquet; provides DuckDB-backed querying and upload tooling.
+
+### Data Flow
+
+- **Historical flow:** Gamma market page -> definition-based normalization -> price-history phase -> normalized Parquet write  
+- **Live flow:** active markets -> WebSocket phase -> staged tick writes / periodic price flushes  
+- **On-chain flow:** shared market windows -> tick-backfill phase -> canonical tick rows -> consolidated Parquet shards
+
+### Extending Supported Markets
+
+The current storage/query schema still assumes a binary market with `up_price` and `down_price`, but adding another **binary** market family is now much more localized:
+
+1. Add a new definition entry to `polymarket_pipeline/market_definitions.json`
+2. Reuse `market_normalization.py` to classify raw Gamma outcomes into canonical up/down sides
+3. Add tests covering definition loading, parsing, and normalization for the new family
+
+This keeps the rest of the ingestion pipeline largely unchanged as long as the market can still be represented as a binary pair.
+
+## Testing & Validation
+
+Recommended local validation:
+
+- **Regression tests:** `./.venv/bin/python -m pytest -q`  
+  Covers parsing, storage behavior, definition loading, settings, extracted phase helpers, and the offline pipeline run-mode matrix.
+- **Lint:** `./.venv/bin/python -m ruff check polymarket_pipeline tests`  
+  Catches import, formatting, and unused-code issues across the repository.
+- **Live smoke test:** `./.venv/bin/python -m polymarket_pipeline --test 10`  
+  Fetches a small real dataset into `test_output_parquet/` and runs data-quality checks against the generated Parquet output.
+
 ## Structure
 
 | File | Purpose |
@@ -107,16 +162,31 @@ See [docs/deployment.md](docs/deployment.md) for the full troubleshooting notes.
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Environment variable template |
 | `polymarket_pipeline/config.py` | Constants and runtime configuration |
-| `polymarket_pipeline/models.py` | Typed `MarketRecord` data model |
+| `polymarket_pipeline/market_definitions.json` | Bundled external market-definition data for supported market families |
+| `polymarket_pipeline/markets.py` | Loader/validator for bundled market definitions plus matching helpers |
+| `polymarket_pipeline/market_normalization.py` | Converts raw Gamma API payloads into canonical `MarketRecord` objects |
+| `polymarket_pipeline/models.py` | Typed `MarketRecord` model with explicit canonical up/down token mappings |
 | `polymarket_pipeline/retry.py` | Retry/backoff utility with rate-limit handling |
-| `polymarket_pipeline/parsing.py` | Market text and timestamp parsing helpers |
-| `polymarket_pipeline/api.py` | Gamma/CLOB API access, connection pooling, price validation |
+| `polymarket_pipeline/parsing.py` | Compatibility parsing helpers built on top of the market-definition layer |
+| `polymarket_pipeline/settings.py` | Typed runtime settings and run-option normalization for CLI/env configuration |
+| `polymarket_pipeline/providers.py` | Provider protocols and small adapters for pluggable data sources |
+| `polymarket_pipeline/api.py` | Gamma/CLOB API access, connection pooling, and delegation to market normalization |
 | `polymarket_pipeline/storage.py` | Normalised Parquet I/O and Hugging Face Hub upload |
 | `polymarket_pipeline/query.py` | DuckDB SQL query layer over local Parquet files |
 | `polymarket_pipeline/ticks.py` | On-chain tick data fetcher (Polygonscan preferred, RPC fallback) |
-| `polymarket_pipeline/pipeline.py` | Historical + WebSocket ingestion orchestration |
+| `polymarket_pipeline/phases/` | Extracted pipeline phases and shared row/path helpers |
+| `polymarket_pipeline/pipeline.py` | Thin orchestration layer that wires settings, providers, and pipeline phases together |
 | `polymarket_pipeline/cli.py` | CLI argument parsing and logging setup |
 | `polymarket_pipeline/__main__.py` | Module runner (`python -m polymarket_pipeline`) |
+| `tests/test_market_definitions.py` | Regression tests for externalized market-definition loading and validation |
+| `tests/test_market_normalization.py` | Regression tests for Gamma market normalization and canonical outcome mapping |
+| `tests/test_phase_shared.py` | Regression tests for the shared binary storage-row builders |
+| `tests/test_parsing.py` | Regression tests for timeframe/asset extraction and CLI timeframe normalization |
+| `tests/test_pipeline.py` | Offline orchestration tests for `pipeline.run()` across test, historical-only, and websocket-only modes |
+| `tests/test_price_history_phase.py` | Regression tests for extracted price-history phase behavior |
+| `tests/test_settings.py` | Regression tests for typed settings and run-option normalization |
+| `tests/test_storage.py` | Regression tests for Parquet storage, locking, and legacy tick-shard consolidation compatibility |
+| `tests/test_tick_backfill_phase.py` | Regression tests for extracted tick-backfill phase batching |
 | `scripts/tick_backfill.py` | Standalone historical tick backfill (Deprecated: handled natively by `pipeline.py`) |
 | `deploy/setup.sh` | One-shot server provisioner (Ubuntu 22.04/24.04) |
 | `deploy/polymarket-websocket.service` | systemd unit — continuous `--websocket-only` stream |

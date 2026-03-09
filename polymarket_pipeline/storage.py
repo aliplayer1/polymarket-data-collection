@@ -55,15 +55,9 @@ import pyarrow.parquet as pq
 
 from .config import (
     HF_REPO_ID,
-    PARQUET_DATA_DIR,
     PARQUET_MARKETS_PATH,
     PARQUET_PRICES_DIR,
     PARQUET_TICKS_DIR,
-    PARQUET_TEST_DIR,
-    PARQUET_TEST_MARKETS_PATH,
-    PARQUET_TEST_PRICES_DIR,
-    PARQUET_TEST_TICKS_DIR,
-    TIME_FRAMES,
 )
 
 # ---------------------------------------------------------------------------
@@ -863,12 +857,17 @@ def consolidate_ticks(
                                 src.side,
                                 src.price,
                                 src.size_usdc,
-                                src.tx_hash,
-                                src.block_number,
-                                src.log_index,
+                                COALESCE(src.tx_hash, '') AS tx_hash,
+                                COALESCE(src.block_number, 0) AS block_number,
+                                COALESCE(src.log_index, 0) AS log_index,
                                 src.source,
                                 ((f.file_order::BIGINT << 32) + src.file_row_number::BIGINT) AS sort_key
-                            FROM read_parquet([{files_sql}], filename=true, file_row_number=true) AS src
+                            FROM read_parquet(
+                                [{files_sql}],
+                                union_by_name=true,
+                                filename=true,
+                                file_row_number=true
+                            ) AS src
                             JOIN source_files AS f ON src.filename = f.file_path
                         )
                         -- Intentionally omit a final ORDER BY: the global sort is

@@ -1,25 +1,28 @@
 import argparse
 import logging
 import os
+from os import PathLike
 
 from dotenv import load_dotenv
 
-from .pipeline import PolymarketDataPipeline
-
-load_dotenv()  # reads .env into os.environ (won't overwrite existing vars)
+load_dotenv()  # reads .env into os.environ before settings/config are imported
 
 
-def configure_logging(log_file: str | None = None) -> logging.Logger:
+def configure_logging(log_file: str | PathLike[str] | None = None) -> logging.Logger:
     fmt = "%(asctime)s | %(levelname)s | %(message)s"
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if log_file:
-        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
-        handlers.append(logging.FileHandler(log_file))
+        log_path = os.fspath(log_file)
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        handlers.append(logging.FileHandler(log_path))
     logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
     return logging.getLogger("polymarket_pipeline")
 
 
 def main() -> None:
+    from .pipeline import PolymarketDataPipeline
+    from .settings import PipelineRunOptions, RuntimeSettings
+
     parser = argparse.ArgumentParser(description="Polymarket Data Pipeline")
     parser.add_argument(
         "--historical-only",
@@ -69,7 +72,6 @@ def main() -> None:
         metavar="USER/REPO",
         help="Hugging Face dataset repo ID (e.g., 'myuser/polymarket-data'). Defaults to config value.",
     )
-    # ── Storage ──────────────────────────────────────────────────────────────
     parser.add_argument(
         "--from-date",
         type=str,
@@ -116,7 +118,6 @@ def main() -> None:
             "Also reads from env var POLYMARKET_LOG_FILE."
         ),
     )
-    # ── Tick-level (on-chain) data settings ──────────────────────────────────
     parser.add_argument(
         "--rpc-url",
         type=str,
@@ -142,48 +143,29 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Fall back to environment variables for all credentials / paths
-    rpc_url         = args.rpc_url         or os.environ.get("POLYGON_RPC_URL")
-    polygonscan_key = args.polygonscan_key  or os.environ.get("POLYGONSCAN_API_KEY")
-    data_dir        = args.data_dir         or os.environ.get("POLYMARKET_DATA_DIR")
-    log_file        = args.log_file         or os.environ.get("POLYMARKET_LOG_FILE")
-    hf_repo         = args.hf_repo         or os.environ.get("HF_REPO_ID")
+    runtime_settings = RuntimeSettings.from_args(args)
+    run_options = PipelineRunOptions.from_args(args)
 
-    logger = configure_logging(log_file)
+    logger = configure_logging(runtime_settings.log_file_str)
     try:
-        # Upload-only mode: consolidate + upload without any data collection
-        if args.upload_only:
+        if run_options.upload_only:
             from .storage import upload_to_huggingface
-            from .config import PARQUET_DATA_DIR, PARQUET_MARKETS_PATH, PARQUET_PRICES_DIR, PARQUET_TICKS_DIR
-            markets_path = os.path.join(data_dir, "markets.parquet") if data_dir else PARQUET_MARKETS_PATH
-            prices_dir   = os.path.join(data_dir, "prices")          if data_dir else PARQUET_PRICES_DIR
-            ticks_dir    = os.path.join(data_dir, "ticks")           if data_dir else PARQUET_TICKS_DIR
+
+            paths = runtime_settings.resolve_paths(run_options)
             logger.info("Upload-only mode: consolidating and uploading...")
             upload_to_huggingface(
-                repo_id=hf_repo,
-                markets_path=markets_path,
-                prices_dir=prices_dir,
-                ticks_dir=ticks_dir,
+                repo_id=runtime_settings.hf_repo,
+                markets_path=str(paths.markets_path),
+                prices_dir=str(paths.prices_dir),
+                ticks_dir=str(paths.ticks_dir),
                 logger=logger,
             )
             return
 
         pipeline = PolymarketDataPipeline(
             logger=logger,
-            rpc_url=rpc_url,
-            polygonscan_key=polygonscan_key,
+            settings=runtime_settings,
         )
-        pipeline.run(
-            historical_only=args.historical_only,
-            websocket_only=args.websocket_only,
-            market_ids=args.markets,
-            cryptos=args.crypto,
-            timeframes=args.timeframe,
-            test_limit=args.test,
-            upload=args.upload,
-            hf_repo=hf_repo,
-            data_dir=data_dir,
-            from_date=args.from_date,
-        )
+        pipeline.run(run_options=run_options)
     except Exception as exc:
         logger.exception("Pipeline failed: %s", exc)

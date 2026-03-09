@@ -1,0 +1,247 @@
+from __future__ import annotations
+
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
+
+from ..config import PRICE_SUM_TOLERANCE, TIME_FRAMES, TIMEFRAME_SECONDS
+from ..models import MarketRecord
+from ..providers import PriceHistoryProvider
+from ..storage import load_prices_for_timeframe, persist_normalized, split_markets_prices
+from .shared import PipelinePaths, build_binary_price_frame
+
+
+class PriceHistoryPhase:
+    _MIN_FETCH_WINDOW_SECONDS = 60
+
+    def __init__(
+        self,
+        price_history_provider: PriceHistoryProvider,
+        *,
+        logger: logging.Logger,
+        paths: PipelinePaths,
+    ) -> None:
+        self.price_history_provider = price_history_provider
+        self.logger = logger
+        self.paths = paths
+        self.existing_dfs: dict[str, pd.DataFrame] = {}
+        self.pending_dfs: dict[str, list[pd.DataFrame]] = {tf: [] for tf in TIME_FRAMES}
+        self.processed_count = 0
+
+    def update_paths(self, paths: PipelinePaths) -> None:
+        self.paths = paths
+
+    def reset_batch_state(self) -> None:
+        self.pending_dfs = {tf: [] for tf in TIME_FRAMES}
+        self.processed_count = 0
+
+    def load_existing_data(self) -> None:
+        for timeframe in TIME_FRAMES:
+            self.existing_dfs[timeframe] = load_prices_for_timeframe(
+                timeframe,
+                str(self.paths.prices_dir),
+            )
+
+    def clear_cache(self) -> None:
+        self.existing_dfs.clear()
+
+    def last_cached_prices(self, market: MarketRecord) -> dict[str, float] | None:
+        df = self.existing_dfs.get(market.timeframe, pd.DataFrame())
+        market_df = df[df["market_id"] == market.market_id] if not df.empty else pd.DataFrame()
+        if market_df.empty:
+            return None
+        row = market_df.iloc[-1]
+        return {
+            "up": float(row["up_price"]),
+            "down": float(row["down_price"]),
+        }
+
+    def _market_start_ts(self, market: MarketRecord) -> int:
+        window_seconds = TIMEFRAME_SECONDS.get(market.timeframe, 300)
+        prediction_start = market.end_ts - window_seconds
+
+        existing_df = self.existing_dfs.get(market.timeframe, pd.DataFrame())
+        if existing_df.empty:
+            return prediction_start
+
+        market_df = existing_df[existing_df["market_id"] == market.market_id]
+        if market_df.empty:
+            return prediction_start
+
+        try:
+            last_ts = int(market_df["timestamp"].max())
+            return max(prediction_start, last_ts + 1)
+        except Exception:
+            return prediction_start
+
+    def build_market_dataframe(self, market: MarketRecord) -> pd.DataFrame | None:
+        start_ts = self._market_start_ts(market)
+        if start_ts >= market.end_ts:
+            return None
+
+        if (market.end_ts - start_ts) < self._MIN_FETCH_WINDOW_SECONDS:
+            return None
+
+        self.logger.info(
+            "Fetching price history for market %s (start_ts=%s, end_ts=%s)",
+            market.market_id,
+            start_ts,
+            market.end_ts,
+        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_up = executor.submit(
+                self.price_history_provider.fetch_price_history,
+                market.up_token_id,
+                start_ts,
+                market.end_ts,
+            )
+            future_down = executor.submit(
+                self.price_history_provider.fetch_price_history,
+                market.down_token_id,
+                start_ts,
+                market.end_ts,
+            )
+            up_history = future_up.result()
+            down_history = future_down.result()
+
+        len_up = len(up_history) if up_history else 0
+        len_down = len(down_history) if down_history else 0
+        self.logger.info("  -> %s history rows: %s", market.up_outcome, len_up)
+        self.logger.info("  -> %s history rows: %s", market.down_outcome, len_down)
+
+        if not up_history or not down_history:
+            return None
+
+        up_history_df = pd.DataFrame(
+            [
+                {"timestamp": int(item["t"]), "up_price": float(item["p"])}
+                for item in up_history
+                if "t" in item and "p" in item
+            ]
+        ).sort_values("timestamp")
+        down_history_df = pd.DataFrame(
+            [
+                {"timestamp": int(item["t"]), "down_price": float(item["p"])}
+                for item in down_history
+                if "t" in item and "p" in item
+            ]
+        ).sort_values("timestamp")
+        if up_history_df.empty or down_history_df.empty:
+            return None
+
+        union_ts = (
+            pd.concat([up_history_df[["timestamp"]], down_history_df[["timestamp"]]])
+            .drop_duplicates()
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        merged_prices = pd.merge_asof(
+            union_ts,
+            up_history_df,
+            on="timestamp",
+            direction="backward",
+            allow_exact_matches=True,
+        )
+        merged_prices = pd.merge_asof(
+            merged_prices,
+            down_history_df,
+            on="timestamp",
+            direction="backward",
+            allow_exact_matches=True,
+        )
+        merged_prices = merged_prices.fillna({"up_price": 0.5, "down_price": 0.5})
+        if merged_prices.empty:
+            return None
+
+        price_sum = merged_prices["up_price"] + merged_prices["down_price"]
+        outlier_count = int(((price_sum - 1.0).abs() > PRICE_SUM_TOLERANCE).sum())
+        if outlier_count > 0:
+            self.logger.debug(
+                "  -> %s/%s rows have price sum deviating >%.2f from 1.0 for market %s",
+                outlier_count,
+                len(merged_prices),
+                PRICE_SUM_TOLERANCE,
+                market.market_id,
+            )
+
+        return build_binary_price_frame(
+            market,
+            timestamps=merged_prices["timestamp"],
+            side_prices={
+                "up": merged_prices["up_price"],
+                "down": merged_prices["down_price"],
+            },
+            volume=market.volume,
+            resolution=market.resolution,
+            question=market.question,
+        )
+
+    def persist_dataframe(
+        self,
+        timeframe: str,
+        df: pd.DataFrame,
+        *,
+        update_cache: bool = True,
+    ) -> pd.DataFrame:
+        df = df.assign(market_id=lambda data: data["market_id"].astype(str))
+        markets_df, prices_df = split_markets_prices(df)
+        persist_normalized(
+            markets_df,
+            prices_df,
+            markets_path=str(self.paths.markets_path),
+            prices_dir=str(self.paths.prices_dir),
+            logger=self.logger,
+            skip_markets=not update_cache,
+        )
+
+        if not update_cache:
+            return prices_df
+
+        existing = self.existing_dfs.get(timeframe, pd.DataFrame())
+        merged = (
+            pd.concat([existing, prices_df], ignore_index=True)
+            .drop_duplicates(subset=["market_id", "timestamp"], keep="last")
+            .sort_values(["market_id", "timestamp"])
+            .reset_index(drop=True)
+        )
+        self.existing_dfs[timeframe] = merged
+        return merged
+
+    def process_market_batch(self, batch: list[MarketRecord]) -> None:
+        if not batch:
+            return
+
+        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            future_to_market = {
+                executor.submit(self.build_market_dataframe, market): market for market in batch
+            }
+            for future in as_completed(future_to_market):
+                market = future_to_market[future]
+                self.processed_count += 1
+                if self.processed_count % 10 == 0:
+                    self.logger.info("Processed %d relevant markets so far...", self.processed_count)
+                try:
+                    market_df = future.result()
+                    if market_df is not None and not market_df.empty:
+                        self.pending_dfs[market.timeframe].append(market_df)
+                        self.logger.info("  -> Fetched %s rows", len(market_df))
+                except Exception as exc:
+                    self.logger.error("Failed to process market %s: %s", market.market_id, exc)
+        self.flush_if_needed()
+
+    def flush_if_needed(self, *, threshold: int = 10) -> None:
+        for timeframe in list(self.pending_dfs.keys()):
+            if len(self.pending_dfs[timeframe]) >= threshold:
+                combined = pd.concat(self.pending_dfs[timeframe], ignore_index=True)
+                merged = self.persist_dataframe(timeframe, combined)
+                self.logger.info("Flushed batch for %s (%s total rows)", timeframe, len(merged))
+                self.pending_dfs[timeframe] = []
+
+    def flush_all(self) -> None:
+        for timeframe, dataframes in self.pending_dfs.items():
+            if dataframes:
+                combined = pd.concat(dataframes, ignore_index=True)
+                merged = self.persist_dataframe(timeframe, combined)
+                self.logger.info("Final flush for %s (%s total rows)", timeframe, len(merged))
+                self.pending_dfs[timeframe] = []

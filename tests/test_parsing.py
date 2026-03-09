@@ -2,7 +2,11 @@
 
 import pytest
 
-from polymarket_pipeline.parsing import extract_crypto, extract_timeframe
+from polymarket_pipeline.parsing import (
+    extract_crypto,
+    extract_timeframe,
+    normalize_timeframe_input,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -68,3 +72,14 @@ def test_extract_crypto(question: str, expected: str | None) -> None:
 def test_combined(question: str, tf: str, crypto: str) -> None:
     assert extract_timeframe(question) == tf
     assert extract_crypto(question) == crypto
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("5m", "5-minute"),
+    ("15min", "15-minute"),
+    ("1hr", "1-hour"),
+    ("4h", "4-hour"),
+    ("custom-window", "custom-window"),
+])
+def test_normalize_timeframe_input(raw: str, expected: str) -> None:
+    assert normalize_timeframe_input(raw) == expected

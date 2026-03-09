@@ -1,8 +1,6 @@
 import logging
-import json
 import time
-from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 import requests
 from requests import Session
@@ -11,21 +9,28 @@ from urllib3.util.retry import Retry as Urllib3Retry
 
 from .config import (
     CLOB_HOST,
-    FILTER_KEYWORD,
     GAMMA_API,
     PAGE_SIZE,
     PRICE_HISTORY_CHUNK_SECONDS,
     REQUEST_TIMEOUT_SECONDS,
 )
+from .market_normalization import normalize_gamma_market
+from .markets import BinaryMarketDefinition, get_market_definitions
 from .models import MarketRecord
-from .parsing import extract_crypto, extract_timeframe, parse_iso_timestamp
+from .parsing import parse_iso_timestamp
 from .retry import api_call_with_retry
 
 
 class PolymarketApi:
-    def __init__(self, session: Session | None = None, logger: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        session: Session | None = None,
+        logger: logging.Logger | None = None,
+        market_definitions: Sequence[BinaryMarketDefinition] | None = None,
+    ) -> None:
         self.session = session or self._create_session()
         self.logger = logger or logging.getLogger("polymarket_pipeline")
+        self.market_definitions = tuple(market_definitions) if market_definitions is not None else get_market_definitions()
 
     @staticmethod
     def _create_session() -> Session:
@@ -68,109 +73,12 @@ class PolymarketApi:
             self.logger.error("Request ultimately failed: %s params=%s", url, params)
             raise
 
-    @staticmethod
-    def _coerce_list(value: Any) -> list[Any]:
-        if isinstance(value, list):
-            return value
-        if isinstance(value, str):
-            try:
-                parsed = json.loads(value)
-                return parsed if isinstance(parsed, list) else []
-            except json.JSONDecodeError:
-                return []
-        return []
-
     def _normalize_market(self, market: dict[str, Any], is_active: bool) -> MarketRecord | None:
-        question = market.get("question", "")
-        q_lower = question.lower()
-        if FILTER_KEYWORD not in q_lower:
-            return None
-
-        timeframe = extract_timeframe(question)
-        crypto = extract_crypto(question)
-        if not timeframe or not crypto:
-            # This market matches the keyword filter ("up or down") but we couldn't
-            # parse the timeframe or crypto from the question text.  Log at WARNING
-            # so schema/format changes are visible in production logs rather than
-            # silently dropped.  Search logs for "UNPARSEABLE_MARKET" to audit.
-            self.logger.warning(
-                "UNPARSEABLE_MARKET market_id=%s timeframe=%r crypto=%r question=%r",
-                market.get("id", "?"), timeframe, crypto, question[:150],
-            )
-            return None
-
-        tokens = market.get("tokens", [])
-        outcomes = self._coerce_list(market.get("outcomes"))
-        clob_token_ids = self._coerce_list(market.get("clobTokenIds"))
-
-        outcome1 = ""
-        outcome2 = ""
-        token1_id = ""
-        token2_id = ""
-
-        if len(tokens) == 2:
-            outcome1 = str(tokens[0].get("outcome", "")).lower()
-            outcome2 = str(tokens[1].get("outcome", "")).lower()
-            token1_id = str(tokens[0].get("token_id") or tokens[0].get("tokenId") or "")
-            token2_id = str(tokens[1].get("token_id") or tokens[1].get("tokenId") or "")
-        elif len(outcomes) == 2 and len(clob_token_ids) == 2:
-            outcome1 = str(outcomes[0]).lower()
-            outcome2 = str(outcomes[1]).lower()
-            token1_id = str(clob_token_ids[0])
-            token2_id = str(clob_token_ids[1])
-        else:
-            # Expected token structure not found — could indicate an API schema change.
-            self.logger.debug(
-                "Market %s: unexpected token structure (tokens=%d, outcomes=%d, "
-                "clobTokenIds=%d) — skipping",
-                market.get("id", "?"), len(tokens), len(outcomes), len(clob_token_ids),
-            )
-            return None
-
-        start_iso = market.get("start_date") or market.get("startDate")
-        end_iso = (
-            market.get("end_date")
-            or market.get("endDate")
-            or datetime.now(timezone.utc).isoformat()
-        )
-        if not market.get("closed", False):
-            end_iso = datetime.now(timezone.utc).isoformat()
-
-        start_ts = parse_iso_timestamp(start_iso)
-        end_ts = parse_iso_timestamp(end_iso)
-        if start_ts is None or end_ts is None or start_ts >= end_ts:
-            return None
-
-        # closedTime is distinct from endDate and is what the scan checkpoint tracks.
-        closed_ts = parse_iso_timestamp(market.get("closedTime") or market.get("closed_time"))
-
-        if not token1_id or not token2_id:
-            return None
-
-        resolution = None
-        if market.get("resolved", False):
-            for token in tokens:
-                if token.get("winner", False):
-                    winning_outcome = str(token.get("outcome", "")).lower()
-                    resolution = 1 if ("up" in winning_outcome or "yes" in winning_outcome) else 0
-                    break
-
-        return MarketRecord(
-            market_id=str(market.get("id", "")),
-            question=question,
-            timeframe=timeframe,
-            crypto=crypto,
-            condition_id=market.get("conditionId") or market.get("condition_id"),
-            start_ts=start_ts,
-            end_ts=end_ts,
-            token1_id=token1_id,
-            token2_id=token2_id,
-            outcome1=outcome1,
-            outcome2=outcome2,
-            volume=float(market.get("volume", 0) or 0),
-            resolution=resolution,
+        return normalize_gamma_market(
+            market,
             is_active=is_active,
-            closed_ts=closed_ts,
+            logger=self.logger,
+            definitions=self.market_definitions,
         )
 
     def fetch_markets(self, *, active: bool = False, closed: bool = False, end_ts_min: int | None = None) -> Iterator[MarketRecord]:

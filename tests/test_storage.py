@@ -23,9 +23,7 @@ from polymarket_pipeline.storage import (
     consolidate_ticks,
     load_markets,
     load_prices,
-    load_ticks,
     persist_normalized,
-    persist_ticks,
 )
 
 
@@ -128,8 +126,10 @@ def test_write_lock_thread_safety(tmp_path):
 
     t1 = threading.Thread(target=worker, args=(1,))
     t2 = threading.Thread(target=worker, args=(2,))
-    t1.start(); t2.start()
-    t1.join(); t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
     assert not errors
     assert len(results) == 4
@@ -324,3 +324,50 @@ def test_consolidate_ticks_merges_shards_and_deduplicates(tmp_path):
     assert duplicate_key_row["price"] == pytest.approx(0.57)
     assert duplicate_key_row["source"] == "websocket"
     assert not os.path.exists(shard_dir / ".duckdb_tmp")
+
+
+def test_consolidate_ticks_handles_legacy_shards_without_log_index(tmp_path):
+    ticks_dir = tmp_path / "ticks"
+    shard_dir = ticks_dir / "crypto=BTC" / "timeframe=5-minute"
+    shard_dir.mkdir(parents=True)
+
+    legacy_shard = pd.DataFrame({
+        "market_id": ["m1"],
+        "timestamp_ms": [1_000],
+        "token_id": ["tok1"],
+        "outcome": ["Up"],
+        "side": ["BUY"],
+        "price": [0.55],
+        "size_usdc": [10.0],
+        "tx_hash": ["0xabc"],
+        "block_number": [100],
+        "source": ["onchain"],
+    })
+    current_shard = pd.DataFrame({
+        "market_id": ["m1"],
+        "timestamp_ms": [1_000],
+        "token_id": ["tok1"],
+        "outcome": ["Up"],
+        "side": ["BUY"],
+        "price": [0.57],
+        "size_usdc": [12.0],
+        "tx_hash": ["0xabc"],
+        "block_number": [100],
+        "log_index": [0],
+        "source": ["websocket"],
+    })
+
+    legacy_path = shard_dir / "legacy.parquet"
+    current_path = shard_dir / "current.parquet"
+    pq.write_table(pa.Table.from_pandas(legacy_shard, preserve_index=False), legacy_path)
+    pq.write_table(pa.Table.from_pandas(current_shard, preserve_index=False), current_path)
+    os.utime(legacy_path, (1, 1))
+    os.utime(current_path, (2, 2))
+
+    consolidate_ticks(ticks_dir=str(ticks_dir))
+
+    consolidated = pq.read_table(shard_dir / "part-0.parquet").to_pandas()
+
+    assert len(consolidated) == 1
+    assert consolidated.iloc[0]["price"] == pytest.approx(0.57)
+    assert int(consolidated.iloc[0]["log_index"]) == 0

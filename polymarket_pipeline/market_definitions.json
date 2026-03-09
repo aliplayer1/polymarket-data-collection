@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "definitions": [
+    {
+      "key": "crypto-up-down",
+      "question_keywords": ["up or down"],
+      "asset_aliases": {
+        "BTC": ["bitcoin", "btc"],
+        "ETH": ["ethereum", "eth"],
+        "SOL": ["solana", "sol"]
+      },
+      "up_outcome_aliases": ["up", "yes"],
+      "down_outcome_aliases": ["down", "no"],
+      "timeframes": [
+        {
+          "name": "15-minute",
+          "seconds": 900,
+          "question_aliases": ["15-minute", "15 minute", "15 min"],
+          "cli_aliases": ["15m", "15min", "15-minute", "15-min"],
+          "range_minutes": 15,
+          "matches_single_hour_pattern": false
+        },
+        {
+          "name": "5-minute",
+          "seconds": 300,
+          "question_aliases": ["5-minute", "5 minute", "5 min"],
+          "cli_aliases": ["5m", "5min", "5-minute", "5-min"],
+          "range_minutes": 5,
+          "matches_single_hour_pattern": false
+        },
+        {
+          "name": "4-hour",
+          "seconds": 14400,
+          "question_aliases": ["4-hour", "4 hour"],
+          "cli_aliases": ["4h", "4hr", "4-hour"],
+          "range_minutes": 240,
+          "matches_single_hour_pattern": false
+        },
+        {
+          "name": "1-hour",
+          "seconds": 3600,
+          "question_aliases": ["1-hour", "1 hour", "hourly", "hour"],
+          "cli_aliases": ["1h", "1hr", "1-hour", "hourly"],
+          "range_minutes": 60,
+          "matches_single_hour_pattern": true
+        }
+      ]
+    }
+  ]
+}

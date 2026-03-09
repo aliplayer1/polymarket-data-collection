@@ -1,5 +1,9 @@
 import os
 
+from .markets import get_market_definitions
+
+_DEFAULT_MARKET_DEFINITION = get_market_definitions()[0]
+
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -36,18 +40,13 @@ WS_MAX_TOKENS_PER_SHARD = 500
 # half of each buffer is evicted and an ERROR is logged.
 WS_BUFFER_MAX_ROWS = 50_000
 
-TIME_FRAMES = ("5-minute", "15-minute", "1-hour")
+TIME_FRAMES = _DEFAULT_MARKET_DEFINITION.timeframe_names
 
 # Duration of each prediction window in seconds.  The price fetch for a closed
 # market is limited to [end_ts - window_seconds, end_ts] so that we only
 # capture price action during the actual prediction period, not the long
 # dormant pre-trading phase where prices sit flat at the default 0.5/0.5.
-TIMEFRAME_SECONDS: dict[str, int] = {
-    "5-minute":  5  * 60,   # 300 s
-    "15-minute": 15 * 60,   # 900 s
-    "1-hour":    60 * 60,   # 3600 s
-    "4-hour":    4 * 60 * 60,  # 14400 s
-}
+TIMEFRAME_SECONDS: dict[str, int] = _DEFAULT_MARKET_DEFINITION.timeframe_seconds
 
 # --- Parquet storage (normalized schema) ---
 PARQUET_DATA_DIR = "data"
@@ -65,9 +64,5 @@ HF_REPO_ID = os.environ.get("HF_REPO_ID", "aliplayer1/polymarket-crypto-updown")
 PRICE_SUM_TOLERANCE = 0.15
 MAX_WS_RECONNECT_DELAY_SECONDS = 120
 
-FILTER_KEYWORD = "up or down"
-CRYPTO_ALIASES = {
-    "BTC": ("bitcoin", "btc"),
-    "ETH": ("ethereum", "eth"),
-    "SOL": ("solana", "sol"),
-}
+FILTER_KEYWORD = _DEFAULT_MARKET_DEFINITION.question_keywords[0]
+CRYPTO_ALIASES = dict(_DEFAULT_MARKET_DEFINITION.asset_aliases)

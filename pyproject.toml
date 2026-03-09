@@ -31,6 +31,9 @@ polymarket-pipeline = "polymarket_pipeline.__main__:main"
 where = ["."]
 include = ["polymarket_pipeline*"]
 
+[tool.setuptools.package-data]
+polymarket_pipeline = ["market_definitions.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
