@@ -226,6 +226,11 @@ MARKETS_SCHEMA = pa.schema([
     ("timeframe", pa.dictionary(pa.int8(), pa.string())),
     ("volume", pa.float32()),
     ("resolution", pa.int8()),  # 0 / 1 / -1 (= unresolved)
+    ("start_ts", pa.int64()),
+    ("end_ts", pa.int64()),
+    ("condition_id", pa.string()),
+    ("up_token_id", pa.string()),
+    ("down_token_id", pa.string()),
 ])
 
 PRICES_SCHEMA = pa.schema([
@@ -411,7 +416,7 @@ def split_markets_prices(flat_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
         volume, resolution, question
     """
     if flat_df.empty:
-        markets_df = pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution"])
+        markets_df = pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "up_token_id", "down_token_id"])
         prices_df = pd.DataFrame(columns=["market_id", "timestamp", "up_price", "down_price", "crypto", "timeframe"])
         return markets_df, prices_df
 
@@ -424,6 +429,11 @@ def split_markets_prices(flat_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
             "timeframe": "last",
             "volume": "last",
             "resolution": "last",
+            "start_ts": "last",
+            "end_ts": "last",
+            "condition_id": "last",
+            "up_token_id": "last",
+            "down_token_id": "last",
         })
         .reset_index()
     )
@@ -445,6 +455,19 @@ def optimise_markets_df(df: pd.DataFrame) -> pd.DataFrame:
     df["timeframe"] = df["timeframe"].astype("category")
     df["volume"] = df["volume"].astype("float32")
     df["resolution"] = df["resolution"].apply(_resolution_to_int8).astype("int8")
+    
+    # New columns
+    if "start_ts" in df.columns:
+        df["start_ts"] = pd.to_numeric(df["start_ts"], errors="coerce").fillna(0).astype("int64")
+    if "end_ts" in df.columns:
+        df["end_ts"] = pd.to_numeric(df["end_ts"], errors="coerce").fillna(0).astype("int64")
+    if "condition_id" in df.columns:
+        df["condition_id"] = df["condition_id"].astype("string")
+    if "up_token_id" in df.columns:
+        df["up_token_id"] = df["up_token_id"].astype("string")
+    if "down_token_id" in df.columns:
+        df["down_token_id"] = df["down_token_id"].astype("string")
+    
     return df
 
 
@@ -488,7 +511,7 @@ def load_markets(markets_path: str | None = None) -> pd.DataFrame:
     path = markets_path or PARQUET_MARKETS_PATH
     if os.path.exists(path):
         return pq.read_table(path).to_pandas()
-    return pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution"])
+    return pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "up_token_id", "down_token_id"])
 
 
 def _read_hive_partitioned_robust(
@@ -766,7 +789,7 @@ def append_ticks_only(
     _check_disk_space(os.path.dirname(os.path.abspath(t_dir)) or ".")
     ticks_df = optimise_ticks_df(ticks_df)
     shard_id = f"{int(time.time())}_{os.getpid()}"
-    for (crypto, timeframe), group in ticks_df.groupby(["crypto", "timeframe"], sort=False):
+    for (crypto, timeframe), group in ticks_df.groupby(["crypto", "timeframe"], sort=False, observed=True):
         shard_dir = os.path.join(t_dir, f"crypto={crypto}", f"timeframe={timeframe}")
         os.makedirs(shard_dir, exist_ok=True)
         shard_path = os.path.join(shard_dir, f"backfill_{shard_id}.parquet")
@@ -1106,9 +1129,12 @@ def persist_normalized(
                     markets_df = markets_df.copy()
                     markets_df[col] = markets_df[col].astype(str)
             if not markets_df.empty:
+                dfs_to_concat = [df for df in (existing_markets, markets_df) if not df.empty]
                 merged_markets = (
-                    pd.concat([existing_markets, markets_df], ignore_index=True)
-                    .drop_duplicates(subset=["market_id"], keep="last")
+                    pd.concat(dfs_to_concat, ignore_index=True) if dfs_to_concat else existing_markets
+                )
+                merged_markets = (
+                    merged_markets.drop_duplicates(subset=["market_id"], keep="last")
                     .reset_index(drop=True)
                 )
             else:
@@ -1136,9 +1162,12 @@ def persist_normalized(
                 if col in existing_prices.columns and hasattr(existing_prices[col], "cat"):
                     existing_prices[col] = existing_prices[col].astype(str)
 
+            dfs_to_concat = [df for df in (existing_prices, prices_df) if not df.empty]
             merged_prices = (
-                pd.concat([existing_prices, prices_df], ignore_index=True)
-                .drop_duplicates(subset=["market_id", "timestamp"], keep="last")
+                pd.concat(dfs_to_concat, ignore_index=True) if dfs_to_concat else existing_prices
+            )
+            merged_prices = (
+                merged_prices.drop_duplicates(subset=["market_id", "timestamp"], keep="last")
                 .sort_values(["market_id", "timestamp"])
                 .reset_index(drop=True)
             )

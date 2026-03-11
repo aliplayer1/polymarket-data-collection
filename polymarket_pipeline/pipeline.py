@@ -10,7 +10,7 @@ from py_clob_client.client import ClobClient
 from .api import PolymarketApi
 from .config import CHAIN_ID, CLOB_HOST, PRICE_SUM_TOLERANCE, TIME_FRAMES
 from .models import MarketRecord
-from .phases import PipelinePaths, PriceHistoryPhase, TickBackfillPhase, WebSocketPhase
+from .phases import PipelinePaths, PriceHistoryPhase, PythPricePhase, TickBackfillPhase, WebSocketPhase
 from .providers import (
     ClobLastTradePriceProvider,
     LastTradePriceProvider,
@@ -67,6 +67,10 @@ class PolymarketDataPipeline:
         )
         self.tick_backfill_phase = TickBackfillPhase(
             self.tick_provider,
+            logger=self.logger,
+            paths=default_paths,
+        )
+        self.pyth_phase = PythPricePhase(
             logger=self.logger,
             paths=default_paths,
         )
@@ -432,6 +436,9 @@ class PolymarketDataPipeline:
                 consolidate_ticks(ticks_dir=self._parquet_ticks_dir, logger=self.logger)
             else:
                 self.logger.info("No markets matched for tick backfill.")
+
+        if not options.websocket_only and self.pyth_phase.is_enabled:
+            self.pyth_phase.run(closed_markets_for_ticks)
 
         if options.upload and options.is_test:
             self.logger.warning(

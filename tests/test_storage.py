@@ -174,6 +174,11 @@ def test_persist_normalized_roundtrip(tmp_path):
         "timeframe": ["5-minute"],
         "volume": [1000.0],
         "resolution": [None],
+        "start_ts": [0],
+        "end_ts": [0],
+        "condition_id": ["c1"],
+        "up_token_id": ["u1"],
+        "down_token_id": ["d1"],
     })
     prices_df = pd.DataFrame({
         "market_id": ["m1", "m1"],
@@ -205,6 +210,8 @@ def test_persist_normalized_deduplicates_on_rewrite(tmp_path):
         markets_df = pd.DataFrame({
             "market_id": ["m1"], "question": ["q"], "crypto": ["BTC"],
             "timeframe": ["5-minute"], "volume": [0.0], "resolution": [None],
+            "start_ts": [0], "end_ts": [0], "condition_id": ["c1"],
+            "up_token_id": ["u1"], "down_token_id": ["d1"],
         })
         prices_df = pd.DataFrame({
             "market_id": ["m1"] * len(ts_list),

@@ -199,9 +199,12 @@ class PriceHistoryPhase:
             return prices_df
 
         existing = self.existing_dfs.get(timeframe, pd.DataFrame())
+        dfs_to_concat = [df for df in (existing, prices_df) if not df.empty]
         merged = (
-            pd.concat([existing, prices_df], ignore_index=True)
-            .drop_duplicates(subset=["market_id", "timestamp"], keep="last")
+            pd.concat(dfs_to_concat, ignore_index=True) if dfs_to_concat else existing
+        )
+        merged = (
+            merged.drop_duplicates(subset=["market_id", "timestamp"], keep="last")
             .sort_values(["market_id", "timestamp"])
             .reset_index(drop=True)
         )

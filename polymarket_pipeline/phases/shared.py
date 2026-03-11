@@ -60,6 +60,11 @@ def build_binary_price_frame(
             "volume": volume,
             "resolution": resolution,
             "question": question,
+            "start_ts": market.start_ts,
+            "end_ts": market.end_ts,
+            "condition_id": market.condition_id,
+            "up_token_id": market.up_token_id,
+            "down_token_id": market.down_token_id,
         }
     )
 
@@ -82,6 +87,11 @@ def build_binary_price_row(
         "volume": market.volume,
         "resolution": resolution,
         "question": market.question,
+        "start_ts": market.start_ts,
+        "end_ts": market.end_ts,
+        "condition_id": market.condition_id,
+        "up_token_id": market.up_token_id,
+        "down_token_id": market.down_token_id,
     }
 
 
