@@ -11,6 +11,7 @@ import requests
 
 from ..models import MarketRecord
 from ..retry import api_call_with_retry
+from ..config import TIMEFRAME_SECONDS
 from .shared import PipelinePaths
 
 class PythPricePhase:
@@ -21,27 +22,40 @@ class PythPricePhase:
         "SOL": "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
     }
     
+    # Hermes rate limit: 30 req/10s per IP.  429 triggers a 60-second ban.
+    _HERMES_MIN_INTERVAL = 0.34  # ~3 req/s, safely within 30/10s
+
     def __init__(self, paths: PipelinePaths, logger: logging.Logger | None = None):
         self.paths = paths
         self.logger = logger or logging.getLogger("polymarket_pipeline.pyth")
         self.spot_prices_dir = self.paths.data_dir / "spot_prices"
-        
+
         self.is_enabled = os.environ.get("PYTH_PRICES_ENABLED") == "1"
         self.session = requests.Session()
+        self._last_hermes_ts: float = 0.0
         
+    def _rate_limit_hermes(self) -> None:
+        """Enforce per-IP Hermes rate limit before each request."""
+        elapsed = time.time() - self._last_hermes_ts
+        if elapsed < self._HERMES_MIN_INTERVAL:
+            time.sleep(self._HERMES_MIN_INTERVAL - elapsed)
+        self._last_hermes_ts = time.time()
+
     def _fetch_one(self, ts: int) -> dict[str, Any]:
         url = self.HERMES_URL.format(ts=ts)
         params = [("ids[]", feed_id) for feed_id in self.FEEDS.values()]
-        
+
         def _do_fetch():
+            self._rate_limit_hermes()
             resp = self.session.get(url, params=params, timeout=10)
             resp.raise_for_status()
             return resp.json()
-            
+
         return api_call_with_retry(
             _do_fetch,
             max_attempts=5,
-            base_delay_seconds=1.0,
+            base_delay_seconds=2.0,
+            min_retry_after=61,  # Hermes 429 triggers a 60-second ban
             logger=self.logger,
         )
 
@@ -59,9 +73,14 @@ class PythPricePhase:
         return float("nan"), float("nan")
 
     def fetch_for_market(self, market: MarketRecord) -> pd.DataFrame:
-        """Fetch 1-second prices for [start_ts, end_ts] range."""
+        """Fetch 1-second prices for [start_ts, end_ts] range, capped by timeframe."""
         rows = []
-        for ts in range(market.start_ts, market.end_ts + 1):
+        
+        # Limit the search window to just the timeframe before resolution
+        duration = TIMEFRAME_SECONDS.get(market.timeframe, 86400)
+        start_ts = max(market.start_ts, market.end_ts - duration)
+        
+        for ts in range(start_ts, market.end_ts + 1):
             data = self._fetch_one(ts)
             for symbol, feed_id in self.FEEDS.items():
                 price, conf = self._extract(data, feed_id)
@@ -71,7 +90,7 @@ class PythPricePhase:
                     "price_usd": price,
                     "conf": conf
                 })
-            time.sleep(0.5) # Extremely conservative to avoid 429 errors from Hermes
+            time.sleep(0.05)  # minimal sleep — rate limiting is handled by _rate_limit_hermes
         df = pd.DataFrame(rows)
         # Enforce schema explicitly to avoid problems
         if not df.empty:
@@ -118,7 +137,9 @@ class PythPricePhase:
         self.logger.info("Fetching Pyth spot prices for %s new markets...", len(markets_to_fetch))
         
         for i, m in enumerate(markets_to_fetch):
-            self.logger.info("[%s/%s] Fetching Pyth prices for market %s (duration %s seconds)", i+1, len(markets_to_fetch), m.market_id, m.end_ts - m.start_ts)
+            duration = TIMEFRAME_SECONDS.get(m.timeframe, 86400)
+            actual_duration = m.end_ts - max(m.start_ts, m.end_ts - duration)
+            self.logger.info("[%s/%s] Fetching Pyth prices for market %s (duration %s seconds)", i+1, len(markets_to_fetch), m.market_id, actual_duration)
             try:
                 df = self.fetch_for_market(m)
                 if not df.empty:

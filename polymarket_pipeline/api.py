@@ -37,10 +37,10 @@ class PolymarketApi:
         """Create a requests Session with connection pooling and transport-level retries."""
         session = requests.Session()
         retry_strategy = Urllib3Retry(
-            total=2,
-            backoff_factor=0.5,
-            status_forcelist=[502, 503, 504],
-            allowed_methods=["GET"],
+            total=0,
+            # Application-level retry is handled by api_call_with_retry() —
+            # keeping transport retries at 0 prevents double-stacked retries
+            # that multiply rate-limit pressure (previously 2 × 3 = 6 attempts).
         )
         adapter = HTTPAdapter(
             pool_connections=10,

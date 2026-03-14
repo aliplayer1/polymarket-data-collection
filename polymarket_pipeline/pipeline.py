@@ -10,7 +10,7 @@ from py_clob_client.client import ClobClient
 from .api import PolymarketApi
 from .config import CHAIN_ID, CLOB_HOST, PRICE_SUM_TOLERANCE, TIME_FRAMES
 from .models import MarketRecord
-from .phases import PipelinePaths, PriceHistoryPhase, PythPricePhase, TickBackfillPhase, WebSocketPhase
+from .phases import PipelinePaths, PriceHistoryPhase, PythPricePhase, RTDSStreamPhase, TickBackfillPhase, WebSocketPhase
 from .providers import (
     ClobLastTradePriceProvider,
     LastTradePriceProvider,
@@ -74,11 +74,22 @@ class PolymarketDataPipeline:
             logger=self.logger,
             paths=default_paths,
         )
+
+        # Shared in-memory cache: RTDS writes, WebSocket reads.
+        # Both run in the same asyncio event loop — no lock needed.
+        # Structure: {"btcusdt": (67234.50, 1710000000087), ...}
+        self._spot_price_cache: dict[str, tuple[float, int]] = {}
+
+        self.rtds_stream_phase = RTDSStreamPhase(
+            self._spot_price_cache,
+            logger=self.logger,
+        )
         self.websocket_phase = WebSocketPhase(
             self.last_trade_price_provider,
             self.price_history_phase,
             logger=self.logger,
             paths=default_paths,
+            spot_price_cache=self._spot_price_cache,
         )
 
     def _set_paths(self, paths: PipelinePaths) -> None:
@@ -97,7 +108,12 @@ class PolymarketDataPipeline:
         return self.tick_backfill_phase.run(markets)
 
     async def run_websocket(self, active_markets: list[MarketRecord]) -> None:
-        await self.websocket_phase.run(active_markets)
+        rtds_task = asyncio.create_task(self.rtds_stream_phase.run())
+        try:
+            await self.websocket_phase.run(active_markets)
+        finally:
+            rtds_task.cancel()
+            await asyncio.gather(rtds_task, return_exceptions=True)
 
     def _scan_checkpoint_path(self) -> str:
         return str(self.paths.scan_checkpoint_path())

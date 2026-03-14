@@ -24,6 +24,7 @@ from ..models import MarketRecord
 from ..providers import LastTradePriceProvider
 from ..retry import api_call_with_retry
 from ..storage import append_ws_ticks_staged
+from .rtds_stream import CRYPTO_TO_RTDS_SYMBOL
 from .shared import PipelinePaths, build_binary_price_row, build_binary_tick_row
 
 
@@ -35,14 +36,31 @@ class WebSocketPhase:
         *,
         logger: logging.Logger,
         paths: PipelinePaths,
+        spot_price_cache: dict[str, tuple[float, int]] | None = None,
     ) -> None:
         self.last_trade_price_provider = last_trade_price_provider
         self.price_history_phase = price_history_phase
         self.logger = logger
         self.paths = paths
+        self.spot_price_cache = spot_price_cache or {}
 
     def update_paths(self, paths: PipelinePaths) -> None:
         self.paths = paths
+
+    def _spot_price_kwargs(self, crypto: str) -> dict[str, float | int | None]:
+        """Look up the latest RTDS spot price for the given crypto.
+
+        Returns a dict suitable for **-unpacking into ``build_binary_tick_row``.
+        If no price has been received yet, returns None values (columns are nullable).
+        """
+        rtds_symbol = CRYPTO_TO_RTDS_SYMBOL.get(crypto)
+        if rtds_symbol is None:
+            return {"spot_price_usdt": None, "spot_price_ts_ms": None}
+        entry = self.spot_price_cache.get(rtds_symbol)
+        if entry is None:
+            return {"spot_price_usdt": None, "spot_price_ts_ms": None}
+        return {"spot_price_usdt": entry[0], "spot_price_ts_ms": entry[1]}
+
 
     def _initial_last_prices(self, active_markets: list[MarketRecord]) -> dict[str, dict[str, float]]:
         last_prices: dict[str, dict[str, float]] = {}
@@ -85,7 +103,7 @@ class WebSocketPhase:
                 self.logger.warning("Falling back to 0.5 for market %s: %s", market.market_id, exc)
                 return market.market_id, {"up": 0.5, "down": 0.5}
 
-        with ThreadPoolExecutor(max_workers=min(20, len(needs_api))) as executor:
+        with ThreadPoolExecutor(max_workers=min(5, len(needs_api))) as executor:
             for market_id, prices in executor.map(_fetch_one, needs_api):
                 last_prices[market_id] = prices
 
@@ -228,6 +246,7 @@ class WebSocketPhase:
                                     block_number=0,
                                     log_index=0,
                                     source="websocket",
+                                    **self._spot_price_kwargs(market.crypto),
                                 )
                             )
 

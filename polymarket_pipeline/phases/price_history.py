@@ -215,7 +215,7 @@ class PriceHistoryPhase:
         if not batch:
             return
 
-        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+        with ThreadPoolExecutor(max_workers=min(3, len(batch))) as executor:
             future_to_market = {
                 executor.submit(self.build_market_dataframe, market): market for market in batch
             }

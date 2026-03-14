@@ -108,6 +108,8 @@ def build_binary_tick_row(
     block_number: int,
     log_index: int,
     source: str,
+    spot_price_usdt: float | None = None,
+    spot_price_ts_ms: int | None = None,
 ) -> dict[str, Any]:
     return {
         "timestamp_ms": timestamp_ms,
@@ -123,4 +125,6 @@ def build_binary_tick_row(
         "block_number": block_number,
         "log_index": log_index,
         "source": source,
+        "spot_price_usdt": spot_price_usdt,
+        "spot_price_ts_ms": spot_price_ts_ms,
     }

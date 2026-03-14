@@ -256,9 +256,13 @@ TICKS_SCHEMA = pa.schema([
     ("block_number", pa.int32()),
     ("log_index",    pa.int32()),
     ("source",       pa.dictionary(pa.int8(), pa.string())),   # "onchain" / "websocket"
+    # Spot price of the underlying crypto asset at the instant this tick was received.
+    # Sourced from Polymarket RTDS (Binance feed).  Nullable: None when RTDS hasn't
+    # delivered a price yet or for historical on-chain ticks without live context.
+    ("spot_price_usdt", pa.float32()),   # e.g. 67234.50 for BTC/USDT
+    ("spot_price_ts_ms", pa.int64()),    # Binance timestamp of the spot price (epoch ms)
     # partition columns (crypto, timeframe) are implicit
 ])
-
 
 # ---------------------------------------------------------------------------
 # Schema versioning — embed in every Parquet file's metadata
@@ -631,7 +635,9 @@ def load_prices_for_timeframe(timeframe: str, prices_dir: str | None = None) -> 
 
 _TICKS_EMPTY_COLS = [
     "market_id", "timestamp_ms", "token_id", "outcome", "side",
-    "price", "size_usdc", "tx_hash", "block_number", "log_index", "source", "crypto", "timeframe",
+    "price", "size_usdc", "tx_hash", "block_number", "log_index", "source",
+    "spot_price_usdt", "spot_price_ts_ms",
+    "crypto", "timeframe",
 ]
 _TICKS_DEDUP_COLS = ["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"]
 
@@ -866,6 +872,20 @@ def consolidate_ticks(
                     threads,
                 )
 
+                desc_res = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{files_sql}], union_by_name=true)").fetchall()
+                present_cols = {row[0] for row in desc_res}
+
+                def _col_sql(name: str, default: str) -> str:
+                    if name in present_cols:
+                        return f"COALESCE(src.{name}, {default}) AS {name}"
+                    return f"{default} AS {name}"
+
+                tx_hash_sql = _col_sql("tx_hash", "''")
+                block_number_sql = _col_sql("block_number", "0")
+                log_index_sql = _col_sql("log_index", "0")
+                spot_price_usdt_sql = "src.spot_price_usdt" if "spot_price_usdt" in present_cols else "NULL::FLOAT AS spot_price_usdt"
+                spot_price_ts_ms_sql = "src.spot_price_ts_ms" if "spot_price_ts_ms" in present_cols else "NULL::BIGINT AS spot_price_ts_ms"
+
                 result = con.execute(f"""
                     COPY (
                         WITH source_files(file_path, file_order) AS (
@@ -880,10 +900,12 @@ def consolidate_ticks(
                                 src.side,
                                 src.price,
                                 src.size_usdc,
-                                COALESCE(src.tx_hash, '') AS tx_hash,
-                                COALESCE(src.block_number, 0) AS block_number,
-                                COALESCE(src.log_index, 0) AS log_index,
+                                {tx_hash_sql},
+                                {block_number_sql},
+                                {log_index_sql},
                                 src.source,
+                                {spot_price_usdt_sql},
+                                {spot_price_ts_ms_sql},
                                 ((f.file_order::BIGINT << 32) + src.file_row_number::BIGINT) AS sort_key
                             FROM read_parquet(
                                 [{files_sql}],

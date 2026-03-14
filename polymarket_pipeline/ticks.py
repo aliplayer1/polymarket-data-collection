@@ -38,7 +38,6 @@ from .config import (
     ORDER_FILLED_TOPIC,
     BLOCK_TIME_SECONDS,
     ETHERSCAN_V2_API,
-    POLYGONSCAN_NATIVE_API,
     POLYGON_CHAIN_ID,
 )
 from .phases.shared import build_binary_tick_row
@@ -324,7 +323,7 @@ class PolygonTickFetcher:
             "apikey":    self.polygonscan_key,
         }
         self._rate_limit_etherscan()
-        data = self._etherscan_get(params, use_native=False)
+        data = self._etherscan_get(params)
         if data is not None:
             status = str(data.get("status"))
             result = str(data.get("result", ""))
@@ -399,27 +398,33 @@ class PolygonTickFetcher:
 
     _MAX_RETRIES = 3
 
-    def _etherscan_get(self, params: dict, use_native: bool = False) -> dict | None:
-        """Make an Etherscan/Polygonscan GET request with retry on transient errors.
-
-        When *use_native* is True, queries the native Polygonscan API directly
-        (``api.polygonscan.com/api``) instead of the unified Etherscan V2
-        endpoint.  The ``chainid`` parameter is stripped for native calls.
+    def _etherscan_get(self, params: dict) -> dict | None:
+        """Make an Etherscan V2 GET request with retry on transient errors.
 
         Returns the parsed JSON dict on success, or ``None`` after exhausting
         retries.
         """
-        if use_native:
-            url = POLYGONSCAN_NATIVE_API
-            params = {k: v for k, v in params.items() if k != "chainid"}
-        else:
-            url = ETHERSCAN_V2_API
+        url = ETHERSCAN_V2_API
 
         for attempt in range(1, self._MAX_RETRIES + 1):
             try:
                 resp = self._session.get(url, params=params, timeout=self.timeout)
                 resp.raise_for_status()
                 return resp.json()
+            except requests.exceptions.HTTPError as exc:
+                # Retry on rate-limit (429) and overload (503) — these are
+                # transient and recoverable after a short wait.
+                status = exc.response.status_code if exc.response is not None else 0
+                if status in (429, 503) and attempt < self._MAX_RETRIES:
+                    wait = 2 ** attempt + 1
+                    self.logger.warning(
+                        "Etherscan %d at %s (attempt %d/%d), retrying in %ds",
+                        status, url, attempt, self._MAX_RETRIES, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                self.logger.warning("Etherscan HTTP error at %s: %s", url, exc)
+                break
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
                 if attempt < self._MAX_RETRIES:
                     wait = 2 ** attempt
@@ -443,23 +448,15 @@ class PolygonTickFetcher:
         rejects queries where the total result count exceeds 10 000, so
         we chunk the request into ``POLYGONSCAN_BLOCK_CHUNK``-block segments
         and paginate within each segment.
-
-        The native Polygonscan V1 API (api.polygonscan.com) is deprecated and
-        always returns an error, so only the Etherscan V2 endpoint is used.
         """
-        return self._fetch_logs_polygonscan_endpoint(
-            start_block, end_block, use_native=False, label="Etherscan V2",
-        )
+        return self._fetch_logs_etherscan_v2(start_block, end_block)
 
-    def _fetch_logs_polygonscan_endpoint(
+    def _fetch_logs_etherscan_v2(
         self,
         start_block: int,
         end_block: int,
-        *,
-        use_native: bool = False,
-        label: str = "Etherscan",
     ) -> list[dict] | None:
-        """Fetch OrderFilled logs from a single Etherscan/Polygonscan endpoint."""
+        """Fetch OrderFilled logs from the Etherscan V2 endpoint."""
         all_logs: list[dict] = []
         cur = start_block
 
@@ -481,7 +478,7 @@ class PolygonTickFetcher:
                     "apikey":     self.polygonscan_key,
                 }
                 self._rate_limit_etherscan()
-                data = self._etherscan_get(params, use_native=use_native)
+                data = self._etherscan_get(params)
                 if data is None:
                     return None
 
@@ -492,8 +489,8 @@ class PolygonTickFetcher:
                     if msg == "No records found":
                         break
                     self.logger.warning(
-                        "%s getLogs error (blocks %s–%s): %s (result: %s)",
-                        label, cur, chunk_end, msg, result_text,
+                        "Etherscan V2 getLogs error (blocks %s–%s): %s (result: %s)",
+                        cur, chunk_end, msg, result_text,
                     )
                     return None
 
@@ -504,7 +501,7 @@ class PolygonTickFetcher:
                 page += 1
                 # Etherscan hard cap: page * offset <= 10 000
                 if page * self.POLYGONSCAN_LOG_LIMIT > 10_000:
-                    self.logger.debug("%s pagination cap reached for blocks %s–%s", label, cur, chunk_end)
+                    self.logger.debug("Etherscan V2 pagination cap reached for blocks %s–%s", cur, chunk_end)
                     break
 
             cur = chunk_end + 1
