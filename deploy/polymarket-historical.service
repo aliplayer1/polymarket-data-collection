@@ -18,5 +18,5 @@ ExecStart=/opt/polymarket/.venv/bin/python -m polymarket_pipeline \
     --historical-only \
     --upload
 
-# Allow up to 2 h for an unusually large backfill run
-TimeoutStartSec=7200
+# Allow unlimited time for the initial massive backfill run
+TimeoutStartSec=0

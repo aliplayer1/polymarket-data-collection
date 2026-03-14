@@ -15,5 +15,5 @@ EnvironmentFile=/opt/polymarket/.env
 ExecStart=/opt/polymarket/.venv/bin/python -m polymarket_pipeline \
     --upload-only
 
-# Consolidation + upload should finish well within 30 minutes
-TimeoutStartSec=1800
+# Consolidation + upload can take longer for massive historical partitions
+TimeoutStartSec=0
