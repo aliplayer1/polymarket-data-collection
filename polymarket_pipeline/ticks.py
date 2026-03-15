@@ -79,8 +79,9 @@ class PolygonTickFetcher:
     RPC_LOG_CHUNK_BLOCKS  = 10
 
     # Minimum gap between any two Etherscan V2 API calls (3 req/s limit).
-    # 0.42 s gives ~2.4 req/s, safely below the enforced cap.
-    _ETHERSCAN_MIN_INTERVAL = 0.42
+    # 0.5 s gives 2 req/s, providing safety headroom for the 3/sec cap
+    # enforced on the Polygonscan V2 free tier.
+    _ETHERSCAN_MIN_INTERVAL = 0.5
 
     # Minimum gap between eth_getLogs RPC calls on Alchemy free tier.
     # eth_getLogs costs 75 CU; free tier throughput is 500 CU/s → max 6.67 calls/s.
@@ -411,7 +412,23 @@ class PolygonTickFetcher:
             try:
                 resp = self._session.get(url, params=params, timeout=self.timeout)
                 resp.raise_for_status()
-                return resp.json()
+                data = resp.json()
+
+                # Handle application-level rate limits (HTTP 200 with error message)
+                if (
+                    data.get("status") == "0"
+                    and "rate limit" in str(data.get("result", "")).lower()
+                ):
+                    if attempt < self._MAX_RETRIES:
+                        wait = 2**attempt + 2
+                        self.logger.warning(
+                            "Etherscan V2 rate limit hit (3/sec), retrying in %ds",
+                            wait,
+                        )
+                        time.sleep(wait)
+                        continue
+
+                return data
             except requests.exceptions.HTTPError as exc:
                 # Retry on rate-limit (429) and overload (503) — these are
                 # transient and recoverable after a short wait.
