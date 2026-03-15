@@ -717,6 +717,12 @@ class PolygonTickFetcher:
                     )
                     return None
 
+                if resp.status_code == 400:
+                    self.logger.error(
+                        "RPC 400 Bad Request: %s | URL: %s",
+                        resp.text[:500], self._masked_rpc_url,
+                    )
+
                 resp.raise_for_status()
                 data = resp.json()
                 if "error" in data:
