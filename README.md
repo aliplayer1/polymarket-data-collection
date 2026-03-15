@@ -123,16 +123,20 @@ The runtime is organized into five layers:
    Fetching concerns are expressed through small protocols so Gamma/CLOB price history, last-trade lookups, and tick backfill sources can be swapped or stubbed cleanly in tests.
 
 4. **Pipeline phases** (`polymarket_pipeline/pipeline.py`, `polymarket_pipeline/phases/`)  
-   `pipeline.py` is now a thin orchestrator over dedicated price-history, tick-backfill, RTDS spot price streaming, and WebSocket phases, plus shared builders for the binary storage schema.
+   `pipeline.py` is now a thin orchestrator over dedicated modular phases:
+   - `PriceHistoryPhase`: Fetches OHLC data from Gamma/CLOB.
+   - `TickBackfillPhase`: Performs on-chain backfill of trade logs via Polygonscan/RPC.
+   - `RTDSStreamPhase`: Manages the Real-Time Data Socket feed for Binance spot prices.
+   - `WebSocketPhase`: Streams live Polymarket trade events and merges them with RTDS data.
 
 5. **Persistence/query** (`storage.py`, `query.py`)  
-   Stores markets, prices, and ticks in Hive-partitioned Parquet; provides DuckDB-backed querying and upload tooling. Tick data directly embeds crypto spot prices (`spot_price_usdt`) at the exact millisecond.
+   Stores markets, prices, and ticks in Hive-partitioned Parquet; provides DuckDB-backed querying and upload tooling. Tick data directly embeds crypto spot prices (`spot_price_usdt`) at the exact millisecond using dynamic schema discovery to remain resilient against legacy data shards.
 
 ### Data Flow
 
-- **Historical flow:** Gamma market page -> definition-based normalization -> price-history phase -> normalized Parquet write  
-- **Live flow:** active markets -> WebSocket phase (merging with RTDS spot price cache) -> staged tick writes with embedded spot prices / periodic price flushes  
-- **On-chain flow:** shared market windows -> tick-backfill phase -> canonical tick rows -> consolidated Parquet shards
+- **Historical flow:** Gamma market page -> definition-based normalization -> `PriceHistoryPhase` -> normalized Parquet write  
+- **Live flow:** active markets -> `WebSocketPhase` (merging with `RTDSStreamPhase` spot price cache) -> staged tick writes with embedded spot prices / periodic price flushes  
+- **On-chain flow:** shared market windows -> `TickBackfillPhase` -> canonical tick rows -> DuckDB-consolidated Parquet shards
 
 ### Extending Supported Markets
 
