@@ -73,9 +73,10 @@ class PolygonTickFetcher:
     # Alchemy enforces a 10 000-result cap per call.  The CTF Exchange emits
     # OrderFilled events for *all* Polymarket markets, so the aggregate rate is
     # ~700–1 500 events/block.  25 blocks ≈ 17 000–37 500 events at peak, which
-    # can exceed the cap.  We use 15 blocks as a safe static default and halve
-    # adaptively when the node signals an overflow (see _fetch_logs_rpc).
-    RPC_LOG_CHUNK_BLOCKS  = 15
+    # can exceed the cap.  We use 10 blocks as a safe static default (Alchemy 
+    # Free tier maximum) and halve adaptively when the node signals an overflow 
+    # (see _fetch_logs_rpc).
+    RPC_LOG_CHUNK_BLOCKS  = 10
 
     # Minimum gap between any two Etherscan V2 API calls (3 req/s limit).
     # 0.42 s gives ~2.4 req/s, safely below the enforced cap.
@@ -722,6 +723,10 @@ class PolygonTickFetcher:
                         "RPC 400 Bad Request: %s | URL: %s",
                         resp.text[:500], self._masked_rpc_url,
                     )
+                    # Return None immediately on 400 Client Error. These are typically
+                    # permanent parameter errors (like block range too large) where
+                    # retrying the exact same request is futile.
+                    return None
 
                 resp.raise_for_status()
                 data = resp.json()
