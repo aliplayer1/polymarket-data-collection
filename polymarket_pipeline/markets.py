@@ -13,8 +13,6 @@ TIME_RANGE_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 
-# Matches single-hour format: "Bitcoin Up or Down - March 1, 10AM ET"
-# No end time means the market covers exactly one hour.
 SINGLE_HOUR_PATTERN = re.compile(
     r"\b\d{1,2}(?:AM|PM)\s+ET\b",
     flags=re.IGNORECASE,
@@ -25,6 +23,7 @@ _FALLBACK_MARKET_DEFINITIONS_PAYLOAD: dict[str, Any] = {
     "definitions": [
         {
             "key": "crypto-up-down",
+            "type": "binary",
             "question_keywords": ["up or down"],
             "asset_aliases": {
                 "BTC": ["bitcoin", "btc"],
@@ -101,13 +100,15 @@ class ClassifiedBinaryOutcomePair:
 
 
 @dataclass(frozen=True)
-class BinaryMarketDefinition:
+class MarketDefinition:
     key: str
     question_keywords: tuple[str, ...]
     asset_aliases: dict[str, tuple[str, ...]]
     timeframes: tuple[TimeframeDefinition, ...]
-    up_outcome_aliases: tuple[str, ...] = ("up", "yes")
-    down_outcome_aliases: tuple[str, ...] = ("down", "no")
+    
+    @property
+    def category(self) -> str:
+        return "crypto"
 
     def matches_question(self, question: str) -> bool:
         return _contains_alias(question.lower(), self.question_keywords)
@@ -145,6 +146,20 @@ class BinaryMarketDefinition:
                 return timeframe.name
         return value
 
+    @property
+    def timeframe_names(self) -> tuple[str, ...]:
+        return tuple(timeframe.name for timeframe in self.timeframes)
+
+    @property
+    def timeframe_seconds(self) -> dict[str, int]:
+        return {timeframe.name: timeframe.seconds for timeframe in self.timeframes}
+
+
+@dataclass(frozen=True)
+class BinaryMarketDefinition(MarketDefinition):
+    up_outcome_aliases: tuple[str, ...] = ("up", "yes")
+    down_outcome_aliases: tuple[str, ...] = ("down", "no")
+
     def classify_outcomes(
         self,
         outcome_tokens: Sequence[tuple[str, str]],
@@ -180,13 +195,12 @@ class BinaryMarketDefinition:
             return 0
         return None
 
-    @property
-    def timeframe_names(self) -> tuple[str, ...]:
-        return tuple(timeframe.name for timeframe in self.timeframes)
 
+@dataclass(frozen=True)
+class MultiOutcomeMarketDefinition(MarketDefinition):
     @property
-    def timeframe_seconds(self) -> dict[str, int]:
-        return {timeframe.name: timeframe.seconds for timeframe in self.timeframes}
+    def category(self) -> str:
+        return "culture"
 
 
 def _contains_alias(text: str, aliases: Sequence[str]) -> bool:
@@ -265,7 +279,7 @@ def _parse_timeframe_definition(payload: Any) -> TimeframeDefinition:
     )
 
 
-def _parse_market_definition(payload: Any) -> BinaryMarketDefinition:
+def _parse_market_definition(payload: Any) -> MarketDefinition:
     if not isinstance(payload, dict):
         raise MarketDefinitionError("market definitions must be objects")
 
@@ -276,27 +290,42 @@ def _parse_market_definition(payload: Any) -> BinaryMarketDefinition:
     timeframes_raw = payload.get("timeframes")
     if not isinstance(timeframes_raw, list) or not timeframes_raw:
         raise MarketDefinitionError(f"market definition {key!r} must define timeframes")
+        
+    market_type = payload.get("type", "binary")
 
-    return BinaryMarketDefinition(
-        key=key.strip(),
-        question_keywords=_validate_string_list(
-            payload.get("question_keywords"),
-            field_name=f"definition[{key}].question_keywords",
-        ),
-        asset_aliases=_parse_asset_aliases(payload.get("asset_aliases")),
-        timeframes=tuple(_parse_timeframe_definition(item) for item in timeframes_raw),
-        up_outcome_aliases=_validate_string_list(
-            payload.get("up_outcome_aliases", ["up", "yes"]),
-            field_name=f"definition[{key}].up_outcome_aliases",
-        ),
-        down_outcome_aliases=_validate_string_list(
-            payload.get("down_outcome_aliases", ["down", "no"]),
-            field_name=f"definition[{key}].down_outcome_aliases",
-        ),
-    )
+    if market_type == "binary":
+        return BinaryMarketDefinition(
+            key=key.strip(),
+            question_keywords=_validate_string_list(
+                payload.get("question_keywords"),
+                field_name=f"definition[{key}].question_keywords",
+            ),
+            asset_aliases=_parse_asset_aliases(payload.get("asset_aliases")),
+            timeframes=tuple(_parse_timeframe_definition(item) for item in timeframes_raw),
+            up_outcome_aliases=_validate_string_list(
+                payload.get("up_outcome_aliases", ["up", "yes"]),
+                field_name=f"definition[{key}].up_outcome_aliases",
+            ),
+            down_outcome_aliases=_validate_string_list(
+                payload.get("down_outcome_aliases", ["down", "no"]),
+                field_name=f"definition[{key}].down_outcome_aliases",
+            ),
+        )
+    elif market_type == "multi-outcome":
+        return MultiOutcomeMarketDefinition(
+            key=key.strip(),
+            question_keywords=_validate_string_list(
+                payload.get("question_keywords"),
+                field_name=f"definition[{key}].question_keywords",
+            ),
+            asset_aliases=_parse_asset_aliases(payload.get("asset_aliases")),
+            timeframes=tuple(_parse_timeframe_definition(item) for item in timeframes_raw),
+        )
+    else:
+        raise MarketDefinitionError(f"unknown market type {market_type!r} for definition {key!r}")
 
 
-def _parse_definitions_payload(payload: Any) -> tuple[BinaryMarketDefinition, ...]:
+def _parse_definitions_payload(payload: Any) -> tuple[MarketDefinition, ...]:
     if not isinstance(payload, dict):
         raise MarketDefinitionError("market definitions payload must be an object")
 
@@ -312,7 +341,7 @@ def default_market_definitions_path() -> Path:
 
 
 @lru_cache(maxsize=None)
-def _load_market_definitions_cached(path_value: str | None) -> tuple[BinaryMarketDefinition, ...]:
+def _load_market_definitions_cached(path_value: str | None) -> tuple[MarketDefinition, ...]:
     if path_value is None:
         try:
             with default_market_definitions_path().open("r", encoding="utf-8") as handle:
@@ -328,25 +357,25 @@ def _load_market_definitions_cached(path_value: str | None) -> tuple[BinaryMarke
         raise MarketDefinitionError(f"Failed to load market definitions from {path}: {exc}") from exc
 
 
-def load_market_definitions(path: str | Path | None = None) -> tuple[BinaryMarketDefinition, ...]:
+def load_market_definitions(path: str | Path | None = None) -> tuple[MarketDefinition, ...]:
     resolved = str(Path(path).expanduser().resolve()) if path is not None else None
     return _load_market_definitions_cached(resolved)
 
 
-def get_market_definitions(*, force_reload: bool = False) -> tuple[BinaryMarketDefinition, ...]:
+def get_market_definitions(*, force_reload: bool = False) -> tuple[MarketDefinition, ...]:
     if force_reload:
         _load_market_definitions_cached.cache_clear()
     return load_market_definitions()
 
 
-MARKET_DEFINITIONS: tuple[BinaryMarketDefinition, ...] = get_market_definitions()
+MARKET_DEFINITIONS: tuple[MarketDefinition, ...] = get_market_definitions()
 DEFAULT_MARKET_DEFINITION = MARKET_DEFINITIONS[0]
 
 
 def get_matching_market_definition(
     question: str,
-    definitions: Sequence[BinaryMarketDefinition] | None = None,
-) -> BinaryMarketDefinition | None:
+    definitions: Sequence[MarketDefinition] | None = None,
+) -> MarketDefinition | None:
     active_definitions = definitions if definitions is not None else MARKET_DEFINITIONS
     for definition in active_definitions:
         if definition.matches_question(question):
@@ -356,7 +385,7 @@ def get_matching_market_definition(
 
 def normalize_timeframe_value(
     value: str,
-    definitions: Sequence[BinaryMarketDefinition] | None = None,
+    definitions: Sequence[MarketDefinition] | None = None,
 ) -> str:
     active_definitions = definitions if definitions is not None else MARKET_DEFINITIONS
     for definition in active_definitions:

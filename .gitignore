@@ -7,6 +7,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+.ruff_cache/
 
 # -- Secrets — never commit credentials ----------------------------------------
 .env
@@ -15,8 +17,10 @@ build/
 
 # -- Collected data — can be very large ----------------------------------------
 data/
+data-culture/
 test_output/
 test_output_parquet/
+test_data_15m/
 
 # -- Logs ----------------------------------------------------------------------
 *.log
@@ -25,6 +29,7 @@ test_output_parquet/
 # -- Misc formats produced during analysis -------------------------------------
 *.csv
 *.xlsx
+*.parquet
 
 # -- IDE / editor --------------------------------------------------------------
 .vscode/

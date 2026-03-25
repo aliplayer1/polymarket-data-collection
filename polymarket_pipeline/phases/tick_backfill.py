@@ -82,11 +82,29 @@ class TickBackfillPhase:
 
             if pending_ticks and (index % tick_flush_every == 0 or index == n_windows):
                 ticks_df = pd.DataFrame(pending_ticks)
-                append_ticks_only(
-                    ticks_df,
-                    ticks_dir=str(self.paths.ticks_dir),
-                    logger=self.logger,
-                )
+                
+                if "category" in ticks_df.columns:
+                    culture_mask = ticks_df["category"] == "culture"
+                    crypto_df = ticks_df[~culture_mask].drop(columns=["category"], errors="ignore")
+                    culture_df = ticks_df[culture_mask].drop(columns=["category"], errors="ignore")
+                else:
+                    crypto_df = ticks_df
+                    culture_df = pd.DataFrame()
+
+                if not crypto_df.empty:
+                    append_ticks_only(
+                        crypto_df,
+                        ticks_dir=str(self.paths.ticks_dir),
+                        logger=self.logger,
+                    )
+                if not culture_df.empty:
+                    data_culture_dir = self.paths.data_dir.parent / "data-culture"
+                    append_ticks_only(
+                        culture_df,
+                        ticks_dir=str(data_culture_dir / "ticks"),
+                        logger=self.logger,
+                    )
+
                 self.logger.info(
                     "Flushed %d ticks to disk (window %d/%d)",
                     len(pending_ticks),

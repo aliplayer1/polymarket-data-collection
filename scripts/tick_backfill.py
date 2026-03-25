@@ -55,13 +55,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from polymarket_pipeline.api import PolymarketApi
-from polymarket_pipeline.config import TIMEFRAME_SECONDS
-from polymarket_pipeline.models import MarketRecord
-from polymarket_pipeline.storage import load_ticks, persist_ticks
-from polymarket_pipeline.ticks import PolygonTickFetcher
+from polymarket_pipeline.api import PolymarketApi  # noqa: E402
+from polymarket_pipeline.config import TIMEFRAME_SECONDS  # noqa: E402
+from polymarket_pipeline.models import MarketRecord  # noqa: E402
+from polymarket_pipeline.storage import load_ticks, persist_ticks  # noqa: E402
+from polymarket_pipeline.ticks import PolygonTickFetcher  # noqa: E402
 
-import pandas as pd
+import pandas as pd  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants

@@ -127,4 +127,5 @@ def build_binary_tick_row(
         "source": source,
         "spot_price_usdt": spot_price_usdt,
         "spot_price_ts_ms": spot_price_ts_ms,
+        "category": market.category,
     }

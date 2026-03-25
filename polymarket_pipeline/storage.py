@@ -241,6 +241,27 @@ PRICES_SCHEMA = pa.schema([
     # partition columns (crypto, timeframe) are implicit in the directory tree
 ])
 
+CULTURE_MARKETS_SCHEMA = pa.schema([
+    ("market_id", pa.string()),
+    ("question", pa.string()),
+    ("crypto", pa.dictionary(pa.int8(), pa.string())),
+    ("timeframe", pa.dictionary(pa.int8(), pa.string())),
+    ("volume", pa.float32()),
+    ("resolution", pa.int8()),
+    ("start_ts", pa.int64()),
+    ("end_ts", pa.int64()),
+    ("condition_id", pa.string()),
+    ("tokens", pa.string()), # JSON serialized dict
+])
+
+CULTURE_PRICES_SCHEMA = pa.schema([
+    ("market_id", pa.string()),
+    ("timestamp", pa.int32()),
+    ("token_id", pa.string()),
+    ("outcome", pa.dictionary(pa.int8(), pa.string())),
+    ("price", pa.float32()),
+])
+
 TICKS_SCHEMA = pa.schema([
     # One row per on-chain trade fill (Polygon OrderFilled event) or WebSocket trade event.
     # timestamp_ms is block-timestamp × 1000 for on-chain ticks (Polygon block ~2 s resolution)
@@ -248,7 +269,7 @@ TICKS_SCHEMA = pa.schema([
     ("market_id",    pa.string()),
     ("timestamp_ms", pa.int64()),    # epoch milliseconds
     ("token_id",     pa.string()),
-    ("outcome",      pa.dictionary(pa.int8(), pa.string())),   # "Up" / "Down"
+    ("outcome",      pa.dictionary(pa.int8(), pa.string())),   # "Up" / "Down" or any other name
     ("side",         pa.dictionary(pa.int8(), pa.string())),   # "BUY" / "SELL"
     ("price",        pa.float32()),
     ("size_usdc",    pa.float32()),
@@ -1198,6 +1219,130 @@ def persist_normalized(
             _write_partitioned_atomic(table_p, p_dir, partition_cols=["crypto", "timeframe"])
             log.info("Prices table written: %s/ (%s rows)", p_dir, len(merged_prices))
 
+
+def optimise_culture_markets_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["crypto"] = df["crypto"].astype("category")
+    df["timeframe"] = df["timeframe"].astype("category")
+    df["volume"] = df["volume"].astype("float32")
+    df["resolution"] = df["resolution"].apply(_resolution_to_int8).astype("int8")
+    
+    if "start_ts" in df.columns:
+        df["start_ts"] = pd.to_numeric(df["start_ts"], errors="coerce").fillna(0).astype("int64")
+    if "end_ts" in df.columns:
+        df["end_ts"] = pd.to_numeric(df["end_ts"], errors="coerce").fillna(0).astype("int64")
+    if "condition_id" in df.columns:
+        df["condition_id"] = df["condition_id"].astype("string")
+    if "tokens" in df.columns:
+        df["tokens"] = df["tokens"].astype("string")
+    
+    return df
+
+def optimise_culture_prices_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["timestamp"] = df["timestamp"].astype("int32")
+    df["price"] = df["price"].astype("float32")
+    df["crypto"] = df["crypto"].astype("category")
+    df["timeframe"] = df["timeframe"].astype("category")
+    df["outcome"] = df["outcome"].astype("category")
+    return df
+
+def load_culture_markets(markets_path: str) -> pd.DataFrame:
+    if os.path.exists(markets_path):
+        return pq.read_table(markets_path).to_pandas()
+    return pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "tokens"])
+
+def split_culture_markets_prices(flat_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if flat_df.empty:
+        markets_df = pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "tokens"])
+        prices_df = pd.DataFrame(columns=["market_id", "timestamp", "token_id", "outcome", "price", "crypto", "timeframe"])
+        return markets_df, prices_df
+
+    markets_df = (
+        flat_df.groupby("market_id", sort=False)
+        .agg({
+            "question": "last",
+            "crypto": "last",
+            "timeframe": "last",
+            "volume": "last",
+            "resolution": "last",
+            "start_ts": "last",
+            "end_ts": "last",
+            "condition_id": "last",
+            "tokens": "last",
+        })
+        .reset_index()
+    )
+
+    prices_df = flat_df[["market_id", "timestamp", "token_id", "outcome", "price", "crypto", "timeframe"]].copy()
+
+    return markets_df, prices_df
+
+def persist_culture_normalized(
+    markets_df: pd.DataFrame,
+    prices_df: pd.DataFrame,
+    *,
+    markets_path: str,
+    prices_dir: str,
+    logger: logging.Logger | None = None,
+    skip_markets: bool = False,
+) -> None:
+    log = logger or logging.getLogger("polymarket_pipeline")
+    data_root = os.path.dirname(os.path.abspath(markets_path))
+
+    with _write_lock(data_root):
+        if not skip_markets:
+            existing_markets = load_culture_markets(markets_path)
+            for col in ("crypto", "timeframe"):
+                if col in existing_markets.columns and hasattr(existing_markets[col], "cat"):
+                    existing_markets[col] = existing_markets[col].astype(str)
+                if col in markets_df.columns and hasattr(markets_df[col], "cat"):
+                    markets_df = markets_df.copy()
+                    markets_df[col] = markets_df[col].astype(str)
+            if not markets_df.empty:
+                dfs_to_concat = [df for df in (existing_markets, markets_df) if not df.empty]
+                merged_markets = (
+                    pd.concat(dfs_to_concat, ignore_index=True) if dfs_to_concat else existing_markets
+                )
+                merged_markets = (
+                    merged_markets.drop_duplicates(subset=["market_id"], keep="last")
+                    .reset_index(drop=True)
+                )
+            else:
+                merged_markets = existing_markets
+
+            merged_markets = optimise_culture_markets_df(merged_markets)
+            table_m = pa.Table.from_pandas(merged_markets, schema=CULTURE_MARKETS_SCHEMA, preserve_index=False)
+            _write_parquet_atomic(table_m, markets_path)
+            log.info("Culture markets table written: %s (%s rows)", markets_path, len(merged_markets))
+
+        if not prices_df.empty:
+            for col in ("crypto", "timeframe", "outcome"):
+                if col in prices_df.columns and hasattr(prices_df[col], "cat"):
+                    prices_df = prices_df.copy()
+                    prices_df[col] = prices_df[col].astype(str)
+            
+            partition_pairs = list(prices_df.groupby(["crypto", "timeframe"], sort=False).groups.keys())
+            partition_filters = [[("crypto", "=", str(c)), ("timeframe", "=", str(t))] for c, t in partition_pairs]
+            existing_prices = load_prices(prices_dir, filters=partition_filters)
+            
+            for col in ("crypto", "timeframe", "outcome"):
+                if col in existing_prices.columns and hasattr(existing_prices[col], "cat"):
+                    existing_prices[col] = existing_prices[col].astype(str)
+
+            dfs_to_concat = [df for df in (existing_prices, prices_df) if not df.empty]
+            merged_prices = (
+                pd.concat(dfs_to_concat, ignore_index=True) if dfs_to_concat else existing_prices
+            )
+            merged_prices = (
+                merged_prices.drop_duplicates(subset=["market_id", "timestamp", "outcome"], keep="last")
+                .sort_values(["market_id", "timestamp", "outcome"])
+                .reset_index(drop=True)
+            )
+            merged_prices = optimise_culture_prices_df(merged_prices)
+            table_p = pa.Table.from_pandas(merged_prices, preserve_index=False)
+            _write_partitioned_atomic(table_p, prices_dir, partition_cols=["crypto", "timeframe"])
+            log.info("Culture prices table written: %s/ (%s rows)", prices_dir, len(merged_prices))
 
 # ---------------------------------------------------------------------------
 # Hugging Face Hub upload

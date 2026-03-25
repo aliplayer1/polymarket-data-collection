@@ -3,6 +3,7 @@
   "definitions": [
     {
       "key": "crypto-up-down",
+      "type": "binary",
       "question_keywords": ["up or down"],
       "asset_aliases": {
         "BTC": ["bitcoin", "btc"],
@@ -43,6 +44,30 @@
           "cli_aliases": ["1h", "1hr", "1-hour", "hourly"],
           "range_minutes": 60,
           "matches_single_hour_pattern": true
+        }
+      ]
+    },
+    {
+      "key": "elon-musk-tweets",
+      "type": "multi-outcome",
+      "question_keywords": ["# tweets", "elon musk"],
+      "asset_aliases": {
+        "ELON-TWEETS": ["elon musk", "tweets"]
+      },
+      "timeframes": [
+        {
+          "name": "7-day",
+          "seconds": 604800,
+          "question_aliases": ["march 17 - march 24", "march 17 to march 24"],
+          "cli_aliases": ["7d", "7-day"],
+          "matches_single_hour_pattern": false
+        },
+        {
+          "name": "4-day",
+          "seconds": 345600,
+          "question_aliases": ["march 23 - march 25", "march 26 - march 28", "march 23 to march 25", "march 26 to march 28"],
+          "cli_aliases": ["4d", "4-day", "2d"],
+          "matches_single_hour_pattern": false
         }
       ]
     }

@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from .markets import BinaryMarketDefinition, get_matching_market_definition, get_market_definitions
+from .markets import MarketDefinition, BinaryMarketDefinition, MultiOutcomeMarketDefinition, get_matching_market_definition, get_market_definitions
 from .models import MarketRecord
 from .parsing import parse_iso_timestamp
 
@@ -22,9 +22,9 @@ def _coerce_list(value: Any) -> list[Any]:
     return []
 
 
-def _extract_binary_outcomes(market: dict[str, Any]) -> list[tuple[str, str]] | None:
+def _extract_all_outcomes(market: dict[str, Any]) -> list[tuple[str, str]]:
     tokens = market.get("tokens", [])
-    if len(tokens) == 2:
+    if tokens:
         extracted = [
             (
                 str(token.get("outcome", "")).strip(),
@@ -37,14 +37,21 @@ def _extract_binary_outcomes(market: dict[str, Any]) -> list[tuple[str, str]] | 
 
     outcomes = _coerce_list(market.get("outcomes"))
     clob_token_ids = _coerce_list(market.get("clobTokenIds"))
-    if len(outcomes) == 2 and len(clob_token_ids) == 2:
+    if outcomes and clob_token_ids and len(outcomes) == len(clob_token_ids):
         extracted = [
-            (str(outcomes[0]).strip(), str(clob_token_ids[0]).strip()),
-            (str(outcomes[1]).strip(), str(clob_token_ids[1]).strip()),
+            (str(out).strip(), str(tid).strip())
+            for out, tid in zip(outcomes, clob_token_ids)
         ]
         if all(outcome and token_id for outcome, token_id in extracted):
             return extracted
 
+    return []
+
+
+def _extract_binary_outcomes(market: dict[str, Any]) -> list[tuple[str, str]] | None:
+    extracted = _extract_all_outcomes(market)
+    if len(extracted) == 2:
+        return extracted
     return None
 
 
@@ -60,7 +67,7 @@ def normalize_gamma_market(
     *,
     is_active: bool,
     logger: logging.Logger,
-    definitions: Sequence[BinaryMarketDefinition] | None = None,
+    definitions: Sequence[MarketDefinition] | None = None,
 ) -> MarketRecord | None:
     question = str(market.get("question", ""))
     active_definitions = tuple(definitions) if definitions is not None else get_market_definitions()
@@ -81,30 +88,6 @@ def normalize_gamma_market(
         )
         return None
 
-    extracted_outcomes = _extract_binary_outcomes(market)
-    if extracted_outcomes is None:
-        tokens = market.get("tokens", [])
-        outcomes = _coerce_list(market.get("outcomes"))
-        clob_token_ids = _coerce_list(market.get("clobTokenIds"))
-        logger.debug(
-            "Market %s: unexpected token structure (tokens=%d, outcomes=%d, clobTokenIds=%d) — skipping",
-            market.get("id", "?"),
-            len(tokens),
-            len(outcomes),
-            len(clob_token_ids),
-        )
-        return None
-
-    classified_outcomes = definition.classify_outcomes(extracted_outcomes)
-    if classified_outcomes is None:
-        logger.debug(
-            "Market %s: outcome labels %r do not match %s — skipping",
-            market.get("id", "?"),
-            [outcome for outcome, _ in extracted_outcomes],
-            definition.key,
-        )
-        return None
-
     start_iso = market.get("start_date") or market.get("startDate")
     end_iso = (
         market.get("end_date")
@@ -121,25 +104,91 @@ def normalize_gamma_market(
 
     closed_ts = parse_iso_timestamp(market.get("closedTime") or market.get("closed_time"))
 
-    resolution = None
-    if market.get("resolved", False):
-        resolution = definition.resolution_for_winner(_extract_winning_outcome(market))
+    if isinstance(definition, BinaryMarketDefinition):
+        extracted_outcomes = _extract_binary_outcomes(market)
+        if extracted_outcomes is None:
+            logger.debug(
+                "Market %s: unexpected token structure — skipping binary market",
+                market.get("id", "?"),
+            )
+            return None
 
-    return MarketRecord(
-        market_id=str(market.get("id", "")),
-        market_type=definition.key,
-        question=question,
-        timeframe=timeframe,
-        crypto=crypto,
-        condition_id=market.get("conditionId") or market.get("condition_id"),
-        start_ts=start_ts,
-        end_ts=end_ts,
-        up_token_id=classified_outcomes.up_token_id,
-        down_token_id=classified_outcomes.down_token_id,
-        up_outcome=classified_outcomes.up_outcome,
-        down_outcome=classified_outcomes.down_outcome,
-        volume=float(market.get("volume", 0) or 0),
-        resolution=resolution,
-        is_active=is_active,
-        closed_ts=closed_ts,
-    )
+        classified_outcomes = definition.classify_outcomes(extracted_outcomes)
+        if classified_outcomes is None:
+            logger.debug(
+                "Market %s: outcome labels do not match %s — skipping",
+                market.get("id", "?"),
+                definition.key,
+            )
+            return None
+
+        resolution = None
+        if market.get("resolved", False):
+            resolution = definition.resolution_for_winner(_extract_winning_outcome(market))
+
+        return MarketRecord(
+            market_id=str(market.get("id", "")),
+            market_type=definition.key,
+            question=question,
+            timeframe=timeframe,
+            crypto=crypto,
+            condition_id=market.get("conditionId") or market.get("condition_id"),
+            start_ts=start_ts,
+            end_ts=end_ts,
+            up_token_id=classified_outcomes.up_token_id,
+            down_token_id=classified_outcomes.down_token_id,
+            up_outcome=classified_outcomes.up_outcome,
+            down_outcome=classified_outcomes.down_outcome,
+            tokens={
+                classified_outcomes.up_outcome: classified_outcomes.up_token_id,
+                classified_outcomes.down_outcome: classified_outcomes.down_token_id,
+            },
+            category="crypto",
+            volume=float(market.get("volume", 0) or 0),
+            resolution=resolution,
+            is_active=is_active,
+            closed_ts=closed_ts,
+        )
+
+    elif isinstance(definition, MultiOutcomeMarketDefinition):
+        extracted_outcomes = _extract_all_outcomes(market)
+        if not extracted_outcomes:
+            logger.debug(
+                "Market %s: unexpected token structure — skipping multi-outcome market",
+                market.get("id", "?"),
+            )
+            return None
+            
+        winning_outcome = None
+        if market.get("resolved", False):
+            winning_outcome = _extract_winning_outcome(market)
+        
+        # We don't have a simple 0/1 resolution for multi-outcome unless we just map it.
+        # But for culture markets we can leave resolution=None or map the index of the winner.
+        # Let's map it to the index of the winning outcome string if possible.
+        resolution = None
+        if winning_outcome:
+            try:
+                outcomes = [o for o, t in extracted_outcomes]
+                resolution = outcomes.index(winning_outcome)
+            except ValueError:
+                resolution = None
+                
+        return MarketRecord(
+            market_id=str(market.get("id", "")),
+            market_type=definition.key,
+            question=question,
+            timeframe=timeframe,
+            crypto=crypto,
+            condition_id=market.get("conditionId") or market.get("condition_id"),
+            start_ts=start_ts,
+            end_ts=end_ts,
+            tokens=dict(extracted_outcomes),
+            category="culture",
+            volume=float(market.get("volume", 0) or 0),
+            resolution=resolution,
+            is_active=is_active,
+            closed_ts=closed_ts,
+        )
+
+    return None

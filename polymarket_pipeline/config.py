@@ -2,7 +2,8 @@ import os
 
 from .markets import get_market_definitions
 
-_DEFAULT_MARKET_DEFINITION = get_market_definitions()[0]
+_MARKET_DEFINITIONS = get_market_definitions()
+_DEFAULT_MARKET_DEFINITION = _MARKET_DEFINITIONS[0]
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_HOST = "https://clob.polymarket.com"
@@ -40,13 +41,17 @@ WS_MAX_TOKENS_PER_SHARD = 500
 # half of each buffer is evicted and an ERROR is logged.
 WS_BUFFER_MAX_ROWS = 50_000
 
-TIME_FRAMES = _DEFAULT_MARKET_DEFINITION.timeframe_names
+TIME_FRAMES = tuple(
+    tf for d in _MARKET_DEFINITIONS for tf in d.timeframe_names
+)
 
 # Duration of each prediction window in seconds.  The price fetch for a closed
 # market is limited to [end_ts - window_seconds, end_ts] so that we only
 # capture price action during the actual prediction period, not the long
 # dormant pre-trading phase where prices sit flat at the default 0.5/0.5.
-TIMEFRAME_SECONDS: dict[str, int] = _DEFAULT_MARKET_DEFINITION.timeframe_seconds
+TIMEFRAME_SECONDS: dict[str, int] = {}
+for _d in _MARKET_DEFINITIONS:
+    TIMEFRAME_SECONDS.update(_d.timeframe_seconds)
 
 # --- Parquet storage (normalized schema) ---
 PARQUET_DATA_DIR = "data"
@@ -58,11 +63,17 @@ PARQUET_TEST_MARKETS_PATH = f"{PARQUET_TEST_DIR}/markets.parquet"
 PARQUET_TEST_PRICES_DIR = f"{PARQUET_TEST_DIR}/prices"
 PARQUET_TEST_TICKS_DIR  = f"{PARQUET_TEST_DIR}/ticks"
 
+# Culture specific storage
+CULTURE_DATA_DIR = "data-culture"
+
 # --- Hugging Face Hub ---
 HF_REPO_ID = os.environ.get("HF_REPO_ID", "aliplayer1/polymarket-crypto-updown")
+HF_CULTURE_REPO_ID = os.environ.get("HF_CULTURE_REPO_ID", "aliplayer1/polymarket-culture-data")
 
 PRICE_SUM_TOLERANCE = 0.15
 MAX_WS_RECONNECT_DELAY_SECONDS = 120
 
 FILTER_KEYWORD = _DEFAULT_MARKET_DEFINITION.question_keywords[0]
-CRYPTO_ALIASES = dict(_DEFAULT_MARKET_DEFINITION.asset_aliases)
+CRYPTO_ALIASES = {}
+for _d in _MARKET_DEFINITIONS:
+    CRYPTO_ALIASES.update(_d.asset_aliases)

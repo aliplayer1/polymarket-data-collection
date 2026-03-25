@@ -87,21 +87,19 @@ class WebSocketPhase:
         )
 
         def _fetch_one(market: MarketRecord) -> tuple[str, dict[str, float]]:
-            try:
-                up_raw = api_call_with_retry(
-                    self.last_trade_price_provider.get_last_trade_price,
-                    market.up_token_id,
-                    logger=self.logger,
-                ) or 0.5
-                down_raw = api_call_with_retry(
-                    self.last_trade_price_provider.get_last_trade_price,
-                    market.down_token_id,
-                    logger=self.logger,
-                ) or 0.5
-                return market.market_id, {"up": _parse_price(up_raw), "down": _parse_price(down_raw)}
-            except Exception as exc:
-                self.logger.warning("Falling back to 0.5 for market %s: %s", market.market_id, exc)
-                return market.market_id, {"up": 0.5, "down": 0.5}
+            prices = {}
+            for outcome, token_id in market.tokens.items():
+                try:
+                    raw = api_call_with_retry(
+                        self.last_trade_price_provider.get_last_trade_price,
+                        token_id,
+                        logger=self.logger,
+                    ) or 0.5
+                    prices[outcome] = _parse_price(raw)
+                except Exception as exc:
+                    self.logger.warning("Falling back to 0.5 for market %s outcome %s: %s", market.market_id, outcome, exc)
+                    prices[outcome] = 0.5
+            return market.market_id, prices
 
         with ThreadPoolExecutor(max_workers=min(5, len(needs_api))) as executor:
             for market_id, prices in executor.map(_fetch_one, needs_api):
@@ -127,11 +125,27 @@ class WebSocketPhase:
             all_ticks.extend(rows)
         if all_ticks:
             ticks_df = pd.DataFrame(all_ticks)
-            append_ws_ticks_staged(
-                ticks_df,
-                ticks_dir=str(self.paths.ticks_dir),
-                logger=self.logger,
-            )
+            if "category" in ticks_df.columns:
+                culture_mask = ticks_df["category"] == "culture"
+                crypto_df = ticks_df[~culture_mask].drop(columns=["category"], errors="ignore")
+                culture_df = ticks_df[culture_mask].drop(columns=["category"], errors="ignore")
+            else:
+                crypto_df = ticks_df
+                culture_df = pd.DataFrame()
+
+            if not crypto_df.empty:
+                append_ws_ticks_staged(
+                    crypto_df,
+                    ticks_dir=str(self.paths.ticks_dir),
+                    logger=self.logger,
+                )
+            if not culture_df.empty:
+                data_culture_dir = self.paths.data_dir.parent / "data-culture"
+                append_ws_ticks_staged(
+                    culture_df,
+                    ticks_dir=str(data_culture_dir / "ticks"),
+                    logger=self.logger,
+                )
 
         return flushed_rows
 
@@ -222,17 +236,42 @@ class WebSocketPhase:
                             size_usdc = round(size_shares * price, 6) if size_shares > 0 else 0.0
 
                             if market.market_id not in last_prices:
-                                last_prices[market.market_id] = {"up": 0.5, "down": 0.5}
+                                last_prices[market.market_id] = {}
                             last_prices[market.market_id][outcome_side] = price
 
-                            ws_buffer[market.timeframe].append(
-                                build_binary_price_row(
-                                    market,
-                                    timestamp=timestamp,
-                                    side_prices=last_prices[market.market_id],
-                                    resolution=None,
+                            if market.category == "crypto":
+                                # Ensure we have 'up' and 'down' in last_prices
+                                if "up" not in last_prices[market.market_id]:
+                                    last_prices[market.market_id]["up"] = 0.5
+                                if "down" not in last_prices[market.market_id]:
+                                    last_prices[market.market_id]["down"] = 0.5
+                                ws_buffer[market.timeframe].append(
+                                    build_binary_price_row(
+                                        market,
+                                        timestamp=timestamp,
+                                        side_prices=last_prices[market.market_id],
+                                        resolution=None,
+                                    )
                                 )
-                            )
+                            else:
+                                ws_buffer[market.timeframe].append({
+                                    "market_id": market.market_id,
+                                    "crypto": market.crypto,
+                                    "timeframe": market.timeframe,
+                                    "timestamp": timestamp,
+                                    "token_id": token_id,
+                                    "outcome": outcome_side,
+                                    "price": float(price),
+                                    "question": market.question,
+                                    "volume": market.volume,
+                                    "resolution": market.resolution,
+                                    "start_ts": market.start_ts,
+                                    "end_ts": market.end_ts,
+                                    "condition_id": market.condition_id,
+                                    "tokens": json.dumps(market.tokens),
+                                    "category": market.category,
+                                })
+                                
                             tick_buffer[market.timeframe].append(
                                 build_binary_tick_row(
                                     market,
@@ -326,9 +365,8 @@ class WebSocketPhase:
         token_to_market: dict[str, tuple[MarketRecord, str]] = {}
         token_ids: list[str] = []
         for market in active_markets:
-            for side in ("up", "down"):
-                token_id = market.token_id_for_side(side)
-                token_to_market[token_id] = (market, side)
+            for outcome, token_id in market.tokens.items():
+                token_to_market[token_id] = (market, outcome)
                 token_ids.append(token_id)
 
         if not token_ids:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -8,7 +9,7 @@ import pandas as pd
 from ..config import PRICE_SUM_TOLERANCE, TIME_FRAMES, TIMEFRAME_SECONDS
 from ..models import MarketRecord
 from ..providers import PriceHistoryProvider
-from ..storage import load_prices_for_timeframe, persist_normalized, split_markets_prices
+from ..storage import load_prices_for_timeframe, persist_normalized, split_markets_prices, persist_culture_normalized, split_culture_markets_prices
 from .shared import PipelinePaths, build_binary_price_frame
 
 
@@ -51,11 +52,23 @@ class PriceHistoryPhase:
         market_df = df[df["market_id"] == market.market_id] if not df.empty else pd.DataFrame()
         if market_df.empty:
             return None
-        row = market_df.iloc[-1]
-        return {
-            "up": float(row["up_price"]),
-            "down": float(row["down_price"]),
-        }
+            
+        if market.category == "crypto":
+            row = market_df.iloc[-1]
+            return {
+                "up": float(row["up_price"]),
+                "down": float(row["down_price"]),
+            }
+        else:
+            # For culture markets, we need to return the latest price per token/outcome
+            latest_prices = {}
+            for outcome in market.tokens.keys():
+                outcome_df = market_df[market_df["outcome"] == outcome]
+                if not outcome_df.empty:
+                    latest_prices[outcome] = float(outcome_df.iloc[-1]["price"])
+                else:
+                    latest_prices[outcome] = 0.5
+            return latest_prices
 
     def _market_start_ts(self, market: MarketRecord) -> int:
         window_seconds = TIMEFRAME_SECONDS.get(market.timeframe, 300)
@@ -89,93 +102,131 @@ class PriceHistoryPhase:
             start_ts,
             market.end_ts,
         )
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_up = executor.submit(
-                self.price_history_provider.fetch_price_history,
-                market.up_token_id,
-                start_ts,
-                market.end_ts,
-            )
-            future_down = executor.submit(
-                self.price_history_provider.fetch_price_history,
-                market.down_token_id,
-                start_ts,
-                market.end_ts,
-            )
-            up_history = future_up.result()
-            down_history = future_down.result()
+        
+        histories = {}
+        with ThreadPoolExecutor(max_workers=min(5, len(market.tokens))) as executor:
+            future_to_outcome = {
+                executor.submit(
+                    self.price_history_provider.fetch_price_history,
+                    token_id,
+                    start_ts,
+                    market.end_ts,
+                ): outcome for outcome, token_id in market.tokens.items()
+            }
+            for future in as_completed(future_to_outcome):
+                outcome = future_to_outcome[future]
+                histories[outcome] = future.result()
+                
+        for outcome, history in histories.items():
+            self.logger.info("  -> %s history rows: %s", outcome, len(history) if history else 0)
 
-        len_up = len(up_history) if up_history else 0
-        len_down = len(down_history) if down_history else 0
-        self.logger.info("  -> %s history rows: %s", market.up_outcome, len_up)
-        self.logger.info("  -> %s history rows: %s", market.down_outcome, len_down)
-
-        if not up_history or not down_history:
+        if not any(histories.values()):
             return None
+            
+        if market.category == "culture":
+            frames = []
+            for outcome, history in histories.items():
+                if history:
+                    df = pd.DataFrame(
+                        [
+                            {"timestamp": int(item["t"]), "price": float(item["p"])}
+                            for item in history
+                            if "t" in item and "p" in item
+                        ]
+                    ).sort_values("timestamp")
+                    if not df.empty:
+                        df["market_id"] = market.market_id
+                        df["crypto"] = market.crypto
+                        df["timeframe"] = market.timeframe
+                        df["token_id"] = market.tokens[outcome]
+                        df["outcome"] = outcome
+                        # Add market-level fields for the split to work correctly
+                        df["question"] = market.question
+                        df["volume"] = market.volume
+                        df["resolution"] = market.resolution
+                        df["start_ts"] = market.start_ts
+                        df["end_ts"] = market.end_ts
+                        df["condition_id"] = market.condition_id
+                        df["tokens"] = json.dumps(market.tokens)
+                        df["category"] = "culture"
+                        frames.append(df)
+            if not frames:
+                return None
+            return pd.concat(frames, ignore_index=True)
+            
+        else:
+            # Binary market processing
+            up_history = histories.get(market.up_outcome, [])
+            down_history = histories.get(market.down_outcome, [])
+            
+            if not up_history or not down_history:
+                return None
 
-        up_history_df = pd.DataFrame(
-            [
-                {"timestamp": int(item["t"]), "up_price": float(item["p"])}
-                for item in up_history
-                if "t" in item and "p" in item
-            ]
-        ).sort_values("timestamp")
-        down_history_df = pd.DataFrame(
-            [
-                {"timestamp": int(item["t"]), "down_price": float(item["p"])}
-                for item in down_history
-                if "t" in item and "p" in item
-            ]
-        ).sort_values("timestamp")
-        if up_history_df.empty or down_history_df.empty:
-            return None
+            up_history_df = pd.DataFrame(
+                [
+                    {"timestamp": int(item["t"]), "up_price": float(item["p"])}
+                    for item in up_history
+                    if "t" in item and "p" in item
+                ]
+            ).sort_values("timestamp")
+            down_history_df = pd.DataFrame(
+                [
+                    {"timestamp": int(item["t"]), "down_price": float(item["p"])}
+                    for item in down_history
+                    if "t" in item and "p" in item
+                ]
+            ).sort_values("timestamp")
+            if up_history_df.empty or down_history_df.empty:
+                return None
 
-        union_ts = (
-            pd.concat([up_history_df[["timestamp"]], down_history_df[["timestamp"]]])
-            .drop_duplicates()
-            .sort_values("timestamp")
-            .reset_index(drop=True)
-        )
-        merged_prices = pd.merge_asof(
-            union_ts,
-            up_history_df,
-            on="timestamp",
-            direction="backward",
-            allow_exact_matches=True,
-        )
-        merged_prices = pd.merge_asof(
-            merged_prices,
-            down_history_df,
-            on="timestamp",
-            direction="backward",
-            allow_exact_matches=True,
-        )
-        merged_prices = merged_prices.fillna({"up_price": 0.5, "down_price": 0.5})
-        if merged_prices.empty:
-            return None
-
-        price_sum = merged_prices["up_price"] + merged_prices["down_price"]
-        outlier_count = int(((price_sum - 1.0).abs() > PRICE_SUM_TOLERANCE).sum())
-        if outlier_count > 0:
-            self.logger.debug(
-                "  -> %s/%s rows have price sum deviating >%.2f from 1.0 for market %s",
-                outlier_count,
-                len(merged_prices),
-                PRICE_SUM_TOLERANCE,
-                market.market_id,
+            union_ts = (
+                pd.concat([up_history_df[["timestamp"]], down_history_df[["timestamp"]]])
+                .drop_duplicates()
+                .sort_values("timestamp")
+                .reset_index(drop=True)
             )
+            merged_prices = pd.merge_asof(
+                union_ts,
+                up_history_df,
+                on="timestamp",
+                direction="backward",
+                allow_exact_matches=True,
+            )
+            merged_prices = pd.merge_asof(
+                merged_prices,
+                down_history_df,
+                on="timestamp",
+                direction="backward",
+                allow_exact_matches=True,
+            )
+            merged_prices = merged_prices.fillna({"up_price": 0.5, "down_price": 0.5})
+            if merged_prices.empty:
+                return None
 
-        return build_binary_price_frame(
-            market,
-            timestamps=merged_prices["timestamp"],
-            side_prices={
-                "up": merged_prices["up_price"],
-                "down": merged_prices["down_price"],
-            },
-            volume=market.volume,
-            resolution=market.resolution,
-            question=market.question,
-        )
+            price_sum = merged_prices["up_price"] + merged_prices["down_price"]
+            outlier_count = int(((price_sum - 1.0).abs() > PRICE_SUM_TOLERANCE).sum())
+            if outlier_count > 0:
+                self.logger.debug(
+                    "  -> %s/%s rows have price sum deviating >%.2f from 1.0 for market %s",
+                    outlier_count,
+                    len(merged_prices),
+                    PRICE_SUM_TOLERANCE,
+                    market.market_id,
+                )
+
+            df = build_binary_price_frame(
+                market,
+                timestamps=merged_prices["timestamp"],
+                side_prices={
+                    "up": merged_prices["up_price"],
+                    "down": merged_prices["down_price"],
+                },
+                volume=market.volume,
+                resolution=market.resolution,
+                question=market.question,
+            )
+            df["category"] = "crypto"
+            return df
 
     def persist_dataframe(
         self,
@@ -185,29 +236,58 @@ class PriceHistoryPhase:
         update_cache: bool = True,
     ) -> pd.DataFrame:
         df = df.assign(market_id=lambda data: data["market_id"].astype(str))
-        markets_df, prices_df = split_markets_prices(df)
-        persist_normalized(
-            markets_df,
-            prices_df,
-            markets_path=str(self.paths.markets_path),
-            prices_dir=str(self.paths.prices_dir),
-            logger=self.logger,
-            skip_markets=not update_cache,
-        )
+        
+        # Split by category
+        is_culture = df.get("category", "crypto") == "culture"
+        culture_df = df[is_culture]
+        crypto_df = df[~is_culture]
+        
+        prices_frames = []
+        
+        if not crypto_df.empty:
+            markets_df, prices_df = split_markets_prices(crypto_df)
+            persist_normalized(
+                markets_df,
+                prices_df,
+                markets_path=str(self.paths.markets_path),
+                prices_dir=str(self.paths.prices_dir),
+                logger=self.logger,
+                skip_markets=not update_cache,
+            )
+            prices_frames.append(prices_df)
+            
+        if not culture_df.empty:
+            culture_markets_df, culture_prices_df = split_culture_markets_prices(culture_df)
+            data_culture_dir = self.paths.data_dir.parent / "data-culture"
+            data_culture_dir.mkdir(parents=True, exist_ok=True)
+            persist_culture_normalized(
+                culture_markets_df,
+                culture_prices_df,
+                markets_path=str(data_culture_dir / "markets.parquet"),
+                prices_dir=str(data_culture_dir / "prices"),
+                logger=self.logger,
+                skip_markets=not update_cache,
+            )
+            prices_frames.append(culture_prices_df)
 
         if not update_cache:
-            return prices_df
+            return pd.concat(prices_frames) if prices_frames else pd.DataFrame()
 
         existing = self.existing_dfs.get(timeframe, pd.DataFrame())
-        dfs_to_concat = [df for df in (existing, prices_df) if not df.empty]
+        dfs_to_concat = [existing] + prices_frames
+        dfs_to_concat = [d for d in dfs_to_concat if not d.empty]
+        
         merged = (
             pd.concat(dfs_to_concat, ignore_index=True) if dfs_to_concat else existing
         )
-        merged = (
-            merged.drop_duplicates(subset=["market_id", "timestamp"], keep="last")
-            .sort_values(["market_id", "timestamp"])
-            .reset_index(drop=True)
-        )
+        if not merged.empty:
+            # Depending on columns, deduplicate appropriately
+            if "outcome" in merged.columns: # Culture mixed in
+                merged = merged.drop_duplicates(subset=["market_id", "timestamp", "outcome"], keep="last")
+            else:
+                merged = merged.drop_duplicates(subset=["market_id", "timestamp"], keep="last")
+            merged = merged.sort_values(["market_id", "timestamp"]).reset_index(drop=True)
+            
         self.existing_dfs[timeframe] = merged
         return merged
 
