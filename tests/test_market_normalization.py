@@ -96,3 +96,30 @@ def test_normalize_gamma_market_matches_exact_asset_word() -> None:
 
     assert market is not None
     assert market.crypto == "ETH"
+
+
+def test_normalize_gamma_market_supports_new_assets() -> None:
+    assets_to_test = [
+        ("BNB Up or Down - March 27, 10AM ET", "BNB", "1-hour"),
+        ("Hyperliquid Up or Down - March 26, 1:30PM-1:35PM ET", "HYPE", "5-minute"),
+        ("XRP Up or Down - March 26, 2:05PM-2:10PM ET", "XRP", "5-minute"),
+        ("Dogecoin Up or Down - March 26, 4:00AM-4:15AM ET", "DOGE", "15-minute"),
+        ("HYPE Up or Down - March 26, 10PM ET", "HYPE", "1-hour"),
+    ]
+
+    for question, expected_crypto, expected_timeframe in assets_to_test:
+        raw_market = {
+            "id": "m_test",
+            "question": question,
+            "startDate": "2026-03-26T00:00:00Z",
+            "endDate": "2026-03-26T01:00:00Z",
+            "closed": True,
+            "tokens": [
+                {"outcome": "Up", "tokenId": "tok-up"},
+                {"outcome": "Down", "tokenId": "tok-down"},
+            ],
+        }
+        market = normalize_gamma_market(raw_market, is_active=False, logger=logging.getLogger("test"))
+        assert market is not None, f"Failed to parse: {question}"
+        assert market.crypto == expected_crypto
+        assert market.timeframe == expected_timeframe

@@ -8,7 +8,11 @@
       "asset_aliases": {
         "BTC": ["bitcoin", "btc"],
         "ETH": ["ethereum", "eth"],
-        "SOL": ["solana", "sol"]
+        "SOL": ["solana", "sol"],
+        "BNB": ["bnb", "binance coin"],
+        "XRP": ["xrp", "ripple"],
+        "DOGE": ["dogecoin", "doge"],
+        "HYPE": ["hype", "hyperliquid"]
       },
       "up_outcome_aliases": ["up", "yes"],
       "down_outcome_aliases": ["down", "no"],

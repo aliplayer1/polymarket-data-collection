@@ -238,7 +238,10 @@ class PriceHistoryPhase:
         df = df.assign(market_id=lambda data: data["market_id"].astype(str))
         
         # Split by category
-        is_culture = df.get("category", "crypto") == "culture"
+        if "category" not in df.columns:
+            df["category"] = "crypto"
+            
+        is_culture = df["category"] == "culture"
         culture_df = df[is_culture]
         crypto_df = df[~is_culture]
         

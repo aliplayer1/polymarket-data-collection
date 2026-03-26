@@ -65,6 +65,7 @@ def build_binary_price_frame(
             "condition_id": market.condition_id,
             "up_token_id": market.up_token_id,
             "down_token_id": market.down_token_id,
+            "category": market.category,
         }
     )
 
@@ -92,6 +93,7 @@ def build_binary_price_row(
         "condition_id": market.condition_id,
         "up_token_id": market.up_token_id,
         "down_token_id": market.down_token_id,
+        "category": market.category,
     }
 
 

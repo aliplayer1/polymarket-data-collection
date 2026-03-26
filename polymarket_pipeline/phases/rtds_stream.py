@@ -39,13 +39,17 @@ from ..config import MAX_WS_RECONNECT_DELAY_SECONDS
 
 _RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 _PING_INTERVAL_SECONDS = 5.0
-_SUPPORTED_SYMBOLS = frozenset({"btcusdt", "ethusdt", "solusdt"})
+_SUPPORTED_SYMBOLS = frozenset({"btcusdt", "ethusdt", "solusdt", "bnbusdt", "xrpusdt", "dogeusdt", "hypeusdt"})
 
 # Mapping from MarketRecord.crypto → RTDS symbol
 CRYPTO_TO_RTDS_SYMBOL: dict[str, str] = {
     "BTC": "btcusdt",
     "ETH": "ethusdt",
     "SOL": "solusdt",
+    "BNB": "bnbusdt",
+    "XRP": "xrpusdt",
+    "DOGE": "dogeusdt",
+    "HYPE": "hypeusdt",
 }
 
 
