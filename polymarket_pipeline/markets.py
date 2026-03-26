@@ -18,6 +18,16 @@ SINGLE_HOUR_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 
+DATE_RANGE_PATTERN = re.compile(
+    r"([a-z]+)\s+(\d{1,2})(?:\s*-\s*|\s+to\s+)([a-z]+\s+)?(\d{1,2}),\s+(\d{4})",
+    flags=re.IGNORECASE,
+)
+
+MONTH_YEAR_PATTERN = re.compile(
+    r"\bin\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b",
+    flags=re.IGNORECASE,
+)
+
 _FALLBACK_MARKET_DEFINITIONS_PAYLOAD: dict[str, Any] = {
     "version": 1,
     "definitions": [
@@ -70,7 +80,47 @@ _FALLBACK_MARKET_DEFINITIONS_PAYLOAD: dict[str, Any] = {
                     "matches_single_hour_pattern": True,
                 },
             ],
-        }
+        },
+        {
+            "key": "elon-musk-tweets",
+            "type": "multi-outcome",
+            "question_keywords": ["# tweets", "elon musk"],
+            "asset_aliases": {
+                "ELON-TWEETS": ["elon musk", "tweets"],
+            },
+            "timeframes": [
+                {
+                    "name": "7-day",
+                    "seconds": 7 * 24 * 60 * 60,
+                    "question_aliases": ["march 17 - march 24", "march 17 to march 24"],
+                    "cli_aliases": ["7d", "7-day"],
+                    "range_minutes": 7 * 24 * 60,
+                    "matches_single_hour_pattern": False,
+                },
+                {
+                    "name": "4-day",
+                    "seconds": 4 * 24 * 60 * 60,
+                    "question_aliases": [
+                        "march 23 - march 25",
+                        "march 26 - march 28",
+                        "march 23 to march 25",
+                        "march 26 to march 28",
+                    ],
+                    "cli_aliases": ["4d", "4-day", "2d"],
+                    "range_minutes": 4 * 24 * 60,
+                    "matches_single_hour_pattern": False,
+                },
+                {
+                    "name": "1-month",
+                    "seconds": 30 * 24 * 60 * 60,
+                    "question_aliases": ["monthly"],
+                    "cli_aliases": ["1m", "1-month", "month"],
+                    "range_minutes": None,
+                    "matches_single_hour_pattern": False,
+                    "matches_month_year_pattern": True,
+                },
+            ],
+        },
     ],
 }
 
@@ -87,6 +137,7 @@ class TimeframeDefinition:
     cli_aliases: tuple[str, ...]
     range_minutes: int | None = None
     matches_single_hour_pattern: bool = False
+    matches_month_year_pattern: bool = False
 
     def matches_question(self, question_lower: str) -> bool:
         return _contains_alias(question_lower, self.question_aliases)
@@ -131,6 +182,9 @@ class MarketDefinition:
                 return timeframe.name
 
         range_minutes = _minutes_from_time_range(question)
+        if range_minutes is None:
+            range_minutes = _minutes_from_date_range(question)
+
         if range_minutes is not None:
             for timeframe in self.timeframes:
                 if timeframe.range_minutes == range_minutes:
@@ -139,6 +193,11 @@ class MarketDefinition:
         if SINGLE_HOUR_PATTERN.search(question):
             for timeframe in self.timeframes:
                 if timeframe.matches_single_hour_pattern:
+                    return timeframe.name
+
+        if MONTH_YEAR_PATTERN.search(question):
+            for timeframe in self.timeframes:
+                if timeframe.matches_month_year_pattern:
                     return timeframe.name
 
         return None
@@ -229,6 +288,26 @@ def _minutes_from_time_range(question: str) -> int | None:
     return delta_minutes
 
 
+def _minutes_from_date_range(question: str) -> int | None:
+    match = DATE_RANGE_PATTERN.search(question)
+    if not match:
+        return None
+
+    month_str, day1, month2_str, day2, year = match.groups()
+    m1 = datetime.strptime(month_str, "%B").month
+    m2 = m1 if not month2_str else datetime.strptime(month2_str.strip(), "%B").month
+
+    d1 = datetime(int(year), m1, int(day1))
+    d2 = datetime(int(year), m2, int(day2))
+
+    delta_days = (d2 - d1).days
+    if delta_days < 0:  # Crossed year boundary (e.g. Dec 30 to Jan 2)
+        d2 = datetime(int(year) + 1, m2, int(day2))
+        delta_days = (d2 - d1).days
+
+    return delta_days * 24 * 60
+
+
 def _validate_string_list(value: Any, *, field_name: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise MarketDefinitionError(f"{field_name} must be a non-empty list")
@@ -270,20 +349,22 @@ def _parse_timeframe_definition(payload: Any) -> TimeframeDefinition:
         raise MarketDefinitionError(f"timeframe {name!r} has invalid range_minutes")
 
     matches_single_hour_pattern = bool(payload.get("matches_single_hour_pattern", False))
+    matches_month_year_pattern = bool(payload.get("matches_month_year_pattern", False))
 
     return TimeframeDefinition(
         name=name.strip(),
         seconds=seconds,
         question_aliases=_validate_string_list(
-            payload.get("question_aliases"),
+            payload.get("question_aliases", []),
             field_name=f"timeframe[{name}].question_aliases",
         ),
         cli_aliases=_validate_string_list(
-            payload.get("cli_aliases"),
+            payload.get("cli_aliases", []),
             field_name=f"timeframe[{name}].cli_aliases",
         ),
         range_minutes=range_minutes,
         matches_single_hour_pattern=matches_single_hour_pattern,
+        matches_month_year_pattern=matches_month_year_pattern,
     )
 
 

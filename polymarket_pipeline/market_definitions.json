@@ -64,6 +64,7 @@
           "seconds": 604800,
           "question_aliases": ["march 17 - march 24", "march 17 to march 24"],
           "cli_aliases": ["7d", "7-day"],
+          "range_minutes": 10080,
           "matches_single_hour_pattern": false
         },
         {
@@ -71,7 +72,16 @@
           "seconds": 345600,
           "question_aliases": ["march 23 - march 25", "march 26 - march 28", "march 23 to march 25", "march 26 to march 28"],
           "cli_aliases": ["4d", "4-day", "2d"],
+          "range_minutes": 5760,
           "matches_single_hour_pattern": false
+        },
+        {
+          "name": "1-month",
+          "seconds": 2592000,
+          "question_aliases": ["monthly"],
+          "cli_aliases": ["1m", "1-month", "month"],
+          "matches_single_hour_pattern": false,
+          "matches_month_year_pattern": true
         }
       ]
     }

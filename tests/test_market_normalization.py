@@ -123,3 +123,41 @@ def test_normalize_gamma_market_supports_new_assets() -> None:
         assert market is not None, f"Failed to parse: {question}"
         assert market.crypto == expected_crypto
         assert market.timeframe == expected_timeframe
+
+
+def test_normalize_gamma_market_supports_elon_musk_tweets() -> None:
+    # 7-day range (March 27 to April 3 = 7 days = 10080 minutes)
+    raw_market = {
+        "id": "elon-1",
+        "question": "Will Elon Musk post 20-39 tweets from March 27 to April 3, 2026?",
+        "startDate": "2026-03-20T00:00:00Z",
+        "endDate": "2026-04-03T00:00:00Z",
+        "closed": False,
+        "tokens": [
+            {"outcome": "20-39", "tokenId": "tok-1"},
+            {"outcome": "Other", "tokenId": "tok-2"},
+        ],
+    }
+    market = normalize_gamma_market(raw_market, is_active=True, logger=logging.getLogger("test"))
+    assert market is not None
+    assert market.market_type == "elon-musk-tweets"
+    assert market.crypto == "ELON-TWEETS"
+    assert market.timeframe == "7-day"
+
+    # Monthly range
+    raw_market_monthly = {
+        "id": "elon-2",
+        "question": "Will Elon Musk post 1120-1159 tweets in April 2026?",
+        "startDate": "2026-03-20T00:00:00Z",
+        "endDate": "2026-04-30T00:00:00Z",
+        "closed": False,
+        "tokens": [
+            {"outcome": "1120-1159", "tokenId": "tok-1"},
+            {"outcome": "Other", "tokenId": "tok-2"},
+        ],
+    }
+    market_monthly = normalize_gamma_market(raw_market_monthly, is_active=True, logger=logging.getLogger("test"))
+    assert market_monthly is not None
+    assert market_monthly.market_type == "elon-musk-tweets"
+    assert market_monthly.crypto == "ELON-TWEETS"
+    assert market_monthly.timeframe == "1-month"
