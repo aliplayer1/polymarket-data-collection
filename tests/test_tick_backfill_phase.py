@@ -56,34 +56,35 @@ def _market(market_id: str, *, start_ts: int, end_ts: int) -> MarketRecord:
     )
 
 
-def test_tick_backfill_phase_batches_shared_windows(tmp_path, monkeypatch) -> None:
+def test_tick_backfill_phase_chunks_large_windows(tmp_path, monkeypatch) -> None:
     provider = DummyTickProvider()
     phase = TickBackfillPhase(
         provider,
         logger=logging.getLogger("test"),
         paths=PipelinePaths.from_root(tmp_path / "data"),
     )
-    captured: list[tuple[int, str | None]] = []
 
-    def _capture_append_ticks_only(ticks_df, *, ticks_dir=None, logger=None) -> None:
-        captured.append((len(ticks_df), ticks_dir))
-
-    monkeypatch.setattr(
-        "polymarket_pipeline.phases.tick_backfill.append_ticks_only",
-        _capture_append_ticks_only,
+    # Market with 4-day timeframe (345,600 seconds)
+    m1 = MarketRecord(
+        market_id="m-large",
+        market_type="multi-outcome",
+        question="Large market",
+        timeframe="4-day",
+        crypto="ELON-TWEETS",
+        condition_id=None,
+        start_ts=0,
+        end_ts=345600,
+        volume=1.0,
+        resolution=None,
+        is_active=False,
+        category="culture",
+        tokens={"Outcome 1": "tok1", "Outcome 2": "tok2"},
     )
 
-    total_ticks = phase.run(
-        [
-            _market("m1", start_ts=0, end_ts=300),
-            _market("m2", start_ts=0, end_ts=300),
-            _market("m3", start_ts=300, end_ts=600),
-        ]
-    )
+    phase.run([m1])
 
-    assert total_ticks == 3
-    assert provider.calls == [
-        (("m1", "m2"), 0, 300),
-        (("m3",), 300, 600),
-    ]
-    assert captured == [(3, str((tmp_path / "data" / "ticks")))]
+    # 345600 / 21600 (6 hours) = 16 chunks
+    assert len(provider.calls) == 16
+    # Verify first and last chunk
+    assert provider.calls[0] == (("m-large",), 0, 21600)
+    assert provider.calls[-1] == (("m-large",), 324000, 345600)

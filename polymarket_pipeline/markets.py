@@ -204,7 +204,11 @@ class MultiOutcomeMarketDefinition(MarketDefinition):
 
 
 def _contains_alias(text: str, aliases: Sequence[str]) -> bool:
-    return any(alias in text for alias in aliases)
+    for alias in aliases:
+        pattern = rf"\b{re.escape(alias)}\b"
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return True
+    return False
 
 
 def _minutes_from_time_range(question: str) -> int | None:

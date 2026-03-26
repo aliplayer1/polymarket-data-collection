@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -148,45 +148,42 @@ class PolygonTickFetcher:
         # Build token_id → market lookup for O(1) dispatch
         token_to_market: dict[str, MarketRecord] = {}
         for m in markets:
-            token_to_market[m.up_token_id] = m
-            token_to_market[m.down_token_id] = m
+            for token_id in m.token_ids:
+                if token_id:
+                    token_to_market[token_id] = m
 
-        raw_logs = self._fetch_logs(start_ts, end_ts)
-        if not raw_logs:
-            return result
-
-        for log in raw_logs:
+        def log_processor(log: dict) -> None:
             # Quick pre-filter: read the first two 32-byte words (maker/taker asset IDs)
-            # before paying the cost of a full _decode_log call.
             data = log.get("data", "")[2:]
             if len(data) < 2 * 64:
-                continue
+                return
             try:
                 maker_asset = str(int(data[0:64], 16))
                 taker_asset = str(int(data[64:128], 16))
             except (ValueError, IndexError):
-                continue
+                return
 
             m = token_to_market.get(maker_asset) or token_to_market.get(taker_asset)
             if m is None:
-                continue
+                return
 
-            tick = self._decode_log(log, m, up_token=m.up_token_id, down_token=m.down_token_id)
+            tick = self._decode_log(log, m)
             if tick is not None:
                 result[m.market_id].append(tick)
+
+        self._fetch_logs_streamed(start_ts, end_ts, log_processor)
 
         for mid, ticks in result.items():
             market = markets_by_id[mid]
             ticks.sort(key=lambda t: t["timestamp_ms"])
-            self.logger.info(
-                "On-chain ticks for market %s: %s fills (%s=%s %s=%s)",
-                mid,
-                len(ticks),
-                market.up_outcome,
-                sum(1 for t in ticks if t["outcome"] == market.up_outcome),
-                market.down_outcome,
-                sum(1 for t in ticks if t["outcome"] == market.down_outcome),
-            )
+            if ticks:
+                self.logger.info(
+                    "On-chain ticks for market %s (%s/%s): %s fills",
+                    mid,
+                    market.crypto,
+                    market.timeframe,
+                    len(ticks),
+                )
 
         return result
 
@@ -196,36 +193,25 @@ class PolygonTickFetcher:
         start_ts: int,
         end_ts: int,
     ) -> list[dict[str, Any]]:
-        """Return a list of trade tick dicts for *both* outcome tokens.
-
-        Each dict has keys:
-            timestamp_ms, market_id, crypto, timeframe, token_id,
-            outcome, side, price, size_usdc, tx_hash, block_number
-        """
-        up_token   = market.up_token_id
-        down_token = market.down_token_id
-
-        raw_logs = self._fetch_logs(start_ts, end_ts)
-        if not raw_logs:
-            self.logger.debug("No on-chain logs found for market %s", market.market_id)
-            return []
-
+        """Return a list of trade tick dicts for all of the market's outcome tokens."""
         ticks: list[dict[str, Any]] = []
-        for log in raw_logs:
-            tick = self._decode_log(log, market, up_token=up_token, down_token=down_token)
+
+        def log_processor(log: dict) -> None:
+            tick = self._decode_log(log, market)
             if tick is not None:
                 ticks.append(tick)
 
+        self._fetch_logs_streamed(start_ts, end_ts, log_processor)
         ticks.sort(key=lambda t: t["timestamp_ms"])
-        self.logger.info(
-            "On-chain ticks for market %s: %s fills (%s=%s %s=%s)",
-            market.market_id,
-            len(ticks),
-            market.up_outcome,
-            sum(1 for t in ticks if t["outcome"] == market.up_outcome),
-            market.down_outcome,
-            sum(1 for t in ticks if t["outcome"] == market.down_outcome),
-        )
+        
+        if ticks:
+            self.logger.info(
+                "On-chain ticks for market %s (%s/%s): %s fills",
+                market.market_id,
+                market.crypto,
+                market.timeframe,
+                len(ticks),
+            )
         return ticks
 
     # ------------------------------------------------------------------
@@ -353,263 +339,165 @@ class PolygonTickFetcher:
     # Log fetching (Polygonscan preferred, direct RPC fallback)
     # ------------------------------------------------------------------
 
-    def _fetch_logs(self, start_ts: int, end_ts: int) -> list[dict]:
+    def _fetch_logs_streamed(self, start_ts: int, end_ts: int, on_log: Callable[[dict], None]) -> bool:
+        """Fetch OrderFilled logs for a time range and stream them to the callback.
+
+        Handles block number estimation and dispatches to Etherscan V2 or RPC.
+        Returns True on success, False if one or more chunks failed permanently.
+        """
         start_block = self._ts_to_block(start_ts)
-        end_block   = self._ts_to_block(end_ts + 30)   # small buffer
+        end_block = self._ts_to_block(end_ts + 30)
 
         if start_block is None or end_block is None:
-            self.logger.error("Could not estimate block range; no RPC available")
-            return []
+            self.logger.error("Could not estimate block range for on-chain ticks")
+            return False
 
-        # Add ±20 block buffer to absorb timestamp estimation errors (~44 s)
+        # Add ±20 block buffer for timestamp jitter
         start_block = max(1, start_block - 20)
-        end_block   = end_block + 20
+        end_block = end_block + 20
 
-        self.logger.debug("Fetching logs for blocks %s–%s", start_block, end_block)
+        self.logger.debug("Streaming logs for blocks %s–%s", start_block, end_block)
 
-        # Prefer Polygonscan for log fetching: Alchemy's free-tier archive
-        # nodes frequently return HTTP 503 / JSON-RPC -32001 ("Unable to
-        # complete request at this time") for cold historical block ranges,
-        # burning ~60-70 s per window in futile retries before falling back.
-        # Polygonscan's free tier handles historical getLogs reliably.
-        #
-        # RPC is kept as a fallback for when Polygonscan is unavailable or
-        # when no Polygonscan key is configured.
         if self.polygonscan_key:
-            logs = self._fetch_logs_polygonscan(start_block, end_block)
-            if logs is not None:
-                return logs
+            success = self._fetch_logs_etherscan_v2_streamed(start_block, end_block, on_log)
+            if success:
+                return True
             if self.rpc_url:
-                self.logger.warning(
-                    "Polygonscan log fetch failed; falling back to RPC "
-                    "(blocks %s–%s)", start_block, end_block,
-                )
+                self.logger.warning("Polygonscan stream failed; falling back to RPC")
 
         if self.rpc_url:
-            logs = self._fetch_logs_rpc(start_block, end_block)
-            if logs is not None:
-                return logs
-            self.logger.error(
-                "RPC log fetch failed; "
-                "returning partial results for blocks %s–%s", start_block, end_block,
-            )
-            return []
+            return self._fetch_logs_rpc_streamed(start_block, end_block, on_log)
 
-        self.logger.error("No RPC URL or Polygonscan key configured; cannot fetch logs")
-        return []
+        self.logger.error("No valid log source (RPC/Polygonscan) available for streaming")
+        return False
 
-    _MAX_RETRIES = 3
-
-    def _etherscan_get(self, params: dict) -> dict | None:
-        """Make an Etherscan V2 GET request with retry on transient errors.
-
-        Returns the parsed JSON dict on success, or ``None`` after exhausting
-        retries.
-        """
-        url = ETHERSCAN_V2_API
-
-        for attempt in range(1, self._MAX_RETRIES + 1):
-            try:
-                resp = self._session.get(url, params=params, timeout=self.timeout)
-                resp.raise_for_status()
-                data = resp.json()
-
-                # Handle application-level rate limits (HTTP 200 with error message)
-                if (
-                    data.get("status") == "0"
-                    and "rate limit" in str(data.get("result", "")).lower()
-                ):
-                    if attempt < self._MAX_RETRIES:
-                        wait = 2**attempt + 2
-                        self.logger.warning(
-                            "Etherscan V2 rate limit hit (3/sec), retrying in %ds",
-                            wait,
-                        )
-                        time.sleep(wait)
-                        continue
-
-                return data
-            except requests.exceptions.HTTPError as exc:
-                # Retry on rate-limit (429) and overload (503) — these are
-                # transient and recoverable after a short wait.
-                status = exc.response.status_code if exc.response is not None else 0
-                if status in (429, 503) and attempt < self._MAX_RETRIES:
-                    wait = 2 ** attempt + 1
-                    self.logger.warning(
-                        "Etherscan %d at %s (attempt %d/%d), retrying in %ds",
-                        status, url, attempt, self._MAX_RETRIES, wait,
-                    )
-                    time.sleep(wait)
-                    continue
-                self.logger.warning("Etherscan HTTP error at %s: %s", url, exc)
-                break
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-                if attempt < self._MAX_RETRIES:
-                    wait = 2 ** attempt
-                    self.logger.warning(
-                        "Etherscan request to %s (attempt %d/%d), retrying in %ds: %s",
-                        url, attempt, self._MAX_RETRIES, wait, exc,
-                    )
-                    time.sleep(wait)
-                else:
-                    self.logger.warning("Etherscan request to %s failed after %d retries: %s", url, self._MAX_RETRIES, exc)
-            except Exception as exc:
-                self.logger.warning("Etherscan request to %s failed: %s", url, exc)
-                break
-        return None
-
-    def _fetch_logs_polygonscan(self, start_block: int, end_block: int) -> list[dict] | None:
-        """Fetch OrderFilled logs via the Etherscan V2 API.
-
-        The CTF Exchange contract emits events for ALL Polymarket trades, so
-        even a small block range can contain thousands of logs.  The API
-        rejects queries where the total result count exceeds 10 000, so
-        we chunk the request into ``POLYGONSCAN_BLOCK_CHUNK``-block segments
-        and paginate within each segment.
-        """
-        return self._fetch_logs_etherscan_v2(start_block, end_block)
-
-    def _fetch_logs_etherscan_v2(
+    def _fetch_logs_etherscan_v2_streamed(
         self,
         start_block: int,
         end_block: int,
-    ) -> list[dict] | None:
-        """Fetch OrderFilled logs from the Etherscan V2 endpoint."""
-        all_logs: list[dict] = []
+        on_log: Callable[[dict], None],
+    ) -> bool:
         cur = start_block
-
         while cur <= end_block:
             chunk_end = min(cur + self.POLYGONSCAN_BLOCK_CHUNK - 1, end_block)
             page = 1
-
             while True:
                 params = {
-                    "chainid":    POLYGON_CHAIN_ID,
-                    "module":     "logs",
-                    "action":     "getLogs",
-                    "address":    CTF_EXCHANGE_ADDRESS,
-                    "topic0":     ORDER_FILLED_TOPIC,
-                    "fromBlock":  cur,
-                    "toBlock":    chunk_end,
-                    "page":       page,
-                    "offset":     self.POLYGONSCAN_LOG_LIMIT,
-                    "apikey":     self.polygonscan_key,
+                    "chainid": POLYGON_CHAIN_ID,
+                    "module": "logs",
+                    "action": "getLogs",
+                    "address": CTF_EXCHANGE_ADDRESS,
+                    "topic0": ORDER_FILLED_TOPIC,
+                    "fromBlock": cur,
+                    "toBlock": chunk_end,
+                    "page": page,
+                    "offset": self.POLYGONSCAN_LOG_LIMIT,
+                    "apikey": self.polygonscan_key,
                 }
                 self._rate_limit_etherscan()
                 data = self._etherscan_get(params)
                 if data is None:
-                    return None
+                    return False
 
                 status = str(data.get("status"))
                 if status != "1":
                     msg = data.get("message", "")
-                    result_text = str(data.get("result", ""))[:200]
                     if msg == "No records found":
                         break
-                    self.logger.warning(
-                        "Etherscan V2 getLogs error (blocks %s–%s): %s (result: %s)",
-                        cur, chunk_end, msg, result_text,
-                    )
-                    return None
+                    return False
 
                 logs = data.get("result", [])
-                all_logs.extend(logs)
+                for log in logs:
+                    on_log(log)
+
                 if len(logs) < self.POLYGONSCAN_LOG_LIMIT:
                     break
                 page += 1
-                # Etherscan hard cap: page * offset <= 10 000
                 if page * self.POLYGONSCAN_LOG_LIMIT > 10_000:
-                    self.logger.debug("Etherscan V2 pagination cap reached for blocks %s–%s", cur, chunk_end)
                     break
-
             cur = chunk_end + 1
+        return True
 
-        return all_logs
-
-    def _fetch_logs_rpc(self, start_block: int, end_block: int) -> list[dict] | None:
-        """Fetch OrderFilled logs via eth_getLogs in chunked block ranges.
-
-        The chunk size starts at RPC_LOG_CHUNK_BLOCKS and halves automatically
-        when the node signals a result-count overflow (Alchemy -32005 /
-        "query returned more than 10 000 results").  This lets the static
-        default be conservative while gracefully handling peak-traffic blocks.
-
-        Returns ``None`` (instead of an empty list) when one or more blocks had
-        to be skipped due to persistent RPC failures, so the caller can fall
-        back to Polygonscan rather than silently returning incomplete data.
-        """
-        if not self.rpc_url:
-            self.logger.error("No RPC URL configured; cannot fetch on-chain ticks")
-            return None
-
-        all_logs: list[dict] = []
+    def _fetch_logs_rpc_streamed(
+        self,
+        start_block: int,
+        end_block: int,
+        on_log: Callable[[dict], None],
+    ) -> bool:
         cur = start_block
         had_failure = False
-
         while cur <= end_block:
             chunk = self.RPC_LOG_CHUNK_BLOCKS
-            # Try with the current chunk size; halve on overflow, give up after
-            # 4 halvings (chunk shrinks to 1 block at minimum).
             for _ in range(4):
                 chunk_end = min(cur + chunk - 1, end_block)
                 self._rate_limit_rpc_logs()
                 try:
                     logs = self._rpc("eth_getLogs", {
                         "fromBlock": hex(cur),
-                        "toBlock":   hex(chunk_end),
-                        "address":   CTF_EXCHANGE_ADDRESS,
-                        "topics":    [ORDER_FILLED_TOPIC],
+                        "toBlock": hex(chunk_end),
+                        "address": CTF_EXCHANGE_ADDRESS,
+                        "topics": [ORDER_FILLED_TOPIC],
                     })
-                except Exception as exc:
-                    self.logger.warning("eth_getLogs failed (blocks %s–%s): %s", cur, chunk_end, self._sanitize_exc(exc))
+                except Exception:
                     logs = None
 
                 if logs is None:
-                    # _rpc() returns None for sustained 429/503 (already backed
-                    # off internally) OR for -32005 overflow.  Try a narrower
-                    # range before giving up.
                     if chunk > 1:
                         chunk = max(1, chunk // 2)
-                        self.logger.debug(
-                            "eth_getLogs overflow or error (blocks %s–%s); "
-                            "halving chunk to %d blocks and retrying.",
-                            cur, chunk_end, chunk,
-                        )
                         continue
-                    self.logger.warning(
-                        "eth_getLogs still failing at chunk=1 (blocks %s–%s); skipping.",
-                        cur, chunk_end,
-                    )
                     had_failure = True
-                    chunk_end = cur  # advance by 1 block to avoid infinite loop
+                    chunk_end = cur
                     break
 
-                if logs:
-                    all_logs.extend(logs)
-                break  # success — advance to the next chunk
-
+                for log in logs:
+                    on_log(log)
+                break
             cur = chunk_end + 1
+        return not had_failure
 
-        # Return None when blocks were skipped so _fetch_logs can fall back to
-        # Polygonscan rather than returning silently incomplete data.
-        return None if had_failure else all_logs
+    _MAX_RETRIES = 3
 
-    # ------------------------------------------------------------------
-    # Log decoding
-    # ------------------------------------------------------------------
+    def _etherscan_get(self, params: dict) -> dict | None:
+        """Make an Etherscan V2 GET request with retry on transient errors."""
+        url = ETHERSCAN_V2_API
+        for attempt in range(1, self._MAX_RETRIES + 1):
+            try:
+                resp = self._session.get(url, params=params, timeout=self.timeout)
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("status") == "0" and "rate limit" in str(data.get("result", "")).lower():
+                    if attempt < self._MAX_RETRIES:
+                        wait = 2**attempt + 2
+                        self.logger.warning("Etherscan V2 rate limit hit (3/sec), retrying in %ds", wait)
+                        time.sleep(wait)
+                        continue
+                return data
+            except requests.exceptions.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else 0
+                if status in (429, 503) and attempt < self._MAX_RETRIES:
+                    wait = 2 ** attempt + 1
+                    self.logger.warning("Etherscan %d (attempt %d/%d), retrying in %ds", status, attempt, self._MAX_RETRIES, wait)
+                    time.sleep(wait)
+                    continue
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                if attempt < self._MAX_RETRIES:
+                    wait = 2 ** attempt
+                    self.logger.warning("Etherscan attempt %d/%d failed, retrying: %s", attempt, self._MAX_RETRIES, exc)
+                    time.sleep(wait)
+                else:
+                    break
+            except Exception:
+                break
+        return None
 
     def _decode_log(
         self,
         log: dict,
         market: MarketRecord,
-        up_token: str,
-        down_token: str,
     ) -> dict[str, Any] | None:
         """Decode one OrderFilled log into a tick dict, or None if irrelevant."""
         try:
-            # data = 5 × 32-byte words:
-            #   [0] makerAssetId   [1] takerAssetId   [2] makerAmountFilled
-            #   [3] takerAmountFilled   [4] fee
             data = log.get("data", "")[2:]
             if len(data) < 5 * 64:
                 return None
@@ -620,58 +508,39 @@ class PolygonTickFetcher:
             maker_asset_s = str(maker_asset)
             taker_asset_s = str(taker_asset)
 
-            if maker_asset_s == up_token:
-                outcome_side, side = "up", "SELL"
+            outcome_side = market.side_for_token_id(maker_asset_s)
+            if outcome_side is not None:
+                side = "SELL"
                 outcome_amt_raw = maker_amt_raw
-                usdc_amt_raw    = taker_amt_raw
-            elif taker_asset_s == up_token:
-                outcome_side, side = "up", "BUY"
-                outcome_amt_raw = taker_amt_raw
-                usdc_amt_raw    = maker_amt_raw
-            elif maker_asset_s == down_token:
-                outcome_side, side = "down", "SELL"
-                outcome_amt_raw = maker_amt_raw
-                usdc_amt_raw    = taker_amt_raw
-            elif taker_asset_s == down_token:
-                outcome_side, side = "down", "BUY"
-                outcome_amt_raw = taker_amt_raw
-                usdc_amt_raw    = maker_amt_raw
+                usdc_amt_raw = taker_amt_raw
             else:
-                return None   # trade is for a different market
+                outcome_side = market.side_for_token_id(taker_asset_s)
+                if outcome_side is not None:
+                    side = "BUY"
+                    outcome_amt_raw = taker_amt_raw
+                    usdc_amt_raw = maker_amt_raw
+                else:
+                    return None
 
-            # Amounts are in units of 1e6 (USDC has 6 decimals)
-            usdc_size    = usdc_amt_raw / 1_000_000
+            usdc_size = usdc_amt_raw / 1_000_000
             outcome_size = outcome_amt_raw / 1_000_000
-
             if outcome_size <= 0 or usdc_size <= 0:
                 return None
 
-            price = usdc_size / outcome_size       # USDC per share = probability
-
+            price = usdc_size / outcome_size
             if not (0.001 <= price <= 0.999):
                 return None
 
-            # Block timestamp (Polygonscan returns decimal string; RPC returns hex)
             raw_ts = log.get("timeStamp") or log.get("timestamp", "0x0")
-            if isinstance(raw_ts, str) and raw_ts.startswith("0x"):
-                block_ts = int(raw_ts, 16)
-            else:
-                block_ts = int(raw_ts)
+            block_ts = int(raw_ts, 16) if isinstance(raw_ts, str) and raw_ts.startswith("0x") else int(raw_ts)
 
             block_num = log.get("blockNumber", "0x0")
-            if isinstance(block_num, str) and block_num.startswith("0x"):
-                block_num = int(block_num, 16)
-            else:
-                block_num = int(block_num)
+            block_num = int(block_num, 16) if isinstance(block_num, str) and block_num.startswith("0x") else int(block_num)
 
             log_idx = log.get("logIndex", "0x0")
-            if isinstance(log_idx, str) and log_idx.startswith("0x"):
-                log_idx_int = int(log_idx, 16)
-            else:
-                log_idx_int = int(log_idx)
+            log_idx_int = int(log_idx, 16) if isinstance(log_idx, str) and log_idx.startswith("0x") else int(log_idx)
 
             token_id = market.token_id_for_side(outcome_side)
-
             return build_binary_tick_row(
                 market,
                 timestamp_ms=block_ts * 1000,
@@ -685,8 +554,7 @@ class PolygonTickFetcher:
                 log_index=log_idx_int,
                 source="onchain",
             )
-        except Exception as exc:
-            self.logger.debug("Failed to decode log: %s  log=%s", exc, str(log)[:120])
+        except Exception:
             return None
 
     # ------------------------------------------------------------------

@@ -39,25 +39,39 @@ class TickBackfillPhase:
             )
             return 0
 
+        # Max window size for a single on-chain log query (6 hours).
+        # Larger windows (e.g. 4-day culture markets) will be chunked.
+        MAX_WINDOW_SECONDS = 6 * 3600
+
         windows: dict[tuple[int, int], list[MarketRecord]] = defaultdict(list)
         for market in markets:
             window_seconds = TIMEFRAME_SECONDS.get(market.timeframe, 300)
+            # Fetch at most the last timeframe's worth of ticks
             win_start = max(market.start_ts, market.end_ts - window_seconds)
-            windows[(win_start, market.end_ts)].append(market)
+            
+            # Chunk the window if it exceeds MAX_WINDOW_SECONDS
+            current_start = win_start
+            while current_start < market.end_ts:
+                current_end = min(current_start + MAX_WINDOW_SECONDS, market.end_ts)
+                windows[(current_start, current_end)].append(market)
+                current_start = current_end
 
         tick_flush_every = 5
         total_ticks = 0
         pending_ticks: list[dict] = []
         n_windows = len(windows)
+        
+        # Sort windows by start time to keep log output chronological
+        sorted_windows = sorted(windows.items(), key=lambda x: x[0][0])
 
-        for index, ((win_start, win_end), window_markets) in enumerate(windows.items(), 1):
+        for index, ((win_start, win_end), window_markets) in enumerate(sorted_windows, 1):
             self.logger.info(
                 "[%d/%d] Fetching on-chain ticks for window %s–%s (%s)",
                 index,
                 n_windows,
                 win_start,
                 win_end,
-                ", ".join(f"{market.crypto}/{market.timeframe}" for market in window_markets),
+                ", ".join(set(f"{market.crypto}/{market.timeframe}" for market in window_markets)),
             )
             try:
                 batch = self.tick_provider.get_ticks_for_markets_batch(

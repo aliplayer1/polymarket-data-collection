@@ -90,9 +90,15 @@ The runtime is strictly partitioned to maintain isolation between heavily standa
 
 4. **Pipeline phases** (`polymarket_pipeline/pipeline.py`, `polymarket_pipeline/phases/`)  
    - `PriceHistoryPhase`: Fetches OHLC data from Gamma/CLOB asynchronously across all mapped tokens.
-   - `TickBackfillPhase`: Scans Polygon RPC for trade logs involving any active token map.
+   - `TickBackfillPhase`: Scans Polygon RPC for trade logs. Automatically **chunks large windows** (e.g. 4-day culture markets) into 6-hour segments to ensure memory stability and RPC reliability.
    - `RTDSStreamPhase`: Manages Binance spot prices (Gracefully skipped with `NULL` columns for non-crypto assets).
    - `WebSocketPhase`: Streams live Polymarket trade events.
+
+### Advanced Data Reliability
+
+- **Precise Market Matching**: Uses regex word boundaries (`\b`) for asset identification. This prevents substring false positives (e.g., "synthetic" incorrectly matching "ETH") and ensures "random" tokens are never erroneously collected.
+- **Streaming Tick Collection**: The `PolygonTickFetcher` uses a memory-efficient callback pattern to process on-chain logs. Events are decoded and filtered as they are streamed from RPC/Etherscan chunks, preventing OOM errors even during high-volume historical backfills.
+- **Culture Data Hub**: Culture-specific data (e.g., Elon Musk tweets) is automatically isolated in `data-culture/` and uploaded to a dedicated Hugging Face repository (`HF_CULTURE_REPO_ID`).
 
 ### Extending Supported Markets
 

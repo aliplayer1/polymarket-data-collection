@@ -466,6 +466,7 @@ class PolymarketDataPipeline:
         elif options.upload:
             self.logger.info("Uploading dataset to Hugging Face Hub...")
             try:
+                # 1. Upload main crypto dataset
                 upload_to_huggingface(
                     repo_id=self.settings.hf_repo,
                     markets_path=self._parquet_markets_path,
@@ -474,9 +475,23 @@ class PolymarketDataPipeline:
                     logger=self.logger,
                     skip_consolidate=True,
                 )
+                
+                # 2. Upload culture dataset (if it exists)
+                from .config import HF_CULTURE_REPO_ID
+                culture_root = self.paths.data_dir.parent / "data-culture"
+                if culture_root.exists():
+                    self.logger.info("Uploading culture dataset to Hugging Face...")
+                    upload_to_huggingface(
+                        repo_id=os.environ.get("HF_CULTURE_REPO_ID", HF_CULTURE_REPO_ID),
+                        markets_path=str(culture_root / "markets.parquet"),
+                        prices_dir=str(culture_root / "prices"),
+                        ticks_dir=str(culture_root / "ticks"),
+                        logger=self.logger,
+                        skip_consolidate=False,
+                    )
             except Exception as exc:
                 self.logger.error("Hugging Face upload failed (non-fatal): %s", exc)
-                self.logger.info("Continuing to WebSocket streaming despite upload failure.")
+                self.logger.info("Continuing despite upload failure.")
 
         if options.is_test:
             self._print_test_report()

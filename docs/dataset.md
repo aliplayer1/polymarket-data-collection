@@ -40,13 +40,16 @@ For active markets, every incoming WebSocket `trade` event is stored as a tick w
 | `market_id` | string | Foreign key to markets table |
 | `timestamp_ms` | int64 | Fill timestamp in epoch milliseconds |
 | `token_id` | string | ERC-1155 outcome token ID |
-| `outcome` | dict(int8→string) | `"Up"` or `"Down"` |
+| `outcome` | dict(int8→string) | Outcome name (e.g. `"Up"`, `"Down"`, or culture label) |
 | `side` | dict(int8→string) | `"BUY"` or `"SELL"` (taker perspective) |
 | `price` | float32 | Fill price in [0, 1] |
 | `size_usdc` | float32 | USDC notional of the fill |
 | `tx_hash` | string | On-chain transaction hash (`""` for WebSocket ticks) |
 | `block_number` | int32 | Polygon block number (`0` for WebSocket ticks) |
 | `source` | dict(int8→string) | `"onchain"` or `"websocket"` |
+| `spot_price_usdt` | float32 | BTC/ETH/SOL spot price (USDT) from RTDS Binance feed |
+| `spot_price_ts_ms` | int64 | Binance timestamp of the spot price snapshot |
+| `category` | string | `"crypto"` or `"culture"` |
 
 Deduplication is applied on `(market_id, timestamp_ms, token_id, tx_hash)` so re-running the pipeline is safe.
 
@@ -219,6 +222,9 @@ Active markets are monitored over a WebSocket connection (`ws-subscriptions-clob
 - **Even shard distribution** — Token IDs are shuffled before WebSocket sharding so high-volume tokens (sorted first by `volume24hr`) spread evenly across all shards instead of concentrating in the first one or two connections.
 - **Parallel initial price fetch** — On `--websocket-only` startup, last-known prices for ~3,000 active tokens are fetched via a `ThreadPoolExecutor(max_workers=20)` instead of sequentially, reducing startup latency significantly.
 - **Price validation** — Out-of-range prices (outside [0, 1]) are filtered during fetch and logged as warnings.
-- **Incremental scan checkpoint** — After each completed closed-market scan, the pipeline writes `data/.scan_checkpoint` with the highest `end_ts` seen. On subsequent runs this is read automatically and the market scan stops as soon as it reaches pages older than `checkpoint − 2 days`. The initial full scan takes ~60 s; every 6-hourly run after that takes 2–5 s. Pass `--from-date YYYY-MM-DD` to override the cutoff manually. The checkpoint is saved incrementally every 500 markets so an interrupted scan retains partial progress.
+- **Streaming log processing** — The on-chain tick fetcher decodes and filters events as they are streamed in small chunks from Etherscan/RPC. This prevents the memory spikes (OOM) that previously occurred when collecting millions of logs for high-volume contracts.
+- **Automatic window chunking** — For markets with large timeframes (e.g. 4-day culture markets), the backfill window is automatically split into 6-hour segments. This ensures stable collection and avoids JSON-RPC timeouts on long-running queries.
+- **Precise word-boundary matching** — Asset identification uses regex boundaries (`\beth\b`) to eliminate substring false positives (e.g., "synthetic" matching "ETH") and ensure data integrity.
+- **Incremental scan checkpoint** — After each completed closed-market scan...
 - **Non-fatal HF uploads** — Errors during Hugging Face Hub uploads are caught and logged as warnings rather than crashing the service, ensuring transient network or auth issues do not interrupt data collection.
 - **Daily market re-discovery** — The WebSocket service subscribes to markets found at startup and does not re-scan while running. The `polymarket-restart.timer` restarts `polymarket-websocket.service` daily at 00:05 UTC so newly-created markets are picked up within 24 hours.

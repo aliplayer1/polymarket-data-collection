@@ -57,19 +57,42 @@ def test_normalize_gamma_market_supports_outcomes_clob_ids_schema() -> None:
     assert market.down_outcome == "No"
 
 
-def test_normalize_gamma_market_returns_none_for_unknown_market_family() -> None:
+def test_normalize_gamma_market_avoids_substring_false_positives() -> None:
+    # "synthetic" contains "eth", but it should NOT match the ETH asset alias "eth"
+    # because of the word boundary regex in _contains_alias.
     raw_market = {
-        "id": "m3",
-        "question": "Will it rain tomorrow?",
+        "id": "m4",
+        "question": "Will Synthetic Assets be up or down at 5PM ET?",
         "startDate": "2026-03-08T10:00:00Z",
         "endDate": "2026-03-08T10:05:00Z",
         "closed": True,
         "tokens": [
-            {"outcome": "Yes", "tokenId": "tok-yes"},
-            {"outcome": "No", "tokenId": "tok-no"},
+            {"outcome": "Up", "tokenId": "tok-up"},
+            {"outcome": "Down", "tokenId": "tok-down"},
         ],
     }
 
     market = normalize_gamma_market(raw_market, is_active=False, logger=logging.getLogger("test"))
 
+    # Should be None because although it has "up or down", it does NOT have a valid asset (BTC/ETH/SOL)
     assert market is None
+
+
+def test_normalize_gamma_market_matches_exact_asset_word() -> None:
+    # "ETH" as a standalone word SHOULD match.
+    raw_market = {
+        "id": "m5",
+        "question": "Will ETH be up or down at 5PM ET?",
+        "startDate": "2026-03-08T10:00:00Z",
+        "endDate": "2026-03-08T10:05:00Z",
+        "closed": True,
+        "tokens": [
+            {"outcome": "Up", "tokenId": "tok-up"},
+            {"outcome": "Down", "tokenId": "tok-down"},
+        ],
+    }
+
+    market = normalize_gamma_market(raw_market, is_active=False, logger=logging.getLogger("test"))
+
+    assert market is not None
+    assert market.crypto == "ETH"
