@@ -272,22 +272,25 @@ class WebSocketPhase:
                                     "category": market.category,
                                 })
                                 
-                            tick_buffer[market.timeframe].append(
-                                build_binary_tick_row(
-                                    market,
-                                    timestamp_ms=timestamp_ms,
-                                    token_id=token_id,
-                                    outcome_side=outcome_side,
-                                    trade_side=trade_side,
-                                    price=price,
-                                    size_usdc=size_usdc,
-                                    tx_hash=str(event.get("hash") or event.get("tx_hash") or ""),
-                                    block_number=0,
-                                    log_index=0,
-                                    source="websocket",
-                                    **self._spot_price_kwargs(market.crypto),
+                            # Skip live tick collection for "culture" markets to match the
+                            # historical backfill policy (focus on share prices only).
+                            if market.category != "culture":
+                                tick_buffer[market.timeframe].append(
+                                    build_binary_tick_row(
+                                        market,
+                                        timestamp_ms=timestamp_ms,
+                                        token_id=token_id,
+                                        outcome_side=outcome_side,
+                                        trade_side=trade_side,
+                                        price=price,
+                                        size_usdc=size_usdc,
+                                        tx_hash=str(event.get("hash") or event.get("tx_hash") or ""),
+                                        block_number=0,
+                                        log_index=0,
+                                        source="websocket",
+                                        **self._spot_price_kwargs(market.crypto),
+                                    )
                                 )
-                            )
 
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise

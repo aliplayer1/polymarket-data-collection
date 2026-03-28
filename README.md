@@ -1,6 +1,6 @@
 # Polymarket Data Pipeline
 
-Modular pipeline for collecting historical and real-time Polymarket prediction market data, with normalised Parquet storage and Hugging Face Hub integration. The dataset targets Polymarket crypto up/down markets and multi-outcome culture events (e.g. Elon Musk Tweets). The market-matching/parsing logic is completely centralized and driven by a generic dictionary model (`MarketRecord`), meaning any new binary or multi-outcome event can be seamlessly supported with localized definition updates.
+Modular pipeline for collecting historical and real-time Polymarket prediction market data, with normalised Parquet storage and Hugging Face Hub integration. The dataset targets Polymarket crypto up/down markets (BTC, ETH, SOL, BNB, XRP, DOGE, HYPE) and multi-outcome culture events (e.g. Elon Musk Tweets). The market-matching/parsing logic is completely centralized and driven by a generic dictionary model (`MarketRecord`), meaning any new binary or multi-outcome event can be seamlessly supported with localized definition updates.
 
 ---
 
@@ -23,7 +23,8 @@ Create and activate a virtual environment, then install dependencies:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+# Note: On Ubuntu 24.04 (PEP 668), always use the venv's pip path
+./.venv/bin/pip install -r requirements.txt
 ```
 
 **Windows (PowerShell):**
@@ -47,7 +48,7 @@ cp .env.example .env
 ```bash
 # First-time setup
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+./.venv/bin/pip install -r requirements.txt
 cp .env.example .env   # then fill in your keys
 
 # Full pipeline (1. Historical market scan + price history -> 2. Tick Backfill -> 3. Hugging Face Upload -> 4. Live WebSocket)
@@ -60,7 +61,8 @@ cp .env.example .env   # then fill in your keys
 .venv/bin/python -m polymarket_pipeline --historical-only
 
 # Filter by asset / timeframe (works for Crypto or Culture datasets)
-.venv/bin/python -m polymarket_pipeline --historical-only --crypto BTC ETH ELON-TWEETS --timeframe 15m 1h 7-day
+# Supports BTC, ETH, SOL, BNB, XRP, DOGE, HYPE, and ELON-TWEETS
+.venv/bin/python -m polymarket_pipeline --historical-only --crypto BTC ETH ELON-TWEETS --timeframe 15m 1h 7-day 1-month
 
 # Write to a specific directory and log to file
 .venv/bin/python -m polymarket_pipeline \
@@ -90,13 +92,14 @@ The runtime is strictly partitioned to maintain isolation between heavily standa
 
 4. **Pipeline phases** (`polymarket_pipeline/pipeline.py`, `polymarket_pipeline/phases/`)  
    - `PriceHistoryPhase`: Fetches OHLC data from Gamma/CLOB asynchronously across all mapped tokens.
-   - `TickBackfillPhase`: Scans Polygon RPC for trade logs. Automatically **chunks large windows** (e.g. 4-day culture markets) into 6-hour segments to ensure memory stability and RPC reliability.
+   - `TickBackfillPhase`: Scans Polygon RPC for trade logs. Automatically **chunks large windows** (e.g. 4-day/7-day/1-month culture markets) into 6-hour segments to ensure memory stability and RPC reliability.
    - `RTDSStreamPhase`: Manages Binance spot prices (Gracefully skipped with `NULL` columns for non-crypto assets).
-   - `WebSocketPhase`: Streams live Polymarket trade events.
+   - `WebSocketPhase`: Streams live Polymarket trade events. Features crash-resilient `category` handling for "Culture" markets.
 
 ### Advanced Data Reliability
 
 - **Precise Market Matching**: Uses regex word boundaries (`\b`) for asset identification. This prevents substring false positives (e.g., "synthetic" incorrectly matching "ETH") and ensures "random" tokens are never erroneously collected.
+- **Dynamic Timeframe Parsing**: Support for variable date ranges (e.g., "March 27 to April 3") and month-based ranges (e.g., "in April 2026") using advanced regex normalization in `markets.py`.
 - **Streaming Tick Collection**: The `PolygonTickFetcher` uses a memory-efficient callback pattern to process on-chain logs. Events are decoded and filtered as they are streamed from RPC/Etherscan chunks, preventing OOM errors even during high-volume historical backfills.
 - **Culture Data Hub**: Culture-specific data (e.g., Elon Musk tweets) is automatically isolated in `data-culture/` and uploaded to a dedicated Hugging Face repository (`HF_CULTURE_REPO_ID`).
 

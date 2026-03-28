@@ -39,6 +39,22 @@ class TickBackfillPhase:
             )
             return 0
 
+        # Performance optimization: skip on-chain backfill for "culture" markets.
+        # These markets (e.g. Elon Musk tweets) have many tokens and long durations,
+        # making historical log scans extremely slow. We still collect their
+        # share prices (OHLC) via the PriceHistoryPhase.
+        original_count = len(markets)
+        markets = [m for m in markets if m.category != "culture"]
+        if len(markets) < original_count:
+            self.logger.info(
+                "Skipping on-chain tick backfill for %d 'culture' markets; "
+                "share price (OHLC) history will still be collected.",
+                original_count - len(markets),
+            )
+
+        if not markets:
+            return 0
+
         # Max window size for a single on-chain log query (6 hours).
         # Larger windows (e.g. 4-day culture markets) will be chunked.
         MAX_WINDOW_SECONDS = 6 * 3600
