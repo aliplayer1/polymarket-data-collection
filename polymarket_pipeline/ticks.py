@@ -73,21 +73,17 @@ class PolygonTickFetcher:
     # Alchemy enforces a 10 000-result cap per call.  The CTF Exchange emits
     # OrderFilled events for *all* Polymarket markets, so the aggregate rate is
     # ~700–1 500 events/block.  25 blocks ≈ 17 000–37 500 events at peak, which
-    # can exceed the cap.  We use 10 blocks as a safe static default (Alchemy 
-    # Free tier maximum) and halve adaptively when the node signals an overflow 
-    # (see _fetch_logs_rpc).
+    # can exceed the cap.  We use 10 blocks as a safe static default for the
+    # Alchemy Free tier (which enforces a strict 10-block range limit).
     RPC_LOG_CHUNK_BLOCKS  = 10
 
     # Minimum gap between any two Etherscan V2 API calls (3 req/s limit).
-    # 0.5 s gives 2 req/s, providing safety headroom for the 3/sec cap
-    # enforced on the Polygonscan V2 free tier.
-    _ETHERSCAN_MIN_INTERVAL = 0.5
+    # 0.4 s gives 2.5 req/s, providing safety headroom for the 3/sec cap
+    _ETHERSCAN_MIN_INTERVAL = 0.4
 
     # Minimum gap between eth_getLogs RPC calls on Alchemy free tier.
-    # eth_getLogs costs 75 CU; free tier throughput is 500 CU/s → max 6.67 calls/s.
-    # 0.5 s gives 2 calls/s × 75 CU = 150 CU/s, leaving 70% headroom to avoid
-    # sustained HTTP 503 "node overload" errors.
-    _RPC_LOGS_MIN_INTERVAL = 0.5
+    # 0.2 s gives 5 calls/s, which fits within Alchemy free tier throughput.
+    _RPC_LOGS_MIN_INTERVAL = 0.2
 
     def __init__(
         self,
@@ -104,6 +100,11 @@ class PolygonTickFetcher:
         self._block_cache: dict[int, int] = {}  # ts → block number
         self._last_etherscan_ts: float = 0.0    # global rate-limit tracker
         self._last_rpc_logs_ts: float = 0.0       # rate-limit tracker for eth_getLogs
+        
+        import threading
+        self._etherscan_lock = threading.Lock()
+        self._rpc_logs_lock = threading.Lock()
+        self._block_cache_lock = threading.Lock()
 
     @property
     def _masked_rpc_url(self) -> str:
@@ -219,21 +220,14 @@ class PolygonTickFetcher:
     # ------------------------------------------------------------------
 
     def _ts_to_block(self, target_ts: int) -> int | None:
-        """Convert a Unix timestamp to the nearest Polygon block number.
-
-        Results are cached so repeated lookups for the same timestamp
-        (common when multiple markets share the same time window) are free.
-
-        Tries Polygonscan ``getblocknobytime`` first (single HTTP call, exact),
-        then falls back to a binary-search over JSON-RPC if an *rpc_url* is
-        configured.
-        """
-        if target_ts in self._block_cache:
-            return self._block_cache[target_ts]
+        with self._block_cache_lock:
+            if target_ts in self._block_cache:
+                return self._block_cache[target_ts]
 
         block = self._ts_to_block_uncached(target_ts)
         if block is not None:
-            self._block_cache[target_ts] = block
+            with self._block_cache_lock:
+                self._block_cache[target_ts] = block
         return block
 
     def _ts_to_block_uncached(self, target_ts: int) -> int | None:
@@ -279,10 +273,11 @@ class PolygonTickFetcher:
         requests must call this *before* issuing the HTTP request so that
         ``getblocknobytime`` and ``getLogs`` share a single global token bucket.
         """
-        elapsed = time.time() - self._last_etherscan_ts
-        if elapsed < self._ETHERSCAN_MIN_INTERVAL:
-            time.sleep(self._ETHERSCAN_MIN_INTERVAL - elapsed)
-        self._last_etherscan_ts = time.time()
+        with self._etherscan_lock:
+            elapsed = time.time() - self._last_etherscan_ts
+            if elapsed < self._ETHERSCAN_MIN_INTERVAL:
+                time.sleep(self._ETHERSCAN_MIN_INTERVAL - elapsed)
+            self._last_etherscan_ts = time.time()
 
     def _rate_limit_rpc_logs(self) -> None:
         """Block until at least _RPC_LOGS_MIN_INTERVAL seconds have passed since
@@ -290,10 +285,11 @@ class PolygonTickFetcher:
         (75 CU each) so must be paced separately from cheap calls like
         eth_getBlockByNumber (16 CU each).
         """
-        elapsed = time.time() - self._last_rpc_logs_ts
-        if elapsed < self._RPC_LOGS_MIN_INTERVAL:
-            time.sleep(self._RPC_LOGS_MIN_INTERVAL - elapsed)
-        self._last_rpc_logs_ts = time.time()
+        with self._rpc_logs_lock:
+            elapsed = time.time() - self._last_rpc_logs_ts
+            if elapsed < self._RPC_LOGS_MIN_INTERVAL:
+                time.sleep(self._RPC_LOGS_MIN_INTERVAL - elapsed)
+            self._last_rpc_logs_ts = time.time()
 
     def _ts_to_block_polygonscan(self, target_ts: int) -> int | None:
         """Use the Etherscan V2 ``getblocknobytime`` endpoint to convert a Unix

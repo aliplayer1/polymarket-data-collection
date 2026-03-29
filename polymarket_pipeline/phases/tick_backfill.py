@@ -77,8 +77,14 @@ class TickBackfillPhase:
         
         # Sort windows by start time to keep log output chronological
         sorted_windows = sorted(windows.items(), key=lambda x: x[0][0])
-
-        for index, ((win_start, win_end), window_markets) in enumerate(sorted_windows, 1):
+        
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        total_ticks = 0
+        total_ticks_lock = threading.Lock()
+        
+        def process_window(index: int, win_start: int, win_end: int, window_markets: list[MarketRecord]) -> list[dict]:
             self.logger.info(
                 "[%d/%d] Fetching on-chain ticks for window %s–%s (%s)",
                 index,
@@ -93,13 +99,17 @@ class TickBackfillPhase:
                     win_start,
                     win_end,
                 )
+                window_ticks = []
                 for market in window_markets:
                     ticks = batch.get(market.market_id, [])
                     if not ticks:
                         continue
-                    pending_ticks.extend(ticks)
-                    total_ticks += len(ticks)
+                    window_ticks.extend(ticks)
+                    with total_ticks_lock:
+                        nonlocal total_ticks
+                        total_ticks += len(ticks)
                     self.logger.info("  -> %s %s: %s fills", market.crypto, market.timeframe, len(ticks))
+                return window_ticks
             except Exception as exc:
                 self.logger.error(
                     "Failed on-chain tick fetch for window %s–%s: %s",
@@ -107,39 +117,54 @@ class TickBackfillPhase:
                     win_end,
                     exc,
                 )
+                return []
 
-            if pending_ticks and (index % tick_flush_every == 0 or index == n_windows):
-                ticks_df = pd.DataFrame(pending_ticks)
+        pending_ticks: list[dict] = []
+        
+        # Use a ThreadPoolExecutor to process windows in parallel.
+        # This allows hitting both RPC and Etherscan rate limits concurrently.
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(process_window, i, ws, we, wm) 
+                for i, ((ws, we), wm) in enumerate(sorted_windows, 1)
+            ]
+            
+            for i, future in enumerate(as_completed(futures), 1):
+                pending_ticks.extend(future.result())
                 
-                if "category" in ticks_df.columns:
-                    culture_mask = ticks_df["category"] == "culture"
-                    crypto_df = ticks_df[~culture_mask].drop(columns=["category"], errors="ignore")
-                    culture_df = ticks_df[culture_mask].drop(columns=["category"], errors="ignore")
-                else:
-                    crypto_df = ticks_df
-                    culture_df = pd.DataFrame()
+                # Periodically flush to disk to keep memory usage low
+                if pending_ticks and (i % tick_flush_every == 0 or i == n_windows):
+                    ticks_df = pd.DataFrame(pending_ticks)
+                    
+                    if "category" in ticks_df.columns:
+                        culture_mask = ticks_df["category"] == "culture"
+                        crypto_df = ticks_df[~culture_mask].drop(columns=["category"], errors="ignore")
+                        culture_df = ticks_df[culture_mask].drop(columns=["category"], errors="ignore")
+                    else:
+                        crypto_df = ticks_df
+                        culture_df = pd.DataFrame()
 
-                if not crypto_df.empty:
-                    append_ticks_only(
-                        crypto_df,
-                        ticks_dir=str(self.paths.ticks_dir),
-                        logger=self.logger,
-                    )
-                if not culture_df.empty:
-                    data_culture_dir = self.paths.data_dir.parent / "data-culture"
-                    append_ticks_only(
-                        culture_df,
-                        ticks_dir=str(data_culture_dir / "ticks"),
-                        logger=self.logger,
-                    )
+                    if not crypto_df.empty:
+                        append_ticks_only(
+                            crypto_df,
+                            ticks_dir=str(self.paths.ticks_dir),
+                            logger=self.logger,
+                        )
+                    if not culture_df.empty:
+                        data_culture_dir = self.paths.data_dir.parent / "data-culture"
+                        append_ticks_only(
+                            culture_df,
+                            ticks_dir=str(data_culture_dir / "ticks"),
+                            logger=self.logger,
+                        )
 
-                self.logger.info(
-                    "Flushed %d ticks to disk (window %d/%d)",
-                    len(pending_ticks),
-                    index,
-                    n_windows,
-                )
-                pending_ticks = []
+                    self.logger.info(
+                        "Flushed %d ticks to disk (batch %d/%d)",
+                        len(pending_ticks),
+                        i,
+                        n_windows,
+                    )
+                    pending_ticks = []
 
         self.logger.info(
             "On-chain tick backfill complete: %s total ticks across %s markets",
