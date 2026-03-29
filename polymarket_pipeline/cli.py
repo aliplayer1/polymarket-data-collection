@@ -160,6 +160,21 @@ def main() -> None:
                 ticks_dir=str(paths.ticks_dir),
                 logger=logger,
             )
+
+            import os
+            from .config import HF_CULTURE_REPO_ID
+            culture_root = paths.data_dir.parent / "data-culture"
+            if culture_root.exists():
+                logger.info("Uploading culture dataset to Hugging Face...")
+                upload_to_huggingface(
+                    repo_id=os.environ.get("HF_CULTURE_REPO_ID", HF_CULTURE_REPO_ID),
+                    markets_path=str(culture_root / "markets.parquet"),
+                    prices_dir=str(culture_root / "prices"),
+                    ticks_dir=str(culture_root / "ticks"),
+                    logger=logger,
+                    skip_consolidate=False,
+                )
+            
             return
 
         pipeline = PolymarketDataPipeline(
