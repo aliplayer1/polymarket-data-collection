@@ -67,18 +67,21 @@ def test_tick_backfill_phase_chunks_large_windows(tmp_path, monkeypatch) -> None
     # Market with 4-day timeframe (345,600 seconds)
     m1 = MarketRecord(
         market_id="m-large",
-        market_type="multi-outcome",
+        market_type="crypto-up-down",
         question="Large market",
         timeframe="4-day",
-        crypto="ELON-TWEETS",
+        crypto="BTC",
         condition_id=None,
         start_ts=0,
         end_ts=345600,
         volume=1.0,
         resolution=None,
         is_active=False,
-        category="culture",
-        tokens={"Outcome 1": "tok1", "Outcome 2": "tok2"},
+        category="crypto",
+        up_token_id="tok1",
+        down_token_id="tok2",
+        up_outcome="Up",
+        down_outcome="Down",
     )
 
     phase.run([m1])

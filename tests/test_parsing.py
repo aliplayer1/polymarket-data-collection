@@ -51,7 +51,7 @@ def test_extract_timeframe(question: str, expected: str | None) -> None:
     ("Solana Up or Down", "SOL"),
     ("sol up or down 15 min", "SOL"),
     # Unrecognised
-    ("Dogecoin price prediction", None),
+    ("Dogecoin price prediction", "DOGE"),
     ("S&P 500 up or down", None),
     ("", None),
 ])

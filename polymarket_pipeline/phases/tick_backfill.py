@@ -61,9 +61,7 @@ class TickBackfillPhase:
 
         windows: dict[tuple[int, int], list[MarketRecord]] = defaultdict(list)
         for market in markets:
-            window_seconds = TIMEFRAME_SECONDS.get(market.timeframe, 300)
-            # Fetch at most the last timeframe's worth of ticks
-            win_start = max(market.start_ts, market.end_ts - window_seconds)
+            win_start = market.start_ts
             
             # Chunk the window if it exceeds MAX_WINDOW_SECONDS
             current_start = win_start

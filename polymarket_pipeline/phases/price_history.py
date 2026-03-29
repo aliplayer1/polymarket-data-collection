@@ -71,8 +71,7 @@ class PriceHistoryPhase:
             return latest_prices
 
     def _market_start_ts(self, market: MarketRecord) -> int:
-        window_seconds = TIMEFRAME_SECONDS.get(market.timeframe, 300)
-        prediction_start = market.end_ts - window_seconds
+        prediction_start = market.start_ts
 
         existing_df = self.existing_dfs.get(market.timeframe, pd.DataFrame())
         if existing_df.empty:
