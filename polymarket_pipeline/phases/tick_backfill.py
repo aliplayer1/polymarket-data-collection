@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from collections import defaultdict
 
 import pandas as pd
 
-from ..config import TIMEFRAME_SECONDS
+from ..config import TIMEFRAME_SECONDS, HF_CULTURE_REPO_ID
 from ..models import MarketRecord
 from ..providers import TickBatchProvider
-from ..storage import append_ticks_only
+from ..storage import append_ticks_only, upload_to_huggingface
 from .shared import PipelinePaths
 
 
@@ -165,6 +167,28 @@ class TickBackfillPhase:
                         n_windows,
                     )
                     pending_ticks = []
+
+                    # Periodic upload of culture data (every 500 windows) to prevent
+                    # the dataset from appearing stale during massive backfills.
+                    if i % 500 == 0:
+                        culture_root = self.paths.data_dir.parent / "data-culture"
+                        if culture_root.exists():
+                            repo_id = os.environ.get("HF_CULTURE_REPO_ID", HF_CULTURE_REPO_ID)
+                            self.logger.info(
+                                "Periodic upload: pushing intermediate culture data to %s...",
+                                repo_id,
+                            )
+                            try:
+                                upload_to_huggingface(
+                                    repo_id=repo_id,
+                                    markets_path=str(culture_root / "markets.parquet"),
+                                    prices_dir=str(culture_root / "prices"),
+                                    ticks_dir=str(culture_root / "ticks"),
+                                    logger=self.logger,
+                                    skip_consolidate=False,
+                                )
+                            except Exception as exc:
+                                self.logger.warning("Periodic culture upload failed: %s", exc)
 
         self.logger.info(
             "On-chain tick backfill complete: %s total ticks across %s markets",
