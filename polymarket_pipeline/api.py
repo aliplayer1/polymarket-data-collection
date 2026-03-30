@@ -84,6 +84,12 @@ class PolymarketApi:
     def fetch_markets(self, *, active: bool = False, closed: bool = False, end_ts_min: int | None = None) -> Iterator[MarketRecord]:
         offset = 0
 
+        # We must explicitly fetch high-frequency markets by their tag ID because 
+        # Polymarket marks them as "restricted: true", which excludes them from
+        # the default /markets endpoint results.
+        # Tag 102127 = "Up or Down"
+        UP_DOWN_TAG_ID = 102127
+
         while True:
             order_field = "closedTime" if closed else "volume24hr"
             params: dict[str, Any] = {
@@ -100,6 +106,8 @@ class PolymarketApi:
                 params["active"] = "false"
 
             self.logger.info("Fetching markets page (offset=%s, active=%s, closed=%s)...", offset, active, closed)
+            
+            # --- PHASE 1: Standard Markets ---
             try:
                 page = self._request_json(f"{GAMMA_API}/markets", params=params)
             except Exception as exc:
@@ -108,8 +116,19 @@ class PolymarketApi:
                 fallback_params = dict(params)
                 fallback_params.pop("order", None)
                 fallback_params.pop("ascending", None)
-                self.logger.warning("Order field rejected by API, retrying without explicit order")
                 page = self._request_json(f"{GAMMA_API}/markets", params=fallback_params)
+
+            # --- PHASE 2: High-Frequency (Restricted) Markets ---
+            # On the first page, also fetch the "Up or Down" tag directly.
+            if offset == 0:
+                try:
+                    tag_params = dict(params)
+                    tag_params["tag_id"] = UP_DOWN_TAG_ID
+                    tag_page = self._request_json(f"{GAMMA_API}/markets", params=tag_params)
+                    if tag_page:
+                        page.extend(tag_page)
+                except Exception as exc:
+                    self.logger.warning("Failed to fetch restricted up/down markets: %s", exc)
 
             if not page:
                 break
