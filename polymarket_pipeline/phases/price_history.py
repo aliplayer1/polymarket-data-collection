@@ -293,14 +293,41 @@ class PriceHistoryPhase:
         self.existing_dfs[timeframe] = merged
         return merged
 
+    def _fetch_fee_rate(self, market: MarketRecord) -> None:
+        """Best-effort fetch of fee_rate_bps for a crypto market."""
+        if market.category != "crypto" or not market.up_token_id:
+            return
+        if market.fee_rate_bps is not None:
+            return
+        try:
+            bps = self.price_history_provider.fetch_fee_rate_bps(market.up_token_id)
+            if bps is not None:
+                market.fee_rate_bps = bps
+        except Exception:
+            pass  # best-effort; will remain None → stored as -1
+
     def process_market_batch(self, batch: list[MarketRecord]) -> None:
         if not batch:
             return
 
         with ThreadPoolExecutor(max_workers=min(3, len(batch))) as executor:
+            # Fetch fee rates in parallel (crypto only, best-effort)
+            fee_futures = [
+                executor.submit(self._fetch_fee_rate, market)
+                for market in batch if market.category == "crypto"
+            ]
+
             future_to_market = {
                 executor.submit(self.build_market_dataframe, market): market for market in batch
             }
+
+            # Wait for fee futures (fast, single API call each)
+            for f in fee_futures:
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
             for future in as_completed(future_to_market):
                 market = future_to_market[future]
                 self.processed_count += 1

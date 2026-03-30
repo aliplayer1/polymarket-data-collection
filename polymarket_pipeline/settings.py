@@ -106,6 +106,7 @@ class RuntimeSettings:
     data_dir: Path | None = None
     log_file: Path | None = None
     hf_repo: str = HF_REPO_ID
+    prefer_rpc: bool = False
 
     @classmethod
     def from_args(cls, args: Any) -> "RuntimeSettings":
@@ -135,6 +136,12 @@ class RuntimeSettings:
                     getattr(args, "hf_repo", None),
                     os.environ.get("HF_REPO_ID"),
                     HF_REPO_ID,
+                )
+            ),
+            prefer_rpc=bool(
+                _coalesce(
+                    getattr(args, "prefer_rpc", False),
+                    os.environ.get("PREFER_RPC", "").lower() == "true",
                 )
             ),
         )

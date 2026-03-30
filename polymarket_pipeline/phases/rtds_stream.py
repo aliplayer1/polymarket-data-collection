@@ -3,23 +3,32 @@
 Polymarket RTDS WebSocket: wss://ws-live-data.polymarket.com
 Docs: https://docs.polymarket.com/market-data/websocket/rtds
 
-The phase does NOT write to disk.  It populates a shared in-memory dict
-``latest_prices`` that the WebSocketPhase reads synchronously when it builds
-each tick row.  Because both run in the same asyncio event loop, no lock is
-needed — updates and reads are atomic at the await boundary.
+The phase populates two shared in-memory dicts:
 
-Cache structure::
+- ``latest_prices`` — Binance spot prices used by WebSocketPhase to embed
+  into tick rows.  Same asyncio event loop → no lock needed.
+- ``chainlink_prices`` — Chainlink reference prices (resolution oracle).
+
+It also buffers every received price update (Binance + Chainlink) into
+``spot_price_buffer``, which the caller drains periodically and flushes
+to the ``data/spot_prices/`` Parquet table.
+
+Cache structures::
 
     latest_prices: dict[str, tuple[float, int]]
     #  key   = RTDS symbol  ("btcusdt", "ethusdt", "solusdt")
     #  value = (spot_price_usdt, binance_timestamp_ms)
 
-Subscription message (Binance source, filtered):
+    chainlink_prices: dict[str, tuple[float, int]]
+    #  key   = Chainlink symbol  ("btc/usd", "eth/usd")
+    #  value = (price_usd, chainlink_timestamp_ms)
+
+Subscription message — subscribes to BOTH Binance and Chainlink feeds:
     {
         "action": "subscribe",
         "subscriptions": [
-            {"topic": "crypto_prices", "type": "update",
-             "filters": "btcusdt,ethusdt,solusdt"}
+            {"topic": "crypto_prices", "type": "*"},
+            {"topic": "crypto_prices_chainlink", "type": "*"}
         ]
     }
 
@@ -39,9 +48,10 @@ from ..config import MAX_WS_RECONNECT_DELAY_SECONDS
 
 _RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 _PING_INTERVAL_SECONDS = 5.0
-_SUPPORTED_SYMBOLS = frozenset({"btcusdt", "ethusdt", "solusdt", "bnbusdt", "xrpusdt", "dogeusdt", "hypeusdt"})
+_SUPPORTED_BINANCE_SYMBOLS = frozenset({"btcusdt", "ethusdt", "solusdt", "bnbusdt", "xrpusdt", "dogeusdt", "hypeusdt"})
+_SUPPORTED_CHAINLINK_SYMBOLS = frozenset({"btc/usd", "eth/usd", "sol/usd", "bnb/usd", "xrp/usd", "doge/usd", "hype/usd"})
 
-# Mapping from MarketRecord.crypto → RTDS symbol
+# Mapping from MarketRecord.crypto → RTDS Binance symbol
 CRYPTO_TO_RTDS_SYMBOL: dict[str, str] = {
     "BTC": "btcusdt",
     "ETH": "ethusdt",
@@ -54,27 +64,34 @@ CRYPTO_TO_RTDS_SYMBOL: dict[str, str] = {
 
 
 class RTDSStreamPhase:
-    """Populates a shared price cache from Polymarket RTDS crypto_prices.
+    """Populates shared price caches and a persistent buffer from Polymarket RTDS.
 
     Usage::
 
-        cache: dict[str, tuple[float, int]] = {}
-        phase = RTDSStreamPhase(cache, logger=log)
+        binance_cache: dict[str, tuple[float, int]] = {}
+        chainlink_cache: dict[str, tuple[float, int]] = {}
+        spot_buffer: list[dict] = []
+        phase = RTDSStreamPhase(binance_cache, chainlink_cache, spot_buffer, logger=log)
         task  = asyncio.create_task(phase.run())
 
-    Other tasks can then read ``cache.get("btcusdt")`` at any time to
-    obtain ``(spot_price_usdt, binance_ts_ms)`` or ``None``.
+    Other tasks can then read ``binance_cache.get("btcusdt")`` to obtain
+    ``(spot_price_usdt, binance_ts_ms)`` or ``None``.
+
+    The ``spot_price_buffer`` accumulates rows for the spot_prices Parquet table.
+    The caller is responsible for draining and flushing it periodically.
     """
 
     def __init__(
         self,
         latest_prices: dict[str, tuple[float, int]],
+        chainlink_prices: dict[str, tuple[float, int]] | None = None,
+        spot_price_buffer: list[dict[str, Any]] | None = None,
         *,
-        symbols: frozenset[str] = _SUPPORTED_SYMBOLS,
         logger: logging.Logger | None = None,
     ) -> None:
         self.latest_prices = latest_prices
-        self.symbols = symbols
+        self.chainlink_prices = chainlink_prices if chainlink_prices is not None else {}
+        self.spot_price_buffer = spot_price_buffer if spot_price_buffer is not None else []
         self.logger = logger or logging.getLogger("polymarket_pipeline.rtds")
 
     # ------------------------------------------------------------------
@@ -82,18 +99,23 @@ class RTDSStreamPhase:
     # ------------------------------------------------------------------
 
     async def _run_connection(self) -> bool:
-        """Connect, subscribe, and update the cache until disconnected.
+        """Connect, subscribe, and update caches until disconnected.
 
         Returns True if at least one valid price update was received during
         this connection, False otherwise (used to decide whether to reset the
         reconnect backoff counter).
         """
         received_data = False
-        filters = ",".join(sorted(self.symbols))
+
+        # Subscribe to both Binance and Chainlink feeds.
+        # Using type "*" (not "update") ensures we receive both snapshot and
+        # update messages — filtered mode returns only a snapshot with no
+        # live updates for some topic configurations.
         subscribe_msg = json.dumps({
             "action": "subscribe",
             "subscriptions": [
-                {"topic": "crypto_prices", "type": "update", "filters": filters}
+                {"topic": "crypto_prices", "type": "*"},
+                {"topic": "crypto_prices_chainlink", "type": "*"},
             ],
         })
 
@@ -103,7 +125,7 @@ class RTDSStreamPhase:
             open_timeout=10,          # fail fast on DNS/TCP hangs
             ping_interval=None,       # we manage pings manually per RTDS docs
         ) as ws:
-            self.logger.info("RTDS: connected, subscribing to %s", filters)
+            self.logger.info("RTDS: connected, subscribing to Binance + Chainlink feeds")
             await ws.send(subscribe_msg)
 
             async def _ping_loop() -> None:
@@ -128,25 +150,53 @@ class RTDSStreamPhase:
                     except json.JSONDecodeError:
                         continue
 
-                    if msg.get("topic") != "crypto_prices" or msg.get("type") != "update":
+                    msg_type = msg.get("type")
+                    if msg_type != "update":
                         continue
 
                     payload = msg.get("payload")
                     if not isinstance(payload, dict):
                         continue
 
+                    topic = msg.get("topic", "")
                     symbol = str(payload.get("symbol", "")).lower()
-                    if symbol not in self.symbols:
-                        continue
-
                     value = payload.get("value")
                     timestamp_ms = payload.get("timestamp")
+
                     if value is None or timestamp_ms is None:
                         continue
 
-                    # Atomic dict write — safe in single-threaded asyncio
-                    self.latest_prices[symbol] = (float(value), int(timestamp_ms))
-                    received_data = True
+                    try:
+                        price = float(value)
+                        ts_ms = int(timestamp_ms)
+                    except (ValueError, TypeError):
+                        continue
+
+                    # Validate price
+                    if price <= 0.0 or not (price == price):  # NaN check
+                        continue
+
+                    if topic == "crypto_prices" and symbol in _SUPPORTED_BINANCE_SYMBOLS:
+                        # Binance spot price
+                        self.latest_prices[symbol] = (price, ts_ms)
+                        self.spot_price_buffer.append({
+                            "ts_ms": ts_ms,
+                            "symbol": symbol,
+                            "price": price,
+                            "source": "binance",
+                        })
+                        received_data = True
+
+                    elif topic == "crypto_prices_chainlink" and symbol in _SUPPORTED_CHAINLINK_SYMBOLS:
+                        # Chainlink reference price (resolution oracle)
+                        self.chainlink_prices[symbol] = (price, ts_ms)
+                        self.spot_price_buffer.append({
+                            "ts_ms": ts_ms,
+                            "symbol": symbol,
+                            "price": price,
+                            "source": "chainlink",
+                        })
+                        received_data = True
 
             finally:
                 ping_task.cancel()

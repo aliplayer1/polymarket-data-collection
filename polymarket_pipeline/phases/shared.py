@@ -15,6 +15,8 @@ class PipelinePaths:
     markets_path: Path
     prices_dir: Path
     ticks_dir: Path
+    spot_prices_dir: Path
+    orderbook_dir: Path
 
     @classmethod
     def from_root(cls, root: str | Path) -> "PipelinePaths":
@@ -24,6 +26,8 @@ class PipelinePaths:
             markets_path=data_dir / "markets.parquet",
             prices_dir=data_dir / "prices",
             ticks_dir=data_dir / "ticks",
+            spot_prices_dir=data_dir / "spot_prices",
+            orderbook_dir=data_dir / "orderbook",
         )
 
     def ensure_data_dir(self) -> None:
@@ -65,6 +69,7 @@ def build_binary_price_frame(
             "condition_id": market.condition_id,
             "up_token_id": market.up_token_id,
             "down_token_id": market.down_token_id,
+            "fee_rate_bps": market.fee_rate_bps if market.fee_rate_bps is not None else -1,
             "category": market.category,
         }
     )
@@ -93,6 +98,7 @@ def build_binary_price_row(
         "condition_id": market.condition_id,
         "up_token_id": market.up_token_id,
         "down_token_id": market.down_token_id,
+        "fee_rate_bps": market.fee_rate_bps if market.fee_rate_bps is not None else -1,
         "category": market.category,
     }
 
@@ -130,4 +136,46 @@ def build_binary_tick_row(
         "spot_price_usdt": spot_price_usdt,
         "spot_price_ts_ms": spot_price_ts_ms,
         "category": market.category,
+    }
+
+
+def build_spot_price_row(
+    *,
+    ts_ms: int,
+    symbol: str,
+    price: float,
+    source: str,
+) -> dict[str, Any]:
+    """Build a single row for the spot_prices Parquet table."""
+    return {
+        "ts_ms": ts_ms,
+        "symbol": symbol,
+        "price": price,
+        "source": source,
+    }
+
+
+def build_orderbook_row(
+    market: MarketRecord,
+    *,
+    ts_ms: int,
+    token_id: str,
+    outcome_side: str,
+    best_bid: float,
+    best_ask: float,
+    best_bid_size: float,
+    best_ask_size: float,
+) -> dict[str, Any]:
+    """Build a single row for the orderbook Parquet table."""
+    return {
+        "ts_ms": ts_ms,
+        "market_id": market.market_id,
+        "crypto": market.crypto,
+        "timeframe": market.timeframe,
+        "token_id": token_id,
+        "outcome": market.outcome_name_for_side(outcome_side),
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "best_bid_size": best_bid_size,
+        "best_ask_size": best_ask_size,
     }

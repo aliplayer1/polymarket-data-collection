@@ -94,7 +94,10 @@ def normalize_gamma_market(
         or market.get("endDate")
         or datetime.now(timezone.utc).isoformat()
     )
-    if not market.get("closed", False):
+    # Only override endDate for markets with no API-provided end date.
+    # Crypto up/down markets have a fixed prediction window end time that
+    # must be preserved — overriding it makes long-expired markets appear live.
+    if not market.get("closed", False) and not (market.get("end_date") or market.get("endDate")):
         end_iso = datetime.now(timezone.utc).isoformat()
 
     start_ts = parse_iso_timestamp(start_iso)

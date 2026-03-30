@@ -41,6 +41,7 @@ from .config import (
     POLYGON_CHAIN_ID,
 )
 from .phases.shared import build_binary_tick_row
+from .phases.binance_history import SpotPriceLookup
 from .models import MarketRecord
 
 
@@ -91,16 +92,20 @@ class PolygonTickFetcher:
         polygonscan_key: str | None = None,
         timeout: int = 30,
         logger: logging.Logger | None = None,
+        prefer_rpc: bool = False,
+        spot_price_lookup: SpotPriceLookup | None = None,
     ) -> None:
         self.rpc_url = rpc_url
         self.polygonscan_key = polygonscan_key
         self.timeout = timeout
         self.logger = logger or logging.getLogger("polymarket_pipeline.ticks")
+        self.prefer_rpc = prefer_rpc
+        self.spot_price_lookup = spot_price_lookup
         self._session = requests.Session()
         self._block_cache: dict[int, int] = {}  # ts → block number
         self._last_etherscan_ts: float = 0.0    # global rate-limit tracker
         self._last_rpc_logs_ts: float = 0.0       # rate-limit tracker for eth_getLogs
-        
+
         import threading
         self._etherscan_lock = threading.Lock()
         self._rpc_logs_lock = threading.Lock()
@@ -354,15 +359,25 @@ class PolygonTickFetcher:
 
         self.logger.debug("Streaming logs for blocks %s–%s", start_block, end_block)
 
-        if self.polygonscan_key:
-            success = self._fetch_logs_etherscan_v2_streamed(start_block, end_block, on_log)
+        # Order of sources depends on prefer_rpc
+        sources = []
+        if self.prefer_rpc:
+            if self.rpc_url:
+                sources.append(("RPC", self._fetch_logs_rpc_streamed))
+            if self.polygonscan_key:
+                sources.append(("Polygonscan", self._fetch_logs_etherscan_v2_streamed))
+        else:
+            if self.polygonscan_key:
+                sources.append(("Polygonscan", self._fetch_logs_etherscan_v2_streamed))
+            if self.rpc_url:
+                sources.append(("RPC", self._fetch_logs_rpc_streamed))
+
+        for name, fetch_func in sources:
+            success = fetch_func(start_block, end_block, on_log)
             if success:
                 return True
-            if self.rpc_url:
-                self.logger.warning("Polygonscan stream failed; falling back to RPC")
-
-        if self.rpc_url:
-            return self._fetch_logs_rpc_streamed(start_block, end_block, on_log)
+            if len(sources) > 1:
+                self.logger.warning("%s stream failed; trying next source", name)
 
         self.logger.error("No valid log source (RPC/Polygonscan) available for streaming")
         return False
@@ -479,7 +494,10 @@ class PolygonTickFetcher:
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
                 if attempt < self._MAX_RETRIES:
                     wait = 2 ** attempt
-                    self.logger.warning("Etherscan attempt %d/%d failed, retrying: %s", attempt, self._MAX_RETRIES, exc)
+                    msg = str(exc)
+                    if self.polygonscan_key and self.polygonscan_key in msg:
+                        msg = msg.replace(self.polygonscan_key, "<key>")
+                    self.logger.warning("Etherscan attempt %d/%d failed, retrying: %s", attempt, self._MAX_RETRIES, msg)
                     time.sleep(wait)
                 else:
                     break
@@ -524,7 +542,7 @@ class PolygonTickFetcher:
                 return None
 
             price = usdc_size / outcome_size
-            if not (0.001 <= price <= 0.999):
+            if not (0.0 <= price <= 1.0):
                 return None
 
             raw_ts = log.get("timeStamp") or log.get("timestamp", "0x0")
@@ -537,9 +555,19 @@ class PolygonTickFetcher:
             log_idx_int = int(log_idx, 16) if isinstance(log_idx, str) and log_idx.startswith("0x") else int(log_idx)
 
             token_id = market.token_id_for_side(outcome_side)
+            tick_ts_ms = block_ts * 1000
+
+            # Embed spot price from Binance historical lookup if available
+            spot_kwargs: dict[str, Any] = {}
+            if self.spot_price_lookup is not None:
+                result = self.spot_price_lookup.get(market.crypto, tick_ts_ms)
+                if result is not None:
+                    spot_kwargs["spot_price_usdt"] = result[0]
+                    spot_kwargs["spot_price_ts_ms"] = result[1]
+
             return build_binary_tick_row(
                 market,
-                timestamp_ms=block_ts * 1000,
+                timestamp_ms=tick_ts_ms,
                 token_id=token_id,
                 outcome_side=outcome_side,
                 trade_side=side,
@@ -549,6 +577,7 @@ class PolygonTickFetcher:
                 block_number=block_num,
                 log_index=log_idx_int,
                 source="onchain",
+                **spot_kwargs,
             )
         except Exception:
             return None

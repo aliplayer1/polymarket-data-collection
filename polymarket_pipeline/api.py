@@ -143,6 +143,22 @@ class PolymarketApi:
             time.sleep(0.5)
 
 
+    def fetch_fee_rate_bps(self, token_id: str) -> int | None:
+        """Fetch the taker fee rate (basis points) for a token from the CLOB API.
+
+        Calls ``GET /fee-rate?token_id={token_id}`` which returns ``{"base_fee": N}``.
+        Returns ``base_fee`` as an integer, or None on failure.
+        """
+        try:
+            data = self._request_json(f"{CLOB_HOST}/fee-rate", {"token_id": token_id})
+            if data and isinstance(data, dict):
+                base_fee = data.get("base_fee")
+                if base_fee is not None:
+                    return int(base_fee)
+        except Exception as exc:
+            self.logger.debug("Fee rate fetch failed for token %s: %s", token_id[:20], exc)
+        return None
+
     def fetch_price_history(self, token_id: str, start_ts: int, end_ts: int, fidelity: int = 1) -> list[dict[str, Any]]:
         history: list[dict[str, Any]] = []
         current_start = start_ts

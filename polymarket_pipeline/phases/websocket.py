@@ -23,9 +23,9 @@ from ..config import (
 from ..models import MarketRecord
 from ..providers import LastTradePriceProvider
 from ..retry import api_call_with_retry
-from ..storage import append_ws_ticks_staged
+from ..storage import append_ws_ticks_staged, append_ws_spot_prices_staged, append_ws_orderbook_staged
 from .rtds_stream import CRYPTO_TO_RTDS_SYMBOL
-from .shared import PipelinePaths, build_binary_price_row, build_binary_tick_row
+from .shared import PipelinePaths, build_binary_price_row, build_binary_tick_row, build_orderbook_row
 
 
 class WebSocketPhase:
@@ -37,12 +37,14 @@ class WebSocketPhase:
         logger: logging.Logger,
         paths: PipelinePaths,
         spot_price_cache: dict[str, tuple[float, int]] | None = None,
+        spot_price_buffer: list[dict[str, Any]] | None = None,
     ) -> None:
         self.last_trade_price_provider = last_trade_price_provider
         self.price_history_phase = price_history_phase
         self.logger = logger
         self.paths = paths
-        self.spot_price_cache = spot_price_cache or {}
+        self.spot_price_cache = spot_price_cache if spot_price_cache is not None else {}
+        self.spot_price_buffer = spot_price_buffer if spot_price_buffer is not None else []
 
     def update_paths(self, paths: PipelinePaths) -> None:
         self.paths = paths
@@ -111,6 +113,8 @@ class WebSocketPhase:
         self,
         ws_snapshot: dict[str, list[dict[str, Any]]],
         tick_snapshot: dict[str, list[dict[str, Any]]],
+        orderbook_snapshot: dict[str, list[dict[str, Any]]],
+        spot_price_snapshot: list[dict[str, Any]],
     ) -> int:
         flushed_rows = 0
         for timeframe, rows in ws_snapshot.items():
@@ -147,6 +151,26 @@ class WebSocketPhase:
                     logger=self.logger,
                 )
 
+        # Flush orderbook BBO rows
+        all_ob: list[dict[str, Any]] = []
+        for rows in orderbook_snapshot.values():
+            all_ob.extend(rows)
+        if all_ob:
+            ob_df = pd.DataFrame(all_ob)
+            append_ws_orderbook_staged(
+                ob_df,
+                orderbook_dir=str(self.paths.orderbook_dir),
+                logger=self.logger,
+            )
+
+        # Flush spot price rows
+        if spot_price_snapshot:
+            append_ws_spot_prices_staged(
+                spot_price_snapshot,
+                spot_prices_dir=str(self.paths.spot_prices_dir),
+                logger=self.logger,
+            )
+
         return flushed_rows
 
     async def _run_ws_shard(
@@ -158,9 +182,14 @@ class WebSocketPhase:
         last_prices: dict[str, dict[str, float]],
         ws_buffer: dict[str, list[dict[str, Any]]],
         tick_buffer: dict[str, list[dict[str, Any]]],
+        orderbook_buffer: dict[str, list[dict[str, Any]]],
     ) -> None:
         reconnect_attempts = 0
         disconnect_time: float | None = None
+
+        # Per-token BBO state for tracking sizes between updates
+        # (price_change events may omit size fields)
+        token_bbo: dict[str, dict[str, float]] = {}
 
         while True:
             try:
@@ -187,18 +216,58 @@ class WebSocketPhase:
                     )
                     reconnect_attempts = 0
                     disconnect_time = None
+                    # Reset BBO state on reconnect — snapshot will re-establish
+                    token_bbo.clear()
 
                     while True:
                         message = await ws.recv()
                         payload = json.loads(message)
-                        events = payload if isinstance(payload, list) else [payload]
+
+                        # --- Snapshot handling (array of orderbook states) ---
+                        if isinstance(payload, list):
+                            for snapshot in payload:
+                                asset_id = str(snapshot.get("asset_id", ""))
+                                if asset_id not in token_to_market:
+                                    continue
+                                market, outcome_side = token_to_market[asset_id]
+                                bids = snapshot.get("bids") or []
+                                asks = snapshot.get("asks") or []
+                                best_bid = float(bids[0]["price"]) if bids else 0.0
+                                best_ask = float(asks[0]["price"]) if asks else 0.0
+                                best_bid_sz = float(bids[0]["size"]) if bids else 0.0
+                                best_ask_sz = float(asks[0]["size"]) if asks else 0.0
+                                token_bbo[asset_id] = {
+                                    "best_bid": best_bid,
+                                    "best_ask": best_ask,
+                                    "best_bid_size": best_bid_sz,
+                                    "best_ask_size": best_ask_sz,
+                                }
+                                if market.category == "crypto":
+                                    ts_ms = int(time.time() * 1000)
+                                    orderbook_buffer[market.timeframe].append(
+                                        build_orderbook_row(
+                                            market,
+                                            ts_ms=ts_ms,
+                                            token_id=asset_id,
+                                            outcome_side=outcome_side,
+                                            best_bid=best_bid,
+                                            best_ask=best_ask,
+                                            best_bid_size=best_bid_sz,
+                                            best_ask_size=best_ask_sz,
+                                        )
+                                    )
+                            continue
+
+                        # --- Single event handling ---
+                        events = [payload]
 
                         total_buffered = (
                             sum(len(values) for values in ws_buffer.values())
                             + sum(len(values) for values in tick_buffer.values())
+                            + sum(len(values) for values in orderbook_buffer.values())
                         )
                         if total_buffered >= WS_BUFFER_MAX_ROWS:
-                            for buffer in (ws_buffer, tick_buffer):
+                            for buffer in (ws_buffer, tick_buffer, orderbook_buffer):
                                 for timeframe in list(buffer.keys()):
                                     rows = buffer[timeframe]
                                     if rows:
@@ -211,7 +280,93 @@ class WebSocketPhase:
                             )
 
                         for event in events:
-                            if event.get("event_type") != "last_trade_price":
+                            event_type = event.get("event_type")
+
+                            # --- book: full orderbook refresh (extract BBO) ---
+                            if event_type == "book":
+                                asset_id = str(event.get("asset_id", ""))
+                                if asset_id in token_to_market:
+                                    market, outcome_side = token_to_market[asset_id]
+                                    if market.category == "crypto":
+                                        bids = event.get("bids") or []
+                                        asks = event.get("asks") or []
+                                        best_bid = float(bids[0]["price"]) if bids else 0.0
+                                        best_ask = float(asks[0]["price"]) if asks else 0.0
+                                        best_bid_sz = float(bids[0]["size"]) if bids else 0.0
+                                        best_ask_sz = float(asks[0]["size"]) if asks else 0.0
+                                        token_bbo[asset_id] = {
+                                            "best_bid": best_bid, "best_ask": best_ask,
+                                            "best_bid_size": best_bid_sz, "best_ask_size": best_ask_sz,
+                                        }
+                                        ts_ms = int(time.time() * 1000)
+                                        orderbook_buffer[market.timeframe].append(
+                                            build_orderbook_row(
+                                                market, ts_ms=ts_ms, token_id=asset_id,
+                                                outcome_side=outcome_side,
+                                                best_bid=best_bid, best_ask=best_ask,
+                                                best_bid_size=best_bid_sz, best_ask_size=best_ask_sz,
+                                            )
+                                        )
+                                continue
+
+                            # --- price_change: orderbook BBO update ---
+                            if event_type == "price_change":
+                                price_changes = event.get("price_changes") or []
+                                for change in price_changes:
+                                    asset_id = str(change.get("asset_id", ""))
+                                    if asset_id not in token_to_market:
+                                        continue
+                                    market, outcome_side = token_to_market[asset_id]
+                                    if market.category != "crypto":
+                                        continue
+
+                                    # Get current BBO state for this token
+                                    bbo = token_bbo.get(asset_id, {
+                                        "best_bid": 0.0, "best_ask": 0.0,
+                                        "best_bid_size": 0.0, "best_ask_size": 0.0,
+                                    })
+
+                                    # Update with new values (fields may be absent)
+                                    if change.get("best_bid") is not None:
+                                        try:
+                                            bbo["best_bid"] = float(change["best_bid"])
+                                        except (ValueError, TypeError):
+                                            pass
+                                    if change.get("best_ask") is not None:
+                                        try:
+                                            bbo["best_ask"] = float(change["best_ask"])
+                                        except (ValueError, TypeError):
+                                            pass
+                                    if change.get("best_bid_size") is not None:
+                                        try:
+                                            bbo["best_bid_size"] = float(change["best_bid_size"])
+                                        except (ValueError, TypeError):
+                                            pass
+                                    if change.get("best_ask_size") is not None:
+                                        try:
+                                            bbo["best_ask_size"] = float(change["best_ask_size"])
+                                        except (ValueError, TypeError):
+                                            pass
+
+                                    token_bbo[asset_id] = bbo
+
+                                    ts_ms = int(time.time() * 1000)
+                                    orderbook_buffer[market.timeframe].append(
+                                        build_orderbook_row(
+                                            market,
+                                            ts_ms=ts_ms,
+                                            token_id=asset_id,
+                                            outcome_side=outcome_side,
+                                            best_bid=bbo["best_bid"],
+                                            best_ask=bbo["best_ask"],
+                                            best_bid_size=bbo["best_bid_size"],
+                                            best_ask_size=bbo["best_ask_size"],
+                                        )
+                                    )
+                                continue
+
+                            # --- last_trade_price: trade event ---
+                            if event_type != "last_trade_price":
                                 continue
 
                             token_id = str(event.get("asset_id", ""))
@@ -271,7 +426,7 @@ class WebSocketPhase:
                                     "tokens": json.dumps(market.tokens),
                                     "category": market.category,
                                 })
-                                
+
                             # Skip live tick collection for "culture" markets to match the
                             # historical backfill policy (focus on share prices only).
                             if market.category != "culture":
@@ -325,6 +480,7 @@ class WebSocketPhase:
         self,
         ws_buffer: dict[str, list[dict[str, Any]]],
         tick_buffer: dict[str, list[dict[str, Any]]],
+        orderbook_buffer: dict[str, list[dict[str, Any]]],
     ) -> None:
         loop = asyncio.get_running_loop()
         check_interval = 1.0
@@ -334,15 +490,18 @@ class WebSocketPhase:
             await asyncio.sleep(check_interval)
 
             total_ws_rows = sum(len(values) for values in ws_buffer.values())
+            total_ob_rows = sum(len(values) for values in orderbook_buffer.values())
+            total_spot_rows = len(self.spot_price_buffer)
             elapsed = loop.time() - last_flush_time
 
-            if total_ws_rows == 0 and elapsed < WS_FLUSH_INTERVAL_SECONDS:
+            if total_ws_rows == 0 and total_ob_rows == 0 and total_spot_rows == 0 and elapsed < WS_FLUSH_INTERVAL_SECONDS:
                 continue
-            if total_ws_rows < WS_FLUSH_BATCH_SIZE and elapsed < WS_FLUSH_INTERVAL_SECONDS:
+            if (total_ws_rows + total_ob_rows + total_spot_rows) < WS_FLUSH_BATCH_SIZE and elapsed < WS_FLUSH_INTERVAL_SECONDS:
                 continue
 
             ws_snapshot: dict[str, list[dict[str, Any]]] = {}
             tick_snapshot: dict[str, list[dict[str, Any]]] = {}
+            orderbook_snapshot: dict[str, list[dict[str, Any]]] = {}
             for timeframe in list(ws_buffer.keys()):
                 if ws_buffer[timeframe]:
                     ws_snapshot[timeframe] = ws_buffer[timeframe]
@@ -351,15 +510,31 @@ class WebSocketPhase:
                 if tick_buffer[timeframe]:
                     tick_snapshot[timeframe] = tick_buffer[timeframe]
                     tick_buffer[timeframe] = []
+            for timeframe in list(orderbook_buffer.keys()):
+                if orderbook_buffer[timeframe]:
+                    orderbook_snapshot[timeframe] = orderbook_buffer[timeframe]
+                    orderbook_buffer[timeframe] = []
 
-            if not ws_snapshot and not tick_snapshot:
+            # Drain spot price buffer (written by RTDS stream in same event loop)
+            spot_snapshot = self.spot_price_buffer[:]
+            self.spot_price_buffer.clear()
+
+            if not ws_snapshot and not tick_snapshot and not orderbook_snapshot and not spot_snapshot:
                 last_flush_time = loop.time()
                 continue
 
             last_flush_time = loop.time()
-            flushed = await loop.run_in_executor(None, self._flush_snapshot, ws_snapshot, tick_snapshot)
-            if flushed:
-                self.logger.info("Flushed %d WebSocket rows to disk", flushed)
+            flushed = await loop.run_in_executor(
+                None, self._flush_snapshot, ws_snapshot, tick_snapshot, orderbook_snapshot, spot_snapshot,
+            )
+            total_flushed = flushed + len(spot_snapshot) + sum(len(r) for r in orderbook_snapshot.values())
+            if total_flushed:
+                self.logger.info(
+                    "Flushed %d price + %d orderbook + %d spot rows to disk",
+                    flushed,
+                    sum(len(r) for r in orderbook_snapshot.values()),
+                    len(spot_snapshot),
+                )
 
     async def run(self, active_markets: list[MarketRecord]) -> None:
         if not active_markets:
@@ -379,6 +554,7 @@ class WebSocketPhase:
         last_prices = self._initial_last_prices(active_markets)
         ws_buffer: dict[str, list[dict[str, Any]]] = defaultdict(list)
         tick_buffer: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        orderbook_buffer: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
         shuffled_token_ids = token_ids[:]
         random.shuffle(shuffled_token_ids)
@@ -405,11 +581,12 @@ class WebSocketPhase:
                     last_prices,
                     ws_buffer,
                     tick_buffer,
+                    orderbook_buffer,
                 )
             )
             for idx, shard in enumerate(shards)
         ]
-        flush_task = asyncio.create_task(self._ws_flush_loop(ws_buffer, tick_buffer))
+        flush_task = asyncio.create_task(self._ws_flush_loop(ws_buffer, tick_buffer, orderbook_buffer))
         all_tasks = [flush_task, *shard_tasks]
 
         try:
@@ -420,9 +597,14 @@ class WebSocketPhase:
             for task in all_tasks:
                 task.cancel()
             await asyncio.gather(*all_tasks, return_exceptions=True)
+            # Final flush of remaining buffered data
             final_ws = {timeframe: rows for timeframe, rows in ws_buffer.items() if rows}
             final_ticks = {timeframe: rows for timeframe, rows in tick_buffer.items() if rows}
-            if final_ws or final_ticks:
-                flushed = self._flush_snapshot(final_ws, final_ticks)
-                if flushed:
-                    self.logger.info("Final flush on shutdown: %d rows", flushed)
+            final_ob = {timeframe: rows for timeframe, rows in orderbook_buffer.items() if rows}
+            final_spot = self.spot_price_buffer[:]
+            self.spot_price_buffer.clear()
+            if final_ws or final_ticks or final_ob or final_spot:
+                flushed = self._flush_snapshot(final_ws, final_ticks, final_ob, final_spot)
+                total = flushed + len(final_spot) + sum(len(r) for r in final_ob.values())
+                if total:
+                    self.logger.info("Final flush on shutdown: %d rows", total)

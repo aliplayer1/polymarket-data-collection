@@ -141,6 +141,12 @@ def main() -> None:
             "Also reads from env var POLYGONSCAN_API_KEY."
         ),
     )
+    parser.add_argument(
+        "--prefer-rpc",
+        action="store_true",
+        default=False,
+        help="Use RPC provider preferentially over Polygonscan for historical logs (faster if using Alchemy).",
+    )
     args = parser.parse_args()
 
     runtime_settings = RuntimeSettings.from_args(args)
@@ -158,6 +164,8 @@ def main() -> None:
                 markets_path=str(paths.markets_path),
                 prices_dir=str(paths.prices_dir),
                 ticks_dir=str(paths.ticks_dir),
+                spot_prices_dir=str(paths.spot_prices_dir),
+                orderbook_dir=str(paths.orderbook_dir),
                 logger=logger,
             )
 

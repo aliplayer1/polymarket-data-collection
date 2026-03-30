@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import time
 from datetime import datetime, timezone
 
 from py_clob_client.client import ClobClient
@@ -11,6 +12,7 @@ from .api import PolymarketApi
 from .config import CHAIN_ID, CLOB_HOST, PRICE_SUM_TOLERANCE, TIME_FRAMES
 from .models import MarketRecord
 from .phases import PipelinePaths, PriceHistoryPhase, PythPricePhase, RTDSStreamPhase, TickBackfillPhase, WebSocketPhase
+from .phases.binance_history import BinanceHistoryPhase
 from .providers import (
     ClobLastTradePriceProvider,
     LastTradePriceProvider,
@@ -52,6 +54,7 @@ class PolymarketDataPipeline:
                 rpc_url=self.settings.rpc_url,
                 polygonscan_key=self.settings.polygonscan_key,
                 logger=self.logger,
+                prefer_rpc=self.settings.prefer_rpc,
             )
 
         default_paths = self.settings.resolve_paths(PipelineRunOptions())
@@ -74,14 +77,22 @@ class PolymarketDataPipeline:
             logger=self.logger,
             paths=default_paths,
         )
+        self.binance_history_phase = BinanceHistoryPhase(
+            logger=self.logger,
+        )
 
-        # Shared in-memory cache: RTDS writes, WebSocket reads.
+        # Shared in-memory caches: RTDS writes, WebSocket reads.
         # Both run in the same asyncio event loop — no lock needed.
         # Structure: {"btcusdt": (67234.50, 1710000000087), ...}
         self._spot_price_cache: dict[str, tuple[float, int]] = {}
+        self._chainlink_price_cache: dict[str, tuple[float, int]] = {}
+        # Spot price buffer: RTDS appends rows, WS flush loop drains to Parquet.
+        self._spot_price_buffer: list[dict] = []
 
         self.rtds_stream_phase = RTDSStreamPhase(
             self._spot_price_cache,
+            self._chainlink_price_cache,
+            self._spot_price_buffer,
             logger=self.logger,
         )
         self.websocket_phase = WebSocketPhase(
@@ -90,6 +101,7 @@ class PolymarketDataPipeline:
             logger=self.logger,
             paths=default_paths,
             spot_price_cache=self._spot_price_cache,
+            spot_price_buffer=self._spot_price_buffer,
         )
 
     def _set_paths(self, paths: PipelinePaths) -> None:
@@ -108,7 +120,14 @@ class PolymarketDataPipeline:
         return self.tick_backfill_phase.run(markets)
 
     async def run_websocket(self, active_markets: list[MarketRecord]) -> None:
+        # Start RTDS first and let it warm up so the spot price cache is
+        # populated before the first WS trade events arrive.
         rtds_task = asyncio.create_task(self.rtds_stream_phase.run())
+        await asyncio.sleep(2)
+        self.logger.info(
+            "RTDS warm-up complete (%d symbols cached)",
+            len(self._spot_price_cache),
+        )
         try:
             await self.websocket_phase.run(active_markets)
         finally:
@@ -239,13 +258,21 @@ class PolymarketDataPipeline:
     ) -> list[MarketRecord]:
         self.logger.info("Fetching and processing active markets...")
         fetched_active = 0
+        skipped_expired = 0
         active_batch: list[MarketRecord] = []
         active_markets_for_ws: list[MarketRecord] = []
+        now_ts = int(time.time())
 
         for market in self.api.fetch_markets(active=True):
             fetched_active += 1
             if fetched_active % 500 == 0:
                 self.logger.info("Scanned %d active markets...", fetched_active)
+
+            # Skip markets whose prediction window has already ended.
+            # The Gamma API returns old markets as "active" long after expiry.
+            if market.end_ts < now_ts:
+                skipped_expired += 1
+                continue
 
             if self._is_market_relevant(market, run_options, scan_cutoff_ts):
                 active_markets_for_ws.append(market)
@@ -257,6 +284,24 @@ class PolymarketDataPipeline:
 
         if not run_options.websocket_only and active_batch:
             self.price_history_phase.process_market_batch(active_batch)
+
+        if skipped_expired:
+            self.logger.info(
+                "Skipped %d expired markets (end_ts < now) still marked active by Gamma API",
+                skipped_expired,
+            )
+
+        # Best-effort fee rate fetch: one call for all crypto markets (same rate)
+        crypto_markets = [m for m in active_markets_for_ws if m.category == "crypto" and m.up_token_id]
+        if crypto_markets:
+            try:
+                bps = self.api.fetch_fee_rate_bps(crypto_markets[0].up_token_id)
+                if bps is not None:
+                    for m in crypto_markets:
+                        m.fee_rate_bps = bps
+                    self.logger.info("Fee rate for crypto markets: %d bps", bps)
+            except Exception:
+                pass
 
         return active_markets_for_ws
 
@@ -437,21 +482,40 @@ class PolymarketDataPipeline:
         if not options.websocket_only:
             self.price_history_phase.flush_all()
 
-        if not options.websocket_only and self.tick_backfill_phase.is_enabled:
-            self.price_history_phase.clear_cache()
-            gc.collect()
-            all_markets_for_ticks = closed_markets_for_ticks + active_markets_for_ws
-            if all_markets_for_ticks:
+        if not options.websocket_only:
+            # Fetch Binance historical spot prices for all processed markets.
+            # This populates the spot_prices table AND provides a lookup for
+            # embedding prices into historical on-chain ticks.
+            all_markets_for_history = closed_markets_for_ticks + active_markets_for_ws
+            if all_markets_for_history:
                 self.logger.info(
-                    "Starting on-chain tick backfill for %s markets...",
-                    len(all_markets_for_ticks),
+                    "Fetching Binance historical spot prices for %s markets...",
+                    len(all_markets_for_history),
                 )
-                total_ticks = self.run_historical_tick_backfill(all_markets_for_ticks)
-                self.logger.info("Tick backfill complete: %s fills stored.", total_ticks)
-                self.logger.info("Consolidating tick shard files...")
-                consolidate_ticks(ticks_dir=self._parquet_ticks_dir, logger=self.logger)
+                spot_lookup = self.binance_history_phase.run(
+                    all_markets_for_history,
+                    spot_prices_dir=str(self.paths.spot_prices_dir),
+                )
             else:
-                self.logger.info("No markets matched for tick backfill.")
+                spot_lookup = None
+
+            if self.tick_backfill_phase.is_enabled:
+                self.price_history_phase.clear_cache()
+                gc.collect()
+                if all_markets_for_history:
+                    # Pass spot price lookup so on-chain ticks get spot_price_usdt embedded
+                    if spot_lookup is not None and self.tick_provider is not None:
+                        self.tick_provider.spot_price_lookup = spot_lookup
+                    self.logger.info(
+                        "Starting on-chain tick backfill for %s markets...",
+                        len(all_markets_for_history),
+                    )
+                    total_ticks = self.run_historical_tick_backfill(all_markets_for_history)
+                    self.logger.info("Tick backfill complete: %s fills stored.", total_ticks)
+                    self.logger.info("Consolidating tick shard files...")
+                    consolidate_ticks(ticks_dir=self._parquet_ticks_dir, logger=self.logger)
+                else:
+                    self.logger.info("No markets matched for tick backfill.")
 
         if not options.websocket_only and self.pyth_phase.is_enabled:
             self.pyth_phase.run(closed_markets_for_ticks)
@@ -466,12 +530,14 @@ class PolymarketDataPipeline:
         elif options.upload:
             self.logger.info("Uploading dataset to Hugging Face Hub...")
             try:
-                # 1. Upload main crypto dataset
+                # 1. Upload main crypto dataset (including spot prices + orderbook)
                 upload_to_huggingface(
                     repo_id=self.settings.hf_repo,
                     markets_path=self._parquet_markets_path,
                     prices_dir=self._parquet_prices_dir,
                     ticks_dir=self._parquet_ticks_dir,
+                    spot_prices_dir=str(self.paths.spot_prices_dir),
+                    orderbook_dir=str(self.paths.orderbook_dir),
                     logger=self.logger,
                     skip_consolidate=True,
                 )

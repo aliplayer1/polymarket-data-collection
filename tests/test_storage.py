@@ -20,7 +20,11 @@ from polymarket_pipeline.storage import (
     _write_parquet_atomic,
     _write_partitioned_atomic,
     append_ws_ticks_staged,
+    append_ws_spot_prices_staged,
+    append_ws_orderbook_staged,
     consolidate_ticks,
+    consolidate_spot_prices,
+    consolidate_orderbook,
     load_markets,
     load_prices,
     persist_normalized,
@@ -378,3 +382,153 @@ def test_consolidate_ticks_handles_legacy_shards_without_log_index(tmp_path):
     assert len(consolidated) == 1
     assert consolidated.iloc[0]["price"] == pytest.approx(0.57)
     assert int(consolidated.iloc[0]["log_index"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# append_ws_spot_prices_staged
+# ---------------------------------------------------------------------------
+
+def test_append_ws_spot_prices_staged_creates_staging(tmp_path):
+    spot_dir = str(tmp_path / "spot_prices")
+    rows = [
+        {"ts_ms": 1710000000000, "symbol": "btcusdt", "price": 67234.50, "source": "binance"},
+        {"ts_ms": 1710000000100, "symbol": "btcusdt", "price": 67235.00, "source": "binance"},
+        {"ts_ms": 1710000000050, "symbol": "btc/usd", "price": 67200.12, "source": "chainlink"},
+    ]
+    append_ws_spot_prices_staged(rows, spot_prices_dir=spot_dir)
+    staging = os.path.join(spot_dir, "ws_staging.parquet")
+    assert os.path.exists(staging)
+    t = pq.read_table(staging).to_pandas()
+    assert len(t) == 3
+    assert set(t["source"].unique()) == {"binance", "chainlink"}
+    assert t["price"].dtype == "float64"  # full precision
+
+
+def test_append_ws_spot_prices_staged_accumulates(tmp_path):
+    spot_dir = str(tmp_path / "spot_prices2")
+    rows1 = [{"ts_ms": 1000, "symbol": "btcusdt", "price": 67000.0, "source": "binance"}]
+    rows2 = [{"ts_ms": 2000, "symbol": "btcusdt", "price": 67001.0, "source": "binance"}]
+    append_ws_spot_prices_staged(rows1, spot_prices_dir=spot_dir)
+    append_ws_spot_prices_staged(rows2, spot_prices_dir=spot_dir)
+    t = pq.read_table(os.path.join(spot_dir, "ws_staging.parquet")).to_pandas()
+    assert len(t) == 2
+
+
+def test_append_ws_spot_prices_staged_empty_noop(tmp_path):
+    spot_dir = str(tmp_path / "spot_empty")
+    append_ws_spot_prices_staged([], spot_prices_dir=spot_dir)
+    assert not os.path.exists(spot_dir)
+
+
+# ---------------------------------------------------------------------------
+# consolidate_spot_prices
+# ---------------------------------------------------------------------------
+
+def test_consolidate_spot_prices_deduplicates(tmp_path):
+    spot_dir = tmp_path / "spot_prices"
+    spot_dir.mkdir()
+    # Write two staging files with overlapping rows
+    df1 = pd.DataFrame({
+        "ts_ms": [1000, 2000],
+        "symbol": ["btcusdt", "btcusdt"],
+        "price": [67000.0, 67001.0],
+        "source": ["binance", "binance"],
+    })
+    df2 = pd.DataFrame({
+        "ts_ms": [2000, 3000],
+        "symbol": ["btcusdt", "btcusdt"],
+        "price": [67001.5, 67002.0],
+        "source": ["binance", "binance"],
+    })
+    pq.write_table(pa.Table.from_pandas(df1, preserve_index=False), spot_dir / "ws_staging.parquet")
+    pq.write_table(pa.Table.from_pandas(df2, preserve_index=False), spot_dir / "shard_2.parquet")
+
+    consolidate_spot_prices(spot_prices_dir=str(spot_dir))
+
+    assert sorted(os.listdir(spot_dir)) == ["part-0.parquet"]
+    result = pq.read_table(spot_dir / "part-0.parquet").to_pandas()
+    # ts_ms=2000 duplicated — should keep last (from shard_2)
+    assert len(result) == 3
+    assert result["ts_ms"].is_monotonic_increasing
+
+
+# ---------------------------------------------------------------------------
+# append_ws_orderbook_staged
+# ---------------------------------------------------------------------------
+
+def test_append_ws_orderbook_staged_creates_staging(tmp_path):
+    ob_dir = str(tmp_path / "orderbook")
+    df = pd.DataFrame({
+        "ts_ms": [1710000000000],
+        "market_id": ["m1"],
+        "token_id": ["tok1"],
+        "outcome": ["Up"],
+        "best_bid": [0.48],
+        "best_ask": [0.52],
+        "best_bid_size": [150.0],
+        "best_ask_size": [200.0],
+        "crypto": ["BTC"],
+        "timeframe": ["5-minute"],
+    })
+    append_ws_orderbook_staged(df, orderbook_dir=ob_dir)
+    staging = os.path.join(ob_dir, "crypto=BTC", "timeframe=5-minute", "ws_staging.parquet")
+    assert os.path.exists(staging)
+    t = pq.read_table(staging).to_pandas()
+    assert len(t) == 1
+    assert t.iloc[0]["best_bid"] == pytest.approx(0.48)
+
+
+def test_append_ws_orderbook_staged_accumulates(tmp_path):
+    ob_dir = str(tmp_path / "orderbook2")
+    def _make_row(ts):
+        return pd.DataFrame({
+            "ts_ms": [ts], "market_id": ["m1"], "token_id": ["t1"],
+            "outcome": ["Up"], "best_bid": [0.5], "best_ask": [0.5],
+            "best_bid_size": [100.0], "best_ask_size": [100.0],
+            "crypto": ["BTC"], "timeframe": ["5-minute"],
+        })
+    append_ws_orderbook_staged(_make_row(1000), orderbook_dir=ob_dir)
+    append_ws_orderbook_staged(_make_row(2000), orderbook_dir=ob_dir)
+    staging = os.path.join(ob_dir, "crypto=BTC", "timeframe=5-minute", "ws_staging.parquet")
+    t = pq.read_table(staging).to_pandas()
+    assert len(t) == 2
+
+
+# ---------------------------------------------------------------------------
+# consolidate_orderbook
+# ---------------------------------------------------------------------------
+
+def test_consolidate_orderbook_merges_shards(tmp_path):
+    ob_dir = tmp_path / "orderbook"
+    shard_dir = ob_dir / "crypto=BTC" / "timeframe=5-minute"
+    shard_dir.mkdir(parents=True)
+
+    df1 = pd.DataFrame({
+        "ts_ms": [1000, 2000],
+        "market_id": ["m1", "m1"],
+        "token_id": ["t1", "t1"],
+        "outcome": ["Up", "Up"],
+        "best_bid": [0.48, 0.49],
+        "best_ask": [0.52, 0.51],
+        "best_bid_size": [100.0, 110.0],
+        "best_ask_size": [100.0, 90.0],
+    })
+    df2 = pd.DataFrame({
+        "ts_ms": [3000],
+        "market_id": ["m1"],
+        "token_id": ["t1"],
+        "outcome": ["Up"],
+        "best_bid": [0.50],
+        "best_ask": [0.50],
+        "best_bid_size": [120.0],
+        "best_ask_size": [80.0],
+    })
+    pq.write_table(pa.Table.from_pandas(df1, preserve_index=False), shard_dir / "ws_staging.parquet")
+    pq.write_table(pa.Table.from_pandas(df2, preserve_index=False), shard_dir / "shard_2.parquet")
+
+    consolidate_orderbook(orderbook_dir=str(ob_dir))
+
+    assert sorted(os.listdir(shard_dir)) == ["part-0.parquet"]
+    result = pq.read_table(shard_dir / "part-0.parquet").to_pandas()
+    assert len(result) == 3
+    assert result["ts_ms"].is_monotonic_increasing

@@ -231,6 +231,7 @@ MARKETS_SCHEMA = pa.schema([
     ("condition_id", pa.string()),
     ("up_token_id", pa.string()),
     ("down_token_id", pa.string()),
+    ("fee_rate_bps", pa.int16()),  # taker fee rate (basis points); -1 = unknown
 ])
 
 PRICES_SCHEMA = pa.schema([
@@ -283,6 +284,31 @@ TICKS_SCHEMA = pa.schema([
     ("spot_price_usdt", pa.float32()),   # e.g. 67234.50 for BTC/USDT
     ("spot_price_ts_ms", pa.int64()),    # Binance timestamp of the spot price (epoch ms)
     # partition columns (crypto, timeframe) are implicit
+])
+
+# Continuous spot price stream from Polymarket RTDS (Binance + Chainlink feeds).
+# One row per price update — high frequency (~1-5 Hz for BTC Binance, ~0.1 Hz Chainlink).
+# Flat directory (no Hive partitioning) — total volume is moderate.
+SPOT_PRICES_SCHEMA = pa.schema([
+    ("ts_ms",   pa.int64()),       # source timestamp (epoch ms): Binance or Chainlink ts
+    ("symbol",  pa.string()),      # RTDS symbol: "btcusdt", "ethusdt", "btc/usd", "eth/usd"
+    ("price",   pa.float64()),     # spot price in USD(T) — float64 for full precision
+    ("source",  pa.dictionary(pa.int8(), pa.string())),   # "binance" / "chainlink"
+])
+
+# Per-token orderbook BBO snapshots from CLOB WebSocket price_change events.
+# One row per BBO update per token — captures bid/ask/sizes for spread and OFI reconstruction.
+# Hive-partitioned by crypto/timeframe (same as ticks).
+ORDERBOOK_SCHEMA = pa.schema([
+    ("ts_ms",          pa.int64()),     # local receipt timestamp (epoch ms)
+    ("market_id",      pa.string()),
+    ("token_id",       pa.string()),
+    ("outcome",        pa.dictionary(pa.int8(), pa.string())),  # "Up" / "Down"
+    ("best_bid",       pa.float32()),
+    ("best_ask",       pa.float32()),
+    ("best_bid_size",  pa.float32()),
+    ("best_ask_size",  pa.float32()),
+    # partition columns (crypto, timeframe) implicit
 ])
 
 # ---------------------------------------------------------------------------
@@ -441,7 +467,7 @@ def split_markets_prices(flat_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
         volume, resolution, question
     """
     if flat_df.empty:
-        markets_df = pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "up_token_id", "down_token_id"])
+        markets_df = pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "up_token_id", "down_token_id", "fee_rate_bps"])
         prices_df = pd.DataFrame(columns=["market_id", "timestamp", "up_price", "down_price", "crypto", "timeframe"])
         return markets_df, prices_df
 
@@ -459,6 +485,7 @@ def split_markets_prices(flat_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
             "condition_id": "last",
             "up_token_id": "last",
             "down_token_id": "last",
+            **({"fee_rate_bps": "last"} if "fee_rate_bps" in flat_df.columns else {}),
         })
         .reset_index()
     )
@@ -492,7 +519,10 @@ def optimise_markets_df(df: pd.DataFrame) -> pd.DataFrame:
         df["up_token_id"] = df["up_token_id"].astype("string")
     if "down_token_id" in df.columns:
         df["down_token_id"] = df["down_token_id"].astype("string")
-    
+    if "fee_rate_bps" not in df.columns:
+        df["fee_rate_bps"] = -1
+    df["fee_rate_bps"] = pd.to_numeric(df["fee_rate_bps"], errors="coerce").fillna(-1).astype("int16")
+
     return df
 
 
@@ -536,7 +566,7 @@ def load_markets(markets_path: str | None = None) -> pd.DataFrame:
     path = markets_path or PARQUET_MARKETS_PATH
     if os.path.exists(path):
         return pq.read_table(path).to_pandas()
-    return pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "up_token_id", "down_token_id"])
+    return pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "up_token_id", "down_token_id", "fee_rate_bps"])
 
 
 def _read_hive_partitioned_robust(
@@ -1060,6 +1090,216 @@ def append_ws_ticks_staged(
     log.info("WS ticks staged: %d new rows to %s/", rows_staged, t_dir)
 
 
+def append_ws_spot_prices_staged(
+    rows: list[dict],
+    *,
+    spot_prices_dir: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Append RTDS spot price rows to a staging file.
+
+    Spot prices are stored in a flat directory (no Hive partitioning) since
+    the total data volume is moderate (~1-5 rows/sec for active symbols).
+    """
+    if not rows:
+        return
+
+    log = logger or logging.getLogger("polymarket_pipeline")
+    df = pd.DataFrame(rows)
+    df["ts_ms"] = df["ts_ms"].astype("int64")
+    df["price"] = df["price"].astype("float64")
+    df["source"] = df["source"].astype("category")
+
+    os.makedirs(spot_prices_dir, exist_ok=True)
+    staging_path = os.path.join(spot_prices_dir, _WS_STAGING_FILENAME)
+
+    data_root = os.path.dirname(os.path.abspath(spot_prices_dir))
+    with _write_lock(data_root):
+        if os.path.exists(staging_path):
+            existing = pq.ParquetFile(staging_path).read().to_pandas()
+            for col in ("source",):
+                if col in existing.columns and hasattr(existing[col], "cat"):
+                    existing[col] = existing[col].astype(str)
+            df["source"] = df["source"].astype(str)
+            merged = pd.concat([existing, df], ignore_index=True)
+        else:
+            merged = df
+
+        table = pa.Table.from_pandas(merged, preserve_index=False)
+        _write_parquet_atomic(table, staging_path)
+
+    log.info("Spot prices staged: %d new rows to %s/", len(rows), spot_prices_dir)
+
+
+def append_ws_orderbook_staged(
+    rows_df: pd.DataFrame,
+    *,
+    orderbook_dir: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Append orderbook BBO rows to per-partition staging files.
+
+    Same staging pattern as ``append_ws_ticks_staged``: lightweight sidecar
+    files per (crypto, timeframe) partition, absorbed on consolidation.
+    """
+    if rows_df.empty:
+        return
+
+    log = logger or logging.getLogger("polymarket_pipeline")
+
+    for col in ("outcome", "crypto", "timeframe"):
+        if col in rows_df.columns and hasattr(rows_df[col], "cat"):
+            rows_df = rows_df.copy()
+            rows_df[col] = rows_df[col].astype(str)
+
+    data_root = os.path.dirname(os.path.abspath(orderbook_dir))
+    rows_staged = 0
+
+    with _write_lock(data_root):
+        for (crypto, timeframe), group in rows_df.groupby(
+            ["crypto", "timeframe"], sort=False
+        ):
+            shard_dir = os.path.join(orderbook_dir, f"crypto={crypto}", f"timeframe={timeframe}")
+            os.makedirs(shard_dir, exist_ok=True)
+            staging_path = os.path.join(shard_dir, _WS_STAGING_FILENAME)
+
+            new_rows = group.drop(columns=["crypto", "timeframe"]).reset_index(drop=True)
+            for col in ("outcome",):
+                if col in new_rows.columns and hasattr(new_rows[col], "cat"):
+                    new_rows[col] = new_rows[col].astype(str)
+
+            if os.path.exists(staging_path):
+                existing = pq.ParquetFile(staging_path).read().to_pandas()
+                merged = pd.concat([existing, new_rows], ignore_index=True)
+            else:
+                merged = new_rows
+
+            table = pa.Table.from_pandas(merged, preserve_index=False)
+            _write_parquet_atomic(table, staging_path)
+            rows_staged += len(new_rows)
+
+    log.info("Orderbook BBO staged: %d new rows to %s/", rows_staged, orderbook_dir)
+
+
+def consolidate_spot_prices(
+    *,
+    spot_prices_dir: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Consolidate spot price staging files into a single sorted Parquet file."""
+    log = logger or logging.getLogger("polymarket_pipeline")
+    if not os.path.exists(spot_prices_dir):
+        return
+
+    parquet_files = [f for f in os.listdir(spot_prices_dir) if f.endswith(".parquet")]
+    if not parquet_files or parquet_files == ["part-0.parquet"]:
+        return
+
+    data_root = os.path.dirname(os.path.abspath(spot_prices_dir))
+    with _write_lock(data_root):
+        # Re-check inside lock
+        parquet_files = [f for f in os.listdir(spot_prices_dir) if f.endswith(".parquet")]
+        if not parquet_files or parquet_files == ["part-0.parquet"]:
+            return
+
+        log.info("Consolidating spot prices (%d files)...", len(parquet_files))
+        frames = []
+        for fname in parquet_files:
+            try:
+                df = pq.ParquetFile(os.path.join(spot_prices_dir, fname)).read().to_pandas()
+                frames.append(df)
+            except Exception:
+                continue
+
+        if not frames:
+            return
+
+        merged = pd.concat(frames, ignore_index=True)
+        # Dedup on (ts_ms, symbol, source) — same price at same time from same source
+        merged = merged.drop_duplicates(subset=["ts_ms", "symbol", "source"], keep="last")
+        merged = merged.sort_values("ts_ms").reset_index(drop=True)
+        merged["source"] = merged["source"].astype("category")
+
+        consolidated_path = os.path.join(spot_prices_dir, "part-0.parquet")
+        table = pa.Table.from_pandas(merged, preserve_index=False)
+        tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
+        try:
+            _check_disk_space(spot_prices_dir)
+            table = _stamp_schema_version(table)
+            pq.write_table(table, tmp_path, compression="zstd")
+            for fname in parquet_files:
+                try:
+                    os.remove(os.path.join(spot_prices_dir, fname))
+                except OSError:
+                    pass
+            os.replace(tmp_path, consolidated_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    log.info("Spot prices consolidated: %d rows", len(merged))
+
+
+def consolidate_orderbook(
+    *,
+    orderbook_dir: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Consolidate orderbook staging files per partition (same pattern as tick consolidation)."""
+    log = logger or logging.getLogger("polymarket_pipeline")
+    if not os.path.exists(orderbook_dir):
+        return
+
+    data_root = os.path.dirname(os.path.abspath(orderbook_dir))
+
+    for dirpath, _dirs, _fnames in os.walk(orderbook_dir):
+        with _write_lock(data_root):
+            parquet_files = [f for f in os.listdir(dirpath) if f.endswith(".parquet")]
+            if not parquet_files or parquet_files == ["part-0.parquet"]:
+                continue
+
+            rel = os.path.relpath(dirpath, orderbook_dir)
+            log.info("Consolidating orderbook partition %s (%d files)...", rel, len(parquet_files))
+
+            frames = []
+            for fname in parquet_files:
+                try:
+                    df = pq.ParquetFile(os.path.join(dirpath, fname)).read().to_pandas()
+                    frames.append(df)
+                except Exception:
+                    continue
+
+            if not frames:
+                continue
+
+            merged = pd.concat(frames, ignore_index=True)
+            merged = merged.sort_values("ts_ms").reset_index(drop=True)
+            if "outcome" in merged.columns and hasattr(merged["outcome"], "cat"):
+                merged["outcome"] = merged["outcome"].astype(str)
+            merged["outcome"] = merged["outcome"].astype("category")
+
+            consolidated_path = os.path.join(dirpath, "part-0.parquet")
+            table = pa.Table.from_pandas(merged, preserve_index=False)
+            tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
+            try:
+                _check_disk_space(dirpath)
+                table = _stamp_schema_version(table)
+                pq.write_table(table, tmp_path, compression="zstd")
+                for fname in parquet_files:
+                    try:
+                        os.remove(os.path.join(dirpath, fname))
+                    except OSError:
+                        pass
+                os.replace(tmp_path, consolidated_path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+
+        log.info("  -> %s consolidated: %d rows", rel, len(merged))
+
+
 # ---------------------------------------------------------------------------
 # Write helpers  (atomic: write to per-PID .tmp dir then rename)
 # ---------------------------------------------------------------------------
@@ -1354,6 +1594,8 @@ def upload_to_huggingface(
     markets_path: str | None = None,
     prices_dir: str | None = None,
     ticks_dir: str | None = None,
+    spot_prices_dir: str | None = None,
+    orderbook_dir: str | None = None,
     logger: logging.Logger | None = None,
     skip_consolidate: bool = False,
 ) -> None:
@@ -1393,6 +1635,10 @@ def upload_to_huggingface(
         # ran consolidation in this session (skip_consolidate=True).
         if not skip_consolidate and os.path.exists(t_dir):
             consolidate_ticks(ticks_dir=t_dir, logger=log)
+        if spot_prices_dir and os.path.exists(spot_prices_dir):
+            consolidate_spot_prices(spot_prices_dir=spot_prices_dir, logger=log)
+        if orderbook_dir and os.path.exists(orderbook_dir):
+            consolidate_orderbook(orderbook_dir=orderbook_dir, logger=log)
 
         # Upload markets table
         if os.path.exists(m_path):
@@ -1430,6 +1676,28 @@ def upload_to_huggingface(
                 ignore_patterns=_ignore,
             )
             log.info("Uploaded %s/ -> data/ticks/", t_dir)
+
+        # Upload spot prices (flat directory)
+        if spot_prices_dir and os.path.exists(spot_prices_dir):
+            api.upload_folder(
+                folder_path=spot_prices_dir,
+                path_in_repo="data/spot_prices",
+                repo_id=repo,
+                repo_type="dataset",
+                ignore_patterns=_ignore,
+            )
+            log.info("Uploaded %s/ -> data/spot_prices/", spot_prices_dir)
+
+        # Upload orderbook partition tree
+        if orderbook_dir and os.path.exists(orderbook_dir):
+            api.upload_folder(
+                folder_path=orderbook_dir,
+                path_in_repo="data/orderbook",
+                repo_id=repo,
+                repo_type="dataset",
+                ignore_patterns=_ignore,
+            )
+            log.info("Uploaded %s/ -> data/orderbook/", orderbook_dir)
 
     log.info("Upload complete.")
 

@@ -26,6 +26,9 @@ class MarketRecord:
     tokens: dict[str, str] = field(default_factory=dict) # outcome_name -> token_id
     category: str = "crypto" # "crypto" or "culture"
 
+    # Fee schedule (fetched from CLOB API; None if not yet fetched)
+    fee_rate_bps: int | None = None
+
     def __post_init__(self):
         if not self.tokens and self.up_token_id and self.down_token_id:
             self.tokens = {

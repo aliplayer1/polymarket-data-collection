@@ -61,6 +61,9 @@ class FakeApi:
             {"t": start_ts + 50, "p": 0.35},
         ]
 
+    def fetch_fee_rate_bps(self, token_id: str) -> int | None:
+        return 2500
+
 
 class FakeTickProvider:
     def __init__(self) -> None:
@@ -95,7 +98,7 @@ class FakeTickProvider:
         }
 
 
-def _market(market_id: str, *, is_active: bool, start_ts: int = 0, end_ts: int = 300) -> MarketRecord:
+def _market(market_id: str, *, is_active: bool, start_ts: int = 0, end_ts: int = 2000000000) -> MarketRecord:
     return MarketRecord(
         market_id=market_id,
         market_type="crypto-up-down",
@@ -116,7 +119,8 @@ def _market(market_id: str, *, is_active: bool, start_ts: int = 0, end_ts: int =
 
 
 def _pipeline(*, api: FakeApi, settings: RuntimeSettings, tick_provider=None) -> PolymarketDataPipeline:
-    return PolymarketDataPipeline(
+    from polymarket_pipeline.phases.binance_history import SpotPriceLookup
+    p = PolymarketDataPipeline(
         api=api,
         client=object(),
         last_trade_price_provider=DummyLastTradePriceProvider(),
@@ -124,6 +128,9 @@ def _pipeline(*, api: FakeApi, settings: RuntimeSettings, tick_provider=None) ->
         logger=logging.getLogger("test"),
         settings=settings,
     )
+    # Stub out Binance phase to avoid real HTTP calls during tests
+    p.binance_history_phase.run = lambda markets, *, spot_prices_dir: SpotPriceLookup()
+    return p
 
 
 def test_pipeline_test_mode_uses_test_output_and_skips_websocket(tmp_path, monkeypatch) -> None:
@@ -180,7 +187,7 @@ def test_pipeline_websocket_only_fetches_active_markets_and_runs_stream(tmp_path
 
 
 def test_pipeline_historical_only_runs_tick_backfill_without_websocket(tmp_path, monkeypatch) -> None:
-    api = FakeApi(closed_markets=[_market("closed-1", is_active=False)])
+    api = FakeApi(closed_markets=[_market("closed-1", is_active=False, start_ts=1000000, end_ts=1000300)])
     tick_provider = FakeTickProvider()
     pipeline = _pipeline(
         api=api,
@@ -205,7 +212,7 @@ def test_pipeline_historical_only_runs_tick_backfill_without_websocket(tmp_path,
 
     assert api.closed_calls == [None]
     assert api.active_calls == []
-    assert tick_provider.calls == [(("closed-1",), 0, 300)]
+    assert tick_provider.calls == [(("closed-1",), 1000000, 1000300)]
     assert consolidate_calls == [str(tmp_path / "data" / "ticks")]
     assert websocket_calls == []
     assert summary_calls == ["printed"]

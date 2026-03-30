@@ -6,6 +6,8 @@ from polymarket_pipeline.phases.shared import (
     build_binary_price_frame,
     build_binary_price_row,
     build_binary_tick_row,
+    build_spot_price_row,
+    build_orderbook_row,
 )
 
 
@@ -81,3 +83,52 @@ def test_shared_builders_require_both_binary_sides() -> None:
             side_prices={"up": 0.5},
             resolution=None,
         )
+
+
+def test_spot_price_row_builder() -> None:
+    row = build_spot_price_row(
+        ts_ms=1710000000000,
+        symbol="btcusdt",
+        price=67234.50,
+        source="binance",
+    )
+    assert row["ts_ms"] == 1710000000000
+    assert row["symbol"] == "btcusdt"
+    assert row["price"] == 67234.50
+    assert row["source"] == "binance"
+
+
+def test_spot_price_row_builder_chainlink() -> None:
+    row = build_spot_price_row(
+        ts_ms=1710000000000,
+        symbol="btc/usd",
+        price=67200.12345,
+        source="chainlink",
+    )
+    assert row["symbol"] == "btc/usd"
+    assert row["source"] == "chainlink"
+    assert row["price"] == 67200.12345
+
+
+def test_orderbook_row_builder() -> None:
+    market = _market()
+    row = build_orderbook_row(
+        market,
+        ts_ms=1710000000000,
+        token_id="up-token",
+        outcome_side="up",
+        best_bid=0.48,
+        best_ask=0.52,
+        best_bid_size=150.0,
+        best_ask_size=200.0,
+    )
+    assert row["ts_ms"] == 1710000000000
+    assert row["market_id"] == "m1"
+    assert row["token_id"] == "up-token"
+    assert row["outcome"] == "Up"  # outcome_name_for_side maps "up" -> "Up"
+    assert row["best_bid"] == 0.48
+    assert row["best_ask"] == 0.52
+    assert row["best_bid_size"] == 150.0
+    assert row["best_ask_size"] == 200.0
+    assert row["crypto"] == "BTC"
+    assert row["timeframe"] == "5-minute"
