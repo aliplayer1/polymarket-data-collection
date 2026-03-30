@@ -36,10 +36,10 @@ WS_FLUSH_BATCH_SIZE = 200
 # 500 tokens ≈ 38 KB per shard; with ~6 shards all connections stay stable.
 WS_MAX_TOKENS_PER_SHARD = 500
 # Hard cap on total in-memory WS+tick buffer rows across all timeframes.
-# If the flush loop falls behind (slow disk / lock contention), the buffer
+# If the flush loop behind (slow disk / lock contention), the buffer
 # would grow unboundedly and eventually OOM.  When this cap is hit the oldest
 # half of each buffer is evicted and an ERROR is logged.
-WS_BUFFER_MAX_ROWS = 1_000_000
+WS_BUFFER_MAX_ROWS = 600_000
 
 TIME_FRAMES = tuple(
     tf for d in _MARKET_DEFINITIONS for tf in d.timeframe_names
