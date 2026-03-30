@@ -36,11 +36,12 @@ class PolymarketDataPipeline:
         logger: logging.Logger | None = None,
         settings: RuntimeSettings | None = None,
         rpc_url: str | None = None,
+        rpc_urls: list[str] | None = None,
         polygonscan_key: str | None = None,
     ) -> None:
         self.logger = logger or logging.getLogger("polymarket_pipeline")
         self.settings = settings or RuntimeSettings(
-            rpc_url=rpc_url,
+            rpc_urls=tuple(rpc_urls) if rpc_urls else ((rpc_url,) if rpc_url else ()),
             polygonscan_key=polygonscan_key,
         )
         self.api = api or PolymarketApi(logger=self.logger)
@@ -49,9 +50,9 @@ class PolymarketDataPipeline:
             last_trade_price_provider or ClobLastTradePriceProvider(self._clob_client)
         )
         self.tick_provider = tick_provider
-        if self.tick_provider is None and (self.settings.rpc_url or self.settings.polygonscan_key):
+        if self.tick_provider is None and (self.settings.rpc_urls or self.settings.polygonscan_key):
             self.tick_provider = PolygonTickFetcher(
-                rpc_url=self.settings.rpc_url,
+                rpc_url=self.settings.rpc_urls,
                 polygonscan_key=self.settings.polygonscan_key,
                 logger=self.logger,
                 prefer_rpc=self.settings.prefer_rpc,

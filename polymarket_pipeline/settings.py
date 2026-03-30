@@ -101,7 +101,7 @@ class PipelineRunOptions:
 
 @dataclass(frozen=True)
 class RuntimeSettings:
-    rpc_url: str | None = None
+    rpc_urls: tuple[str, ...] = ()
     polygonscan_key: str | None = None
     data_dir: Path | None = None
     log_file: Path | None = None
@@ -110,11 +110,14 @@ class RuntimeSettings:
 
     @classmethod
     def from_args(cls, args: Any) -> "RuntimeSettings":
+        raw_rpc = _coalesce(
+            getattr(args, "rpc_url", None),
+            os.environ.get("POLYGON_RPC_URL"),
+        )
+        rpc_urls = _coerce_tuple(raw_rpc, transform=lambda item: item.strip())
+
         return cls(
-            rpc_url=_coalesce(
-                getattr(args, "rpc_url", None),
-                os.environ.get("POLYGON_RPC_URL"),
-            ),
+            rpc_urls=rpc_urls,
             polygonscan_key=_coalesce(
                 getattr(args, "polygonscan_key", None),
                 os.environ.get("POLYGONSCAN_API_KEY"),
@@ -153,7 +156,7 @@ class RuntimeSettings:
         hf_repo: str | None = None,
     ) -> "RuntimeSettings":
         return RuntimeSettings(
-            rpc_url=self.rpc_url,
+            rpc_urls=self.rpc_urls,
             polygonscan_key=self.polygonscan_key,
             data_dir=_coerce_path(data_dir) or self.data_dir,
             log_file=self.log_file,
@@ -168,6 +171,10 @@ class RuntimeSettings:
         if self.data_dir is not None:
             return PipelinePaths.from_root(self.data_dir)
         return PipelinePaths.from_root(PARQUET_DATA_DIR)
+
+    @property
+    def rpc_url(self) -> str | None:
+        return self.rpc_urls[0] if self.rpc_urls else None
 
     @property
     def log_file_str(self) -> str | None:

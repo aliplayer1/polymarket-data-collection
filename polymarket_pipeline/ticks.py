@@ -79,23 +79,31 @@ class PolygonTickFetcher:
     RPC_LOG_CHUNK_BLOCKS  = 10
 
     # Minimum gap between any two Etherscan V2 API calls (3 req/s limit).
-    # 0.4 s gives 2.5 req/s, providing safety headroom for the 3/sec cap
-    _ETHERSCAN_MIN_INTERVAL = 0.4
+    # 0.5 s gives 2.0 req/s, providing substantial safety headroom for the
+    # 3/sec cap to account for network jitter and multiple threads.
+    _ETHERSCAN_MIN_INTERVAL = 0.5
 
     # Minimum gap between eth_getLogs RPC calls on Alchemy free tier.
-    # 0.2 s gives 5 calls/s, which fits within Alchemy free tier throughput.
-    _RPC_LOGS_MIN_INTERVAL = 0.2
+    # 0.3 s gives ~3.3 calls/s, which fits safely within Alchemy throughput.
+    _RPC_LOGS_MIN_INTERVAL = 0.3
 
     def __init__(
         self,
-        rpc_url: str | None = None,
+        rpc_url: str | Sequence[str] | None = None,
         polygonscan_key: str | None = None,
         timeout: int = 30,
         logger: logging.Logger | None = None,
         prefer_rpc: bool = False,
         spot_price_lookup: SpotPriceLookup | None = None,
     ) -> None:
-        self.rpc_url = rpc_url
+        if isinstance(rpc_url, str):
+            self._rpc_urls = [rpc_url]
+        elif rpc_url:
+            self._rpc_urls = list(rpc_url)
+        else:
+            self._rpc_urls = []
+
+        self._current_rpc_idx = 0
         self.polygonscan_key = polygonscan_key
         self.timeout = timeout
         self.logger = logger or logging.getLogger("polymarket_pipeline.ticks")
@@ -110,24 +118,48 @@ class PolygonTickFetcher:
         self._etherscan_lock = threading.Lock()
         self._rpc_logs_lock = threading.Lock()
         self._block_cache_lock = threading.Lock()
+        self._rpc_lock = threading.Lock()
+
+    @property
+    def rpc_url(self) -> str | None:
+        if not self._rpc_urls:
+            return None
+        return self._rpc_urls[self._current_rpc_idx]
+
+    def _rotate_rpc(self) -> str | None:
+        """Switch to the next available RPC URL in the rotation."""
+        with self._rpc_lock:
+            if not self._rpc_urls or len(self._rpc_urls) <= 1:
+                return self.rpc_url
+            
+            self._current_rpc_idx = (self._current_rpc_idx + 1) % len(self._rpc_urls)
+            new_url = self.rpc_url
+            self.logger.info("RPC limit reached; rotating to next provider: %s", self._masked_rpc_url)
+            
+            # Clear block cache on rotation just in case providers have different
+            # view of the latest blocks or one is significantly lagging.
+            with self._block_cache_lock:
+                self._block_cache.clear()
+            
+            return new_url
 
     @property
     def _masked_rpc_url(self) -> str:
-        """RPC URL with the API key replaced by <key> for safe logging.
-
-        Alchemy URLs have the form ``.../v2/<key>``; we mask everything after
-        the last ``/`` so the key never appears in log files.
-        """
-        if not self.rpc_url:
+        """RPC URL with the API key replaced by <key> for safe logging."""
+        current = self.rpc_url
+        if not current:
             return "<no rpc_url>"
-        idx = self.rpc_url.rfind("/")
-        return (self.rpc_url[: idx + 1] + "<key>") if idx >= 0 else "<rpc_url>"
+        idx = current.rfind("/")
+        return (current[: idx + 1] + "<key>") if idx >= 0 else "<rpc_url>"
 
     def _sanitize_exc(self, exc: Exception) -> str:
-        """Return str(exc) with the raw RPC URL (containing API key) masked."""
+        """Return str(exc) with any raw RPC URL masked."""
         msg = str(exc)
-        if self.rpc_url and self.rpc_url in msg:
-            msg = msg.replace(self.rpc_url, self._masked_rpc_url)
+        for url in self._rpc_urls:
+            if url in msg:
+                idx = url.rfind("/")
+                masked = (url[: idx + 1] + "<key>") if idx >= 0 else "<rpc_url>"
+                msg = msg.replace(url, masked)
         return msg
 
     # ------------------------------------------------------------------
@@ -604,11 +636,23 @@ class PolygonTickFetcher:
                 # we use exponential back-off with a longer base than for generic
                 # errors so that the rate limiter has time to refill.
                 if resp.status_code in (429, 503):
+                    # Check if we have alternative providers to rotate to
+                    if len(self._rpc_urls) > 1:
+                        self.logger.warning(
+                            "RPC %s hit rate limit (HTTP %s); rotating to next provider...",
+                            method, resp.status_code
+                        )
+                        self._rotate_rpc()
+                        # Immediately retry the same attempt with new provider
+                        continue
+
                     retry_after_raw = resp.headers.get("Retry-After")
                     try:
-                        wait = max(float(retry_after_raw), 1.0) if retry_after_raw else 2 ** attempt * 3
+                        # Alchemy/QuickNode can be very aggressive. We wait at least 10s
+                        # to ensure the CU bucket has time to refill.
+                        wait = max(float(retry_after_raw), 10.0) if retry_after_raw else (2 ** attempt * 5.0 + 5.0)
                     except (TypeError, ValueError):
-                        wait = 2 ** attempt * 3
+                        wait = 2 ** attempt * 5.0 + 5.0
                     if attempt < self._MAX_RETRIES:
                         self.logger.warning(
                             "RPC call %s rate-limited (HTTP %s, attempt %d/%d), "
