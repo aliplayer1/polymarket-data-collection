@@ -39,7 +39,7 @@ WS_MAX_TOKENS_PER_SHARD = 500
 # If the flush loop falls behind (slow disk / lock contention), the buffer
 # would grow unboundedly and eventually OOM.  When this cap is hit the oldest
 # half of each buffer is evicted and an ERROR is logged.
-WS_BUFFER_MAX_ROWS = 200_000
+WS_BUFFER_MAX_ROWS = 1_000_000
 
 TIME_FRAMES = tuple(
     tf for d in _MARKET_DEFINITIONS for tf in d.timeframe_names
