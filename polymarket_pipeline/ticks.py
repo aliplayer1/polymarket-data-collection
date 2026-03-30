@@ -97,8 +97,12 @@ class PolygonTickFetcher:
         prefer_rpc: bool = False,
         spot_price_lookup: SpotPriceLookup | None = None,
     ) -> None:
+        # Final, absolute fix for multi-URL parsing:
         if isinstance(rpc_url, str):
-            self._rpc_urls = [rpc_url]
+            if "," in rpc_url:
+                self._rpc_urls = [s.strip() for s in rpc_url.split(",") if s.strip()]
+            else:
+                self._rpc_urls = [rpc_url]
         elif rpc_url:
             self._rpc_urls = list(rpc_url)
         else:
@@ -121,13 +125,22 @@ class PolygonTickFetcher:
         self._block_cache_lock = threading.Lock()
         self._rpc_lock = threading.Lock()
 
-        self.logger.info("PolygonTickFetcher initialized with %d RPC providers", len(self._rpc_urls))
+        self.logger.info("PolygonTickFetcher initialized with %d RPC providers: %s", 
+                         len(self._rpc_urls), ", ".join(self._masked_rpc_urls))
 
     @property
     def rpc_url(self) -> str | None:
         if not self._rpc_urls:
             return None
         return self._rpc_urls[self._current_rpc_idx]
+
+    @property
+    def _masked_rpc_urls(self) -> list[str]:
+        masked = []
+        for url in self._rpc_urls:
+            idx = url.rfind("/")
+            masked.append((url[: idx + 1] + "<key>") if idx >= 0 else "<rpc_url>")
+        return masked
 
     def _rotate_rpc(self) -> str | None:
         """Switch to the next available RPC URL in the rotation."""
@@ -274,9 +287,16 @@ class PolygonTickFetcher:
         """Actual implementation of ts→block conversion (no cache)."""
         # 1. Polygonscan (preferred — one call, exact result)
         if self.polygonscan_key:
-            block = self._ts_to_block_polygonscan(target_ts)
-            if block is not None:
-                return block
+            # We retry Etherscan lookups multiple times with long waits because
+            # falling back to RPC is currently fatal (429).
+            for attempt in range(5):
+                block = self._ts_to_block_polygonscan(target_ts)
+                if block is not None:
+                    return block
+                if attempt < 4:
+                    wait = 5 + (attempt * 5)
+                    self.logger.warning("Etherscan block lookup failed; retrying in %ds before RPC fallback...", wait)
+                    time.sleep(wait)
 
         # 2. RPC binary-search fallback
         current_block, current_ts = self._get_latest_block_info()
@@ -407,12 +427,18 @@ class PolygonTickFetcher:
             if self.rpc_url:
                 sources.append(("RPC", self._fetch_logs_rpc_streamed))
 
-        for name, fetch_func in sources:
+        for i, (name, fetch_func) in enumerate(sources):
+            if i > 0:
+                # If falling back from Etherscan to RPC, wait a full minute
+                # to give Etherscan a chance to recover. This preserves CU.
+                self.logger.warning("Primary source failed; waiting 60s before falling back to %s...", name)
+                time.sleep(60)
+
             success = fetch_func(start_block, end_block, on_log)
             if success:
                 return True
-            if len(sources) > 1:
-                self.logger.warning("%s stream failed; trying next source", name)
+            if len(sources) > 1 and i < len(sources) - 1:
+                self.logger.warning("%s stream failed; attempting fallback", name)
 
         self.logger.error("No valid log source (RPC/Polygonscan) available for streaming")
         return False

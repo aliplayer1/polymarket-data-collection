@@ -28,16 +28,26 @@ def _coerce_path(value: object | None) -> Path | None:
 def _coerce_tuple(values: object | None, *, transform=lambda item: item) -> tuple[str, ...]:
     if values is None:
         return ()
+    
+    raw_items: list[str] = []
     if isinstance(values, str):
-        # Support comma-separated strings
-        items: Iterable[object] = [s.strip() for s in values.split(",") if s.strip()]
+        raw_items = [values]
+    elif isinstance(values, Iterable) and not isinstance(values, (bytes, bytearray)):
+        raw_items = [str(v) for v in values]
     else:
-        items = values if isinstance(values, Iterable) else (values,)
+        raw_items = [str(values)]
+
+    # Deep split: ensure any item containing a comma is broken apart
+    final_items: list[str] = []
+    for item in raw_items:
+        if "," in item:
+            final_items.extend(s.strip() for s in item.split(",") if s.strip())
+        elif item.strip():
+            final_items.append(item.strip())
+
     result: list[str] = []
-    for item in items:
-        text = str(item).strip()
-        if text:
-            result.append(transform(text))
+    for text in final_items:
+        result.append(transform(text))
     return tuple(result)
 
 
@@ -115,11 +125,7 @@ class RuntimeSettings:
             getattr(args, "rpc_url", None),
             os.environ.get("POLYGON_RPC_URL"),
         )
-        # Explicitly handle comma separation here to ensure we pass a tuple of URLs
-        if isinstance(raw_rpc, str) and "," in raw_rpc:
-            rpc_urls = tuple(s.strip() for s in raw_rpc.split(",") if s.strip())
-        else:
-            rpc_urls = _coerce_tuple(raw_rpc, transform=lambda item: item.strip())
+        rpc_urls = _coerce_tuple(raw_rpc, transform=lambda item: item.strip())
 
         return cls(
             rpc_urls=rpc_urls,
