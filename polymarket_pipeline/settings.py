@@ -29,7 +29,8 @@ def _coerce_tuple(values: object | None, *, transform=lambda item: item) -> tupl
     if values is None:
         return ()
     if isinstance(values, str):
-        items: Iterable[object] = (values,)
+        # Support comma-separated strings
+        items: Iterable[object] = [s.strip() for s in values.split(",") if s.strip()]
     else:
         items = values if isinstance(values, Iterable) else (values,)
     result: list[str] = []
@@ -114,7 +115,11 @@ class RuntimeSettings:
             getattr(args, "rpc_url", None),
             os.environ.get("POLYGON_RPC_URL"),
         )
-        rpc_urls = _coerce_tuple(raw_rpc, transform=lambda item: item.strip())
+        # Explicitly handle comma separation here to ensure we pass a tuple of URLs
+        if isinstance(raw_rpc, str) and "," in raw_rpc:
+            rpc_urls = tuple(s.strip() for s in raw_rpc.split(",") if s.strip())
+        else:
+            rpc_urls = _coerce_tuple(raw_rpc, transform=lambda item: item.strip())
 
         return cls(
             rpc_urls=rpc_urls,

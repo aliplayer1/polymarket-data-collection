@@ -77,11 +77,12 @@ class PolygonTickFetcher:
     # can exceed the cap.  We use 10 blocks as a safe static default for the
     # Alchemy Free tier (which enforces a strict 10-block range limit).
     RPC_LOG_CHUNK_BLOCKS  = 10
-
     # Minimum gap between any two Etherscan V2 API calls (3 req/s limit).
-    # 0.5 s gives 2.0 req/s, providing substantial safety headroom for the
+    # 1.2 s gives ~0.8 req/s, providing massive headroom for the
     # 3/sec cap to account for network jitter and multiple threads.
-    _ETHERSCAN_MIN_INTERVAL = 0.5
+    _ETHERSCAN_MIN_INTERVAL = 1.2
+
+    _MAX_RETRIES = 6
 
     # Minimum gap between eth_getLogs RPC calls on Alchemy free tier.
     # 0.3 s gives ~3.3 calls/s, which fits safely within Alchemy throughput.
@@ -119,6 +120,8 @@ class PolygonTickFetcher:
         self._rpc_logs_lock = threading.Lock()
         self._block_cache_lock = threading.Lock()
         self._rpc_lock = threading.Lock()
+
+        self.logger.info("PolygonTickFetcher initialized with %d RPC providers", len(self._rpc_urls))
 
     @property
     def rpc_url(self) -> str | None:
@@ -508,18 +511,22 @@ class PolygonTickFetcher:
                 resp = self._session.get(url, params=params, timeout=self.timeout)
                 resp.raise_for_status()
                 data = resp.json()
+                
+                # Etherscan V2 sometimes returns 200 with an error message
+                # for rate limits.
                 if data.get("status") == "0" and "rate limit" in str(data.get("result", "")).lower():
                     if attempt < self._MAX_RETRIES:
-                        wait = 2**attempt + 2
-                        self.logger.warning("Etherscan V2 rate limit hit (3/sec), retrying in %ds", wait)
+                        # Massive wait on rate limit to ensure we don't hit RPC
+                        wait = min(2**attempt + 5, 30)
+                        self.logger.warning("Etherscan V2 rate limit (3/sec), retrying in %ds...", wait)
                         time.sleep(wait)
                         continue
                 return data
             except requests.exceptions.HTTPError as exc:
                 status = exc.response.status_code if exc.response is not None else 0
                 if status in (429, 503) and attempt < self._MAX_RETRIES:
-                    wait = 2 ** attempt + 1
-                    self.logger.warning("Etherscan %d (attempt %d/%d), retrying in %ds", status, attempt, self._MAX_RETRIES, wait)
+                    wait = min(2 ** attempt + 10, 60)
+                    self.logger.warning("Etherscan %d (attempt %d/%d), retrying in %ds...", status, attempt, self._MAX_RETRIES, wait)
                     time.sleep(wait)
                     continue
                 break
@@ -529,7 +536,7 @@ class PolygonTickFetcher:
                     msg = str(exc)
                     if self.polygonscan_key and self.polygonscan_key in msg:
                         msg = msg.replace(self.polygonscan_key, "<key>")
-                    self.logger.warning("Etherscan attempt %d/%d failed, retrying: %s", attempt, self._MAX_RETRIES, msg)
+                    self.logger.warning("Etherscan attempt %d/%d failed, retrying in %ds: %s", attempt, self._MAX_RETRIES, wait, msg)
                     time.sleep(wait)
                 else:
                     break
@@ -630,70 +637,58 @@ class PolygonTickFetcher:
                 )
 
                 # --- Rate-limit handling (429 / 503) ----------------------------
-                # Alchemy returns 429 for per-second CU overruns and 503 when the
-                # node is temporarily overloaded.  Both responses may carry a
-                # Retry-After header; if present we honour it exactly, otherwise
-                # we use exponential back-off with a longer base than for generic
-                # errors so that the rate limiter has time to refill.
                 if resp.status_code in (429, 503):
-                    # Check if we have alternative providers to rotate to
                     if len(self._rpc_urls) > 1:
                         self.logger.warning(
                             "RPC %s hit rate limit (HTTP %s); rotating to next provider...",
                             method, resp.status_code
                         )
                         self._rotate_rpc()
-                        # Immediately retry the same attempt with new provider
-                        continue
+                        # Retry the same attempt number with the new provider
+                        return self._rpc(method, *params)
 
                     retry_after_raw = resp.headers.get("Retry-After")
                     try:
-                        # Alchemy/QuickNode can be very aggressive. We wait at least 10s
-                        # to ensure the CU bucket has time to refill.
                         wait = max(float(retry_after_raw), 10.0) if retry_after_raw else (2 ** attempt * 5.0 + 5.0)
                     except (TypeError, ValueError):
                         wait = 2 ** attempt * 5.0 + 5.0
                     if attempt < self._MAX_RETRIES:
                         self.logger.warning(
-                            "RPC call %s rate-limited (HTTP %s, attempt %d/%d), "
-                            "retrying in %.1fs: %s",
-                            method, resp.status_code, attempt, self._MAX_RETRIES, wait,
-                            resp.text[:120],
+                            "RPC %s rate-limited (HTTP %s), retrying in %.1fs: %s",
+                            method, resp.status_code, wait, resp.text[:120],
                         )
-                        # Reset the logs rate-limit clock so the next eth_getLogs
-                        # call doesn't fire immediately after the back-off expires.
                         if method == "eth_getLogs":
                             self._last_rpc_logs_ts = time.time() + wait
                         time.sleep(wait)
                         continue
-                    self.logger.warning(
-                        "RPC call %s failed after %d retries: HTTP %s",
-                        method, self._MAX_RETRIES, resp.status_code,
-                    )
                     return None
 
                 if resp.status_code == 400:
-                    self.logger.error(
-                        "RPC 400 Bad Request: %s | URL: %s",
-                        resp.text[:500], self._masked_rpc_url,
-                    )
-                    # Return None immediately on 400 Client Error. These are typically
-                    # permanent parameter errors (like block range too large) where
-                    # retrying the exact same request is futile.
+                    self.logger.error("RPC 400: %s | URL: %s", resp.text[:500], self._masked_rpc_url)
                     return None
 
                 resp.raise_for_status()
                 data = resp.json()
                 if "error" in data:
                     err = data["error"]
-                    # Retry server-side JSON-RPC errors (code -32000..-32099 are server errors)
                     err_code = err.get("code", 0) if isinstance(err, dict) else 0
+                    err_msg = str(err).lower()
+                    
+                    # --- JSON-RPC Level Rate Limiting (e.g. Alchemy Monthly Limit) ---
+                    if err_code == 429 or "capacity limit" in err_msg or "rate limit" in err_msg:
+                        if len(self._rpc_urls) > 1:
+                            self.logger.warning(
+                                "RPC %s returned capacity/rate error (code %s); rotating to next provider...",
+                                method, err_code
+                            )
+                            self._rotate_rpc()
+                            # Retry the same attempt number with the new provider
+                            return self._rpc(method, *params)
+                    
+                    # Retry server-side JSON-RPC errors
                     if -32099 <= err_code <= -32000 and attempt < self._MAX_RETRIES:
                         wait = 2 ** attempt
-                        self.logger.warning(
-                            "RPC server error %s (attempt %d/%d), retrying in %ds: %s",
-                            method, attempt, self._MAX_RETRIES, wait, err,
-                        )
+                        self.logger.warning("RPC server error %s, retrying in %ds: %s", method, wait, err)
                         time.sleep(wait)
                         continue
                     self.logger.warning("RPC error %s: %s", method, err)
