@@ -85,6 +85,10 @@ HF_TOKEN=
 HF_REPO_ID=yourusername/polymarket-crypto-updown
 
 # ── Polygon on-chain tick data (optional but recommended) ─────────────────────
+# Comma-separate multiple RPC URLs for automatic rotation on rate limits.
+# Etherscan is used first; when its 100K daily limit is hit, the pipeline
+# seamlessly switches to RPC for the rest of the run.
+#   POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/<key>,https://xxx.matic.quiknode.pro/<key>
 POLYGON_RPC_URL=https://polygon-bor-rpc.publicnode.com
 POLYGONSCAN_API_KEY=
 

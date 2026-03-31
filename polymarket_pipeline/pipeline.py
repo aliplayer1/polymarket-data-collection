@@ -176,7 +176,7 @@ class PolymarketDataPipeline:
 
         if run_options.from_date:
             try:
-                scan_cutoff_ts = int(datetime.strptime(run_options.from_date, "%Y-%m-%d").timestamp())
+                scan_cutoff_ts = int(datetime.strptime(run_options.from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
                 self.logger.info(
                     "No checkpoint found; scan limited to markets closing on or after %s",
                     run_options.from_date,

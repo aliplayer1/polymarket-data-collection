@@ -121,7 +121,7 @@ class RTDSStreamPhase:
 
         async with websockets.connect(
             _RTDS_WS_URL,
-            max_size=None,
+            max_size=10 * 1024 * 1024,  # 10MB cap to prevent OOM from oversized messages
             open_timeout=10,          # fail fast on DNS/TCP hangs
             ping_interval=None,       # we manage pings manually per RTDS docs
         ) as ws:

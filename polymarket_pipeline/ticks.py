@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Sequence
 from typing import Any, Callable
 
 import requests
@@ -48,6 +49,7 @@ from .models import MarketRecord
 def _token_to_hex_topic(token_id: str) -> str:
     """Pad a 256-bit integer token ID to a 32-byte hex topic."""
     return "0x" + hex(int(token_id))[2:].zfill(64)
+
 
 
 class PolygonTickFetcher:
@@ -116,8 +118,10 @@ class PolygonTickFetcher:
         self.spot_price_lookup = spot_price_lookup
         self._session = requests.Session()
         self._block_cache: dict[int, int] = {}  # ts → block number
-        self._last_etherscan_ts: float = 0.0    # global rate-limit tracker
-        self._last_rpc_logs_ts: float = 0.0       # rate-limit tracker for eth_getLogs
+        self._last_etherscan_ts: float = time.monotonic()    # global rate-limit tracker
+        self._last_rpc_logs_ts: float = time.monotonic()       # rate-limit tracker for eth_getLogs
+        self._etherscan_exhausted: bool = False  # daily limit hit → skip Etherscan for rest of run
+        self._etherscan_call_count: int = 0      # total Etherscan API calls this session
 
         import threading
         self._etherscan_lock = threading.Lock()
@@ -285,14 +289,15 @@ class PolygonTickFetcher:
 
     def _ts_to_block_uncached(self, target_ts: int) -> int | None:
         """Actual implementation of ts→block conversion (no cache)."""
-        # 1. Polygonscan (preferred — one call, exact result)
-        if self.polygonscan_key:
-            # We retry Etherscan lookups multiple times with long waits because
-            # falling back to RPC is currently fatal (429).
+        # 1. Polygonscan (preferred — one call, exact result).
+        #    Skipped when the daily limit is exhausted.
+        if self.polygonscan_key and not self._etherscan_exhausted:
             for attempt in range(5):
                 block = self._ts_to_block_polygonscan(target_ts)
                 if block is not None:
                     return block
+                if self._etherscan_exhausted:
+                    break  # daily limit just detected — fall through to RPC
                 if attempt < 4:
                     wait = 5 + (attempt * 5)
                     self.logger.warning("Etherscan block lookup failed; retrying in %ds before RPC fallback...", wait)
@@ -334,10 +339,10 @@ class PolygonTickFetcher:
         ``getblocknobytime`` and ``getLogs`` share a single global token bucket.
         """
         with self._etherscan_lock:
-            elapsed = time.time() - self._last_etherscan_ts
+            elapsed = time.monotonic() - self._last_etherscan_ts
             if elapsed < self._ETHERSCAN_MIN_INTERVAL:
                 time.sleep(self._ETHERSCAN_MIN_INTERVAL - elapsed)
-            self._last_etherscan_ts = time.time()
+            self._last_etherscan_ts = time.monotonic()
 
     def _rate_limit_rpc_logs(self) -> None:
         """Block until at least _RPC_LOGS_MIN_INTERVAL seconds have passed since
@@ -346,10 +351,10 @@ class PolygonTickFetcher:
         eth_getBlockByNumber (16 CU each).
         """
         with self._rpc_logs_lock:
-            elapsed = time.time() - self._last_rpc_logs_ts
+            elapsed = time.monotonic() - self._last_rpc_logs_ts
             if elapsed < self._RPC_LOGS_MIN_INTERVAL:
                 time.sleep(self._RPC_LOGS_MIN_INTERVAL - elapsed)
-            self._last_rpc_logs_ts = time.time()
+            self._last_rpc_logs_ts = time.monotonic()
 
     def _ts_to_block_polygonscan(self, target_ts: int) -> int | None:
         """Use the Etherscan V2 ``getblocknobytime`` endpoint to convert a Unix
@@ -399,6 +404,12 @@ class PolygonTickFetcher:
         """Fetch OrderFilled logs for a time range and stream them to the callback.
 
         Handles block number estimation and dispatches to Etherscan V2 or RPC.
+
+        Source priority: Etherscan V2 first (reliable, exact results) with RPC
+        as fallback.  When Etherscan's daily 100K-call limit is exhausted
+        (``_etherscan_exhausted`` flag), all subsequent calls go straight to
+        RPC with automatic Alchemy↔QuickNode rotation on rate limits.
+
         Returns True on success, False if one or more chunks failed permanently.
         """
         start_block = self._ts_to_block(start_ts)
@@ -414,23 +425,28 @@ class PolygonTickFetcher:
 
         self.logger.debug("Streaming logs for blocks %s–%s", start_block, end_block)
 
-        # Order of sources depends on prefer_rpc
-        sources = []
-        if self.prefer_rpc:
-            if self.rpc_url:
-                sources.append(("RPC", self._fetch_logs_rpc_streamed))
-            if self.polygonscan_key:
-                sources.append(("Polygonscan", self._fetch_logs_etherscan_v2_streamed))
-        else:
-            if self.polygonscan_key:
-                sources.append(("Polygonscan", self._fetch_logs_etherscan_v2_streamed))
-            if self.rpc_url:
-                sources.append(("RPC", self._fetch_logs_rpc_streamed))
+        # Build source list: Etherscan first, RPC fallback.
+        # When Etherscan is exhausted (daily limit) or prefer_rpc is set,
+        # skip straight to RPC.
+        sources: list[tuple[str, Callable]] = []
+        etherscan_available = (
+            self.polygonscan_key
+            and not self._etherscan_exhausted
+            and not self.prefer_rpc
+        )
+        if etherscan_available:
+            sources.append(("Etherscan", self._fetch_logs_etherscan_v2_streamed))
+        if self.rpc_url:
+            sources.append(("RPC", self._fetch_logs_rpc_streamed))
+        # If prefer_rpc is False but Etherscan is exhausted, Etherscan
+        # can still serve as a last-resort if RPC also fails and a new
+        # day has started.  Not added here to keep things simple — the
+        # exhausted flag resets on the next service invocation.
 
         for i, (name, fetch_func) in enumerate(sources):
-            if i > 0:
-                # If falling back from Etherscan to RPC, wait a full minute
-                # to give Etherscan a chance to recover. This preserves CU.
+            if i > 0 and not self._etherscan_exhausted:
+                # Etherscan failed on a transient error (not daily limit).
+                # Wait before falling back to give it a chance to recover.
                 self.logger.warning("Primary source failed; waiting 60s before falling back to %s...", name)
                 time.sleep(60)
 
@@ -527,26 +543,60 @@ class PolygonTickFetcher:
             cur = chunk_end + 1
         return not had_failure
 
-    _MAX_RETRIES = 3
-
     def _etherscan_get(self, params: dict) -> dict | None:
-        """Make an Etherscan V2 GET request with retry on transient errors."""
+        """Make an Etherscan V2 GET request with retry on transient errors.
+
+        Sets ``_etherscan_exhausted`` when the daily call limit is detected,
+        causing all subsequent Etherscan calls to be skipped in favour of RPC.
+        """
+        if self._etherscan_exhausted:
+            return None
+
         url = ETHERSCAN_V2_API
         for attempt in range(1, self._MAX_RETRIES + 1):
             try:
                 resp = self._session.get(url, params=params, timeout=self.timeout)
                 resp.raise_for_status()
+                self._etherscan_call_count += 1
                 data = resp.json()
-                
-                # Etherscan V2 sometimes returns 200 with an error message
-                # for rate limits.
-                if data.get("status") == "0" and "rate limit" in str(data.get("result", "")).lower():
-                    if attempt < self._MAX_RETRIES:
-                        # Massive wait on rate limit to ensure we don't hit RPC
-                        wait = min(2**attempt + 5, 30)
-                        self.logger.warning("Etherscan V2 rate limit (3/sec), retrying in %ds...", wait)
-                        time.sleep(wait)
-                        continue
+
+                # Etherscan V2 returns 200 with status "0" for both per-second
+                # rate limits and daily quota exhaustion.
+                if data.get("status") == "0":
+                    result_str = str(data.get("result", "")).lower()
+                    message_str = str(data.get("message", "")).lower()
+                    combined = result_str + " " + message_str
+
+                    # Daily limit: "max rate limit reached" or contains "daily"
+                    # Distinct from per-second: per-second says "rate limit"
+                    # but resolves after a short wait.
+                    if "daily" in combined or "max rate limit" in combined or "max calls" in combined:
+                        self._etherscan_exhausted = True
+                        self.logger.warning(
+                            "Etherscan daily limit exhausted after ~%d calls this session — "
+                            "switching to RPC for remaining tick fetches",
+                            self._etherscan_call_count,
+                        )
+                        return None
+
+                    # Per-second rate limit — transient, retry with backoff
+                    if "rate limit" in combined:
+                        if attempt < self._MAX_RETRIES:
+                            wait = min(2**attempt + 5, 30)
+                            self.logger.warning("Etherscan V2 rate limit (3/sec), retrying in %ds...", wait)
+                            time.sleep(wait)
+                            continue
+                        # Exhausted retries on rate limit — might be daily limit
+                        # presenting as generic "rate limit".  Flag as exhausted.
+                        self._etherscan_exhausted = True
+                        self.logger.warning(
+                            "Etherscan rate limit persists after %d retries (~%d calls this session) — "
+                            "treating as daily limit exhaustion, switching to RPC",
+                            self._MAX_RETRIES,
+                            self._etherscan_call_count,
+                        )
+                        return None
+
                 return data
             except requests.exceptions.HTTPError as exc:
                 status = exc.response.status_code if exc.response is not None else 0
@@ -645,6 +695,7 @@ class PolygonTickFetcher:
                 **spot_kwargs,
             )
         except Exception:
+            self.logger.debug("_decode_log failed for tx=%s", log.get("transactionHash", "?"), exc_info=True)
             return None
 
     # ------------------------------------------------------------------
@@ -654,84 +705,103 @@ class PolygonTickFetcher:
     def _rpc(self, method: str, *params: Any) -> Any:
         if not self.rpc_url:
             return None
-        for attempt in range(1, self._MAX_RETRIES + 1):
-            try:
-                resp = self._session.post(
-                    self.rpc_url,
-                    json={"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)},
-                    timeout=self.timeout,
-                )
+        # Outer loop caps provider rotations to prevent unbounded recursion
+        # when all providers are rate-limited simultaneously.
+        max_rotations = len(self._rpc_urls)
+        for _rotation in range(max_rotations + 1):
+            for attempt in range(1, self._MAX_RETRIES + 1):
+                try:
+                    resp = self._session.post(
+                        self.rpc_url,
+                        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)},
+                        timeout=self.timeout,
+                    )
 
-                # --- Rate-limit handling (429 / 503) ----------------------------
-                if resp.status_code in (429, 503):
-                    if len(self._rpc_urls) > 1:
-                        self.logger.warning(
-                            "RPC %s hit rate limit (HTTP %s); rotating to next provider...",
-                            method, resp.status_code
-                        )
-                        self._rotate_rpc()
-                        # Retry the same attempt number with the new provider
-                        return self._rpc(method, *params)
-
-                    retry_after_raw = resp.headers.get("Retry-After")
-                    try:
-                        wait = max(float(retry_after_raw), 10.0) if retry_after_raw else (2 ** attempt * 5.0 + 5.0)
-                    except (TypeError, ValueError):
-                        wait = 2 ** attempt * 5.0 + 5.0
-                    if attempt < self._MAX_RETRIES:
-                        self.logger.warning(
-                            "RPC %s rate-limited (HTTP %s), retrying in %.1fs: %s",
-                            method, resp.status_code, wait, resp.text[:120],
-                        )
-                        if method == "eth_getLogs":
-                            self._last_rpc_logs_ts = time.time() + wait
-                        time.sleep(wait)
-                        continue
-                    return None
-
-                if resp.status_code == 400:
-                    self.logger.error("RPC 400: %s | URL: %s", resp.text[:500], self._masked_rpc_url)
-                    return None
-
-                resp.raise_for_status()
-                data = resp.json()
-                if "error" in data:
-                    err = data["error"]
-                    err_code = err.get("code", 0) if isinstance(err, dict) else 0
-                    err_msg = str(err).lower()
-                    
-                    # --- JSON-RPC Level Rate Limiting (e.g. Alchemy Monthly Limit) ---
-                    if err_code == 429 or "capacity limit" in err_msg or "rate limit" in err_msg:
+                    # --- Rate-limit handling (429 / 503) ----------------------------
+                    if resp.status_code in (429, 503):
                         if len(self._rpc_urls) > 1:
                             self.logger.warning(
-                                "RPC %s returned capacity/rate error (code %s); rotating to next provider...",
-                                method, err_code
+                                "RPC %s hit rate limit (HTTP %s); rotating to next provider...",
+                                method, resp.status_code
                             )
                             self._rotate_rpc()
-                            # Retry the same attempt number with the new provider
-                            return self._rpc(method, *params)
-                    
-                    # Retry server-side JSON-RPC errors
-                    if -32099 <= err_code <= -32000 and attempt < self._MAX_RETRIES:
+                            break  # break inner loop, continue outer rotation loop
+
+                        retry_after_raw = resp.headers.get("Retry-After")
+                        try:
+                            wait = max(float(retry_after_raw), 10.0) if retry_after_raw else (2 ** attempt * 5.0 + 5.0)
+                        except (TypeError, ValueError):
+                            wait = 2 ** attempt * 5.0 + 5.0
+                        if attempt < self._MAX_RETRIES:
+                            self.logger.warning(
+                                "RPC %s rate-limited (HTTP %s), retrying in %.1fs: %s",
+                                method, resp.status_code, wait, resp.text[:120],
+                            )
+                            if method == "eth_getLogs":
+                                self._last_rpc_logs_ts = time.monotonic() + wait
+                            time.sleep(wait)
+                            continue
+                        return None
+
+                    if resp.status_code == 400:
+                        self.logger.error("RPC 400: %s | URL: %s", resp.text[:500], self._masked_rpc_url)
+                        return None
+
+                    # 413 = request too large for this provider (e.g. block range
+                    # exceeds QuickNode's limit).  Permanent failure — retrying
+                    # the same request won't help.
+                    if resp.status_code == 413:
+                        self.logger.warning(
+                            "RPC %s returned 413 Request Entity Too Large; URL: %s",
+                            method, self._masked_rpc_url,
+                        )
+                        if len(self._rpc_urls) > 1:
+                            self._rotate_rpc()
+                            break  # try next provider
+                        return None
+
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if "error" in data:
+                        err = data["error"]
+                        err_code = err.get("code", 0) if isinstance(err, dict) else 0
+                        err_msg = str(err).lower()
+
+                        # --- JSON-RPC Level Rate Limiting (e.g. Alchemy Monthly Limit) ---
+                        if err_code == 429 or "capacity limit" in err_msg or "rate limit" in err_msg:
+                            if len(self._rpc_urls) > 1:
+                                self.logger.warning(
+                                    "RPC %s returned capacity/rate error (code %s); rotating to next provider...",
+                                    method, err_code
+                                )
+                                self._rotate_rpc()
+                                break  # break inner loop, continue outer rotation loop
+
+                        # Retry server-side JSON-RPC errors
+                        if -32099 <= err_code <= -32000 and attempt < self._MAX_RETRIES:
+                            wait = 2 ** attempt
+                            self.logger.warning("RPC server error %s, retrying in %ds: %s", method, wait, err)
+                            time.sleep(wait)
+                            continue
+                        self.logger.warning("RPC error %s: %s", method, err)
+                        return None
+                    return data.get("result")
+                except requests.exceptions.RequestException as exc:
+                    safe_exc = self._sanitize_exc(exc)
+                    if attempt < self._MAX_RETRIES:
                         wait = 2 ** attempt
-                        self.logger.warning("RPC server error %s, retrying in %ds: %s", method, wait, err)
+                        self.logger.warning(
+                            "RPC call %s (attempt %d/%d), retrying in %ds: %s",
+                            method, attempt, self._MAX_RETRIES, wait, safe_exc,
+                        )
                         time.sleep(wait)
-                        continue
-                    self.logger.warning("RPC error %s: %s", method, err)
+                    else:
+                        self.logger.warning("RPC call %s failed after %d retries: %s", method, self._MAX_RETRIES, safe_exc)
+                except Exception as exc:
+                    self.logger.warning("RPC call %s failed: %s", method, self._sanitize_exc(exc))
                     return None
-                return data.get("result")
-            except requests.exceptions.RequestException as exc:
-                safe_exc = self._sanitize_exc(exc)
-                if attempt < self._MAX_RETRIES:
-                    wait = 2 ** attempt
-                    self.logger.warning(
-                        "RPC call %s (attempt %d/%d), retrying in %ds: %s",
-                        method, attempt, self._MAX_RETRIES, wait, safe_exc,
-                    )
-                    time.sleep(wait)
-                else:
-                    self.logger.warning("RPC call %s failed after %d retries: %s", method, self._MAX_RETRIES, safe_exc)
-            except Exception as exc:
-                self.logger.warning("RPC call %s failed: %s", method, self._sanitize_exc(exc))
-                break
+            else:
+                # Inner loop exhausted without a break (no rotation needed)
+                return None
+        self.logger.warning("RPC call %s failed: all %d providers rate-limited", method, len(self._rpc_urls))
         return None

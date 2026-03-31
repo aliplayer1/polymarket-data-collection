@@ -144,7 +144,7 @@ def main() -> None:
     parser.add_argument(
         "--prefer-rpc",
         action="store_true",
-        default=False,
+        default=None,
         help="Use RPC provider preferentially over Polygonscan for historical logs (faster if using Alchemy).",
     )
     args = parser.parse_args()

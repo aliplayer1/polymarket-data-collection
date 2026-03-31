@@ -19,19 +19,24 @@ import pandas as pd
 from .config import PARQUET_MARKETS_PATH, PARQUET_PRICES_DIR, PARQUET_TICKS_DIR
 
 
+def _duckdb_escape(value: str) -> str:
+    """Escape a string for safe interpolation into DuckDB SQL literals."""
+    return value.replace("'", "''")
+
+
 def _ensure_views(con: duckdb.DuckDBPyConnection) -> None:
     """Register the markets and prices Parquet sources as DuckDB views."""
     if os.path.exists(PARQUET_MARKETS_PATH):
         con.execute(
-            f"CREATE OR REPLACE VIEW markets AS SELECT * FROM read_parquet('{PARQUET_MARKETS_PATH}')"
+            f"CREATE OR REPLACE VIEW markets AS SELECT * FROM read_parquet('{_duckdb_escape(PARQUET_MARKETS_PATH)}')"
         )
     if os.path.exists(PARQUET_PRICES_DIR):
         con.execute(
-            f"CREATE OR REPLACE VIEW prices AS SELECT * FROM read_parquet('{PARQUET_PRICES_DIR}/**/*.parquet', hive_partitioning=true)"
+            f"CREATE OR REPLACE VIEW prices AS SELECT * FROM read_parquet('{_duckdb_escape(PARQUET_PRICES_DIR)}/**/*.parquet', hive_partitioning=true)"
         )
     if os.path.exists(PARQUET_TICKS_DIR):
         con.execute(
-            f"CREATE OR REPLACE VIEW ticks AS SELECT * FROM read_parquet('{PARQUET_TICKS_DIR}/**/*.parquet', hive_partitioning=true)"
+            f"CREATE OR REPLACE VIEW ticks AS SELECT * FROM read_parquet('{_duckdb_escape(PARQUET_TICKS_DIR)}/**/*.parquet', hive_partitioning=true)"
         )
 
 

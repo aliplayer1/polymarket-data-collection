@@ -154,7 +154,7 @@ class RuntimeSettings:
             ),
             prefer_rpc=bool(
                 _coalesce(
-                    getattr(args, "prefer_rpc", False),
+                    getattr(args, "prefer_rpc", None),
                     os.environ.get("PREFER_RPC", "").lower() == "true",
                 )
             ),
@@ -172,6 +172,7 @@ class RuntimeSettings:
             data_dir=_coerce_path(data_dir) or self.data_dir,
             log_file=self.log_file,
             hf_repo=str(_coalesce(hf_repo, self.hf_repo)),
+            prefer_rpc=self.prefer_rpc,
         )
 
     def resolve_paths(self, run_options: PipelineRunOptions):

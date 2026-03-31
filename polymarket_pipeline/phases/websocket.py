@@ -193,7 +193,7 @@ class WebSocketPhase:
 
         while True:
             try:
-                async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, max_size=None) as ws:
+                async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20, max_size=10 * 1024 * 1024) as ws:
                     await ws.send(json.dumps({
                         "assets_ids": shard_token_ids,
                         "type": "market",
@@ -214,13 +214,18 @@ class WebSocketPhase:
                         n_shards,
                         len(shard_token_ids),
                     )
-                    reconnect_attempts = 0
                     disconnect_time = None
+                    received_data = False
                     # Reset BBO state on reconnect — snapshot will re-establish
                     token_bbo.clear()
 
                     while True:
                         message = await ws.recv()
+                        # Only reset backoff after receiving valid data (prevents
+                        # tight reconnect loops when server accepts then closes).
+                        if not received_data:
+                            received_data = True
+                            reconnect_attempts = 0
                         payload = json.loads(message)
 
                         # --- Snapshot handling (array of orderbook states) ---
@@ -265,18 +270,27 @@ class WebSocketPhase:
                             sum(len(values) for values in ws_buffer.values())
                             + sum(len(values) for values in tick_buffer.values())
                             + sum(len(values) for values in orderbook_buffer.values())
+                            + len(self.spot_price_buffer)
                         )
                         if total_buffered >= WS_BUFFER_MAX_ROWS:
+                            self.logger.warning(
+                                "WS shard %d/%d: buffer at capacity (%d rows) — attempting emergency flush before eviction",
+                                shard_idx + 1,
+                                n_shards,
+                                total_buffered,
+                            )
                             for buffer in (ws_buffer, tick_buffer, orderbook_buffer):
                                 for timeframe in list(buffer.keys()):
                                     rows = buffer[timeframe]
                                     if rows:
                                         buffer[timeframe] = rows[len(rows) // 2:]
+                            # Also cap the spot_price_buffer
+                            if len(self.spot_price_buffer) > WS_BUFFER_MAX_ROWS // 4:
+                                self.spot_price_buffer[:] = self.spot_price_buffer[len(self.spot_price_buffer) // 2:]
                             self.logger.error(
-                                "WS shard %d/%d: buffer at capacity (%d rows) — evicted oldest half; flush loop may be stuck",
+                                "WS shard %d/%d: evicted oldest half of buffers; flush loop may be stuck",
                                 shard_idx + 1,
                                 n_shards,
-                                total_buffered,
                             )
 
                         for event in events:
@@ -451,7 +465,7 @@ class WebSocketPhase:
                 raise
             except websockets.exceptions.ConnectionClosed as exc:
                 disconnect_time = time.time()
-                reconnect_delay = min(10 * (2 ** reconnect_attempts), MAX_WS_RECONNECT_DELAY_SECONDS)
+                reconnect_delay = min(2 * (2 ** reconnect_attempts), MAX_WS_RECONNECT_DELAY_SECONDS)
                 reconnect_attempts += 1
                 self.logger.warning(
                     "WS shard %d/%d: connection closed (code=%s reason=%r). Reconnecting in %ss...",
@@ -464,7 +478,7 @@ class WebSocketPhase:
                 await asyncio.sleep(reconnect_delay)
             except Exception as exc:
                 disconnect_time = time.time()
-                reconnect_delay = min(10 * (2 ** reconnect_attempts), MAX_WS_RECONNECT_DELAY_SECONDS)
+                reconnect_delay = min(2 * (2 ** reconnect_attempts), MAX_WS_RECONNECT_DELAY_SECONDS)
                 reconnect_attempts += 1
                 self.logger.warning(
                     "WS shard %d/%d: %s — %s. Reconnecting in %ss...",
@@ -490,13 +504,15 @@ class WebSocketPhase:
             await asyncio.sleep(check_interval)
 
             total_ws_rows = sum(len(values) for values in ws_buffer.values())
+            total_tick_rows = sum(len(values) for values in tick_buffer.values())
             total_ob_rows = sum(len(values) for values in orderbook_buffer.values())
             total_spot_rows = len(self.spot_price_buffer)
+            total_all = total_ws_rows + total_tick_rows + total_ob_rows + total_spot_rows
             elapsed = loop.time() - last_flush_time
 
-            if total_ws_rows == 0 and total_ob_rows == 0 and total_spot_rows == 0 and elapsed < WS_FLUSH_INTERVAL_SECONDS:
+            if total_all == 0 and elapsed < WS_FLUSH_INTERVAL_SECONDS:
                 continue
-            if (total_ws_rows + total_ob_rows + total_spot_rows) < WS_FLUSH_BATCH_SIZE and elapsed < WS_FLUSH_INTERVAL_SECONDS:
+            if total_all < WS_FLUSH_BATCH_SIZE and elapsed < WS_FLUSH_INTERVAL_SECONDS:
                 continue
 
             ws_snapshot: dict[str, list[dict[str, Any]]] = {}

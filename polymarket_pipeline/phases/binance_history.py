@@ -25,10 +25,14 @@ import logging
 import time
 from typing import Any
 
+import os
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import requests
 
 from ..models import MarketRecord
-from ..storage import append_ws_spot_prices_staged
 
 # Binance symbol mapping from pipeline crypto codes
 CRYPTO_TO_BINANCE: dict[str, str] = {
@@ -136,13 +140,13 @@ class BinanceHistoryPhase:
         self.logger = logger or logging.getLogger("polymarket_pipeline.binance_history")
         self.timeout = timeout
         self._session = requests.Session()
-        self._last_request_ts: float = 0.0
+        self._last_request_ts: float = time.monotonic()
 
     def _rate_limit(self) -> None:
-        elapsed = time.time() - self._last_request_ts
+        elapsed = time.monotonic() - self._last_request_ts
         if elapsed < _MIN_REQUEST_INTERVAL:
             time.sleep(_MIN_REQUEST_INTERVAL - elapsed)
-        self._last_request_ts = time.time()
+        self._last_request_ts = time.monotonic()
 
     def _fetch_klines(
         self,
@@ -269,11 +273,21 @@ class BinanceHistoryPhase:
                         })
 
             if spot_rows:
-                append_ws_spot_prices_staged(
-                    spot_rows,
-                    spot_prices_dir=spot_prices_dir,
-                    logger=self.logger,
-                )
+                # Write directly as an independent shard file instead of merging
+                # into ws_staging.parquet.  This avoids the read-merge-write cycle
+                # under the write lock, preventing lock contention with the live
+                # WebSocket service that also stages spot prices.
+                df = pd.DataFrame(spot_rows)
+                df["ts_ms"] = df["ts_ms"].astype("int64")
+                df["price"] = df["price"].astype("float64")
+                df["source"] = df["source"].astype("string")
+                os.makedirs(spot_prices_dir, exist_ok=True)
+                shard_name = f"binance_history_{crypto}_{os.getpid()}.parquet"
+                shard_path = os.path.join(spot_prices_dir, shard_name)
+                tmp_path = f"{shard_path}.tmp"
+                table = pa.Table.from_pandas(df, preserve_index=False)
+                pq.write_table(table, tmp_path, compression="zstd")
+                os.replace(tmp_path, shard_path)
                 total_rows += len(spot_rows)
                 self.logger.info(
                     "  -> %s: %d kline rows stored", binance_symbol, len(spot_rows)

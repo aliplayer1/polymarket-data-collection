@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 
-from ..config import PRICE_SUM_TOLERANCE, TIME_FRAMES, TIMEFRAME_SECONDS
+from ..config import PRICE_SUM_TOLERANCE, TIME_FRAMES
 from ..models import MarketRecord
 from ..providers import PriceHistoryProvider
 from ..storage import load_prices_for_timeframe, persist_normalized, split_markets_prices, persist_culture_normalized, split_culture_markets_prices

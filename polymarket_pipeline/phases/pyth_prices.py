@@ -36,14 +36,14 @@ class PythPricePhase:
 
         self.is_enabled = os.environ.get("PYTH_PRICES_ENABLED") == "1"
         self.session = requests.Session()
-        self._last_hermes_ts: float = 0.0
-        
+        self._last_hermes_ts: float = time.monotonic()
+
     def _rate_limit_hermes(self) -> None:
         """Enforce per-IP Hermes rate limit before each request."""
-        elapsed = time.time() - self._last_hermes_ts
+        elapsed = time.monotonic() - self._last_hermes_ts
         if elapsed < self._HERMES_MIN_INTERVAL:
             time.sleep(self._HERMES_MIN_INTERVAL - elapsed)
-        self._last_hermes_ts = time.time()
+        self._last_hermes_ts = time.monotonic()
 
     def _fetch_one(self, ts: int) -> dict[str, Any]:
         url = self.HERMES_URL.format(ts=ts)
@@ -89,19 +89,17 @@ class PythPricePhase:
             for symbol, feed_id in self.FEEDS.items():
                 price, conf = self._extract(data, feed_id)
                 rows.append({
-                    "ts_second": ts,
-                    "symbol": symbol,
-                    "price_usd": price,
-                    "conf": conf
+                    "ts_ms": ts * 1000,
+                    "symbol": symbol.lower(),
+                    "price": price,
+                    "source": "pyth",
                 })
-            time.sleep(0.05)  # minimal sleep — rate limiting is handled by _rate_limit_hermes
         df = pd.DataFrame(rows)
-        # Enforce schema explicitly to avoid problems
         if not df.empty:
-            df["ts_second"] = df["ts_second"].astype("int64")
+            df["ts_ms"] = df["ts_ms"].astype("int64")
             df["symbol"] = df["symbol"].astype("string")
-            df["price_usd"] = df["price_usd"].astype("float64")
-            df["conf"] = df["conf"].astype("float64")
+            df["price"] = df["price"].astype("float64")
+            df["source"] = df["source"].astype("string")
         return df
 
     def run(self, markets: list[MarketRecord]) -> None:
@@ -113,16 +111,21 @@ class PythPricePhase:
         
         covered_ranges = []
         if self.spot_prices_dir.exists() and any(self.spot_prices_dir.iterdir()):
+            con = None
             try:
+                safe_path = str(self.spot_prices_dir).replace("'", "''")
                 con = duckdb.connect()
-                # Find min and max ts_second to do a rough caching 
-                # (Ideally we'd track exactly which ranges are covered)
-                result = con.execute(f"SELECT MIN(ts_second), MAX(ts_second) FROM read_parquet('{self.spot_prices_dir}/**/*.parquet')").fetchone()
+                result = con.execute(
+                    f"SELECT MIN(ts_ms), MAX(ts_ms) FROM read_parquet('{safe_path}/**/*.parquet')"
+                ).fetchone()
                 if result and result[0] is not None:
-                    covered_ranges.append((result[0], result[1]))
-                con.close()
+                    # Convert ms to seconds for comparison with market timestamps
+                    covered_ranges.append((result[0] // 1000, result[1] // 1000))
             except Exception as e:
                 self.logger.warning("Could not query existing spot_prices: %s", e)
+            finally:
+                if con is not None:
+                    con.close()
 
         markets_to_fetch = []
         for m in markets:

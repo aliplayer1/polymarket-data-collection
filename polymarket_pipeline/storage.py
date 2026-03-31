@@ -43,6 +43,7 @@ from __future__ import annotations
 import errno as _errno
 import logging
 import os
+import re
 import shutil
 import threading
 import time
@@ -236,7 +237,7 @@ MARKETS_SCHEMA = pa.schema([
 
 PRICES_SCHEMA = pa.schema([
     ("market_id", pa.string()),
-    ("timestamp", pa.int32()),
+    ("timestamp", pa.int64()),
     ("up_price", pa.float32()),
     ("down_price", pa.float32()),
     # partition columns (crypto, timeframe) are implicit in the directory tree
@@ -257,7 +258,7 @@ CULTURE_MARKETS_SCHEMA = pa.schema([
 
 CULTURE_PRICES_SCHEMA = pa.schema([
     ("market_id", pa.string()),
-    ("timestamp", pa.int32()),
+    ("timestamp", pa.int64()),
     ("token_id", pa.string()),
     ("outcome", pa.dictionary(pa.int8(), pa.string())),
     ("price", pa.float32()),
@@ -318,7 +319,7 @@ ORDERBOOK_SCHEMA = pa.schema([
 # Increment this when any schema column is added, removed, or its type changes.
 # The version is stored as ``b"schema_version"`` in each Parquet file's
 # key-value metadata so consumers can detect and handle schema evolution.
-STORAGE_SCHEMA_VERSION = 2
+STORAGE_SCHEMA_VERSION = 3
 
 
 def _stamp_schema_version(table: pa.Table) -> pa.Table:
@@ -378,10 +379,20 @@ def _detect_effective_memory_limit_bytes() -> int | None:
     return min(candidates) if candidates else None
 
 
+def _duckdb_escape(value: str) -> str:
+    """Escape a string for safe interpolation into DuckDB SQL literals."""
+    return value.replace("'", "''")
+
+
 def _get_consolidation_memory_limit() -> str | None:
     """Return the DuckDB memory limit string for consolidation queries."""
     override = os.environ.get("PM_DUCKDB_MEMORY_LIMIT")
     if override:
+        if not re.fullmatch(r"[1-9]\d{0,5}(KB|MB|GB|TB)", override, re.IGNORECASE):
+            raise ValueError(
+                f"Invalid PM_DUCKDB_MEMORY_LIMIT={override!r}: "
+                "expected format like '512MB' or '4GB' (no leading zeros, no spaces)"
+            )
         return override
 
     effective_bytes = _detect_effective_memory_limit_bytes()
@@ -412,11 +423,11 @@ def _configure_duckdb_for_consolidation(
     temp_dir: str,
 ) -> tuple[str | None, int]:
     """Apply low-memory DuckDB settings used by tick consolidation."""
-    con.execute(f"SET temp_directory='{temp_dir}'")
+    con.execute(f"SET temp_directory='{_duckdb_escape(temp_dir)}'")
 
     memory_limit = _get_consolidation_memory_limit()
     if memory_limit:
-        con.execute(f"SET memory_limit='{memory_limit}'")
+        con.execute(f"SET memory_limit='{_duckdb_escape(memory_limit)}'")
 
     threads = _get_consolidation_threads()
     con.execute(f"SET threads={threads}")
@@ -529,7 +540,7 @@ def optimise_markets_df(df: pd.DataFrame) -> pd.DataFrame:
 def optimise_prices_df(df: pd.DataFrame) -> pd.DataFrame:
     """Downcast dtypes on the prices DataFrame before writing."""
     df = df.copy()
-    df["timestamp"] = df["timestamp"].astype("int32")
+    df["timestamp"] = df["timestamp"].astype("int64")
     df["up_price"] = df["up_price"].astype("float32")
     df["down_price"] = df["down_price"].astype("float32")
     df["crypto"] = df["crypto"].astype("category")
@@ -899,10 +910,9 @@ def consolidate_ticks(
             consolidated_path = os.path.join(dirpath, "part-0.parquet")
             tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
 
-            # Paths are from os.listdir (not user input); safe to interpolate.
-            files_sql = ", ".join(f"'{p}'" for p in file_paths)
+            files_sql = ", ".join(f"'{_duckdb_escape(p)}'" for p in file_paths)
             files_with_order_sql = ", ".join(
-                f"('{path}', {idx})" for idx, path in enumerate(file_paths)
+                f"('{_duckdb_escape(path)}', {idx})" for idx, path in enumerate(file_paths)
             )
             select_sql = _tick_consolidation_select_sql("sort_key")
             group_by_sql = ", ".join(_TICKS_DEDUP_COLS)
@@ -972,7 +982,7 @@ def consolidate_ticks(
                             {select_sql}
                         FROM ranked_rows
                         GROUP BY {group_by_sql}
-                    ) TO '{tmp_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                    ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
                 """).fetchone()
                 nrows = result[0] if result else 0
 
@@ -1246,12 +1256,20 @@ def consolidate_orderbook(
     orderbook_dir: str,
     logger: logging.Logger | None = None,
 ) -> None:
-    """Consolidate orderbook staging files per partition (same pattern as tick consolidation)."""
+    """Consolidate orderbook staging files per partition using DuckDB.
+
+    Uses the same memory-capped, disk-spilling DuckDB approach as
+    ``consolidate_ticks`` to avoid OOM on large partitions (e.g. BTC/5-minute
+    can exceed 8 GB when loaded entirely into pandas).
+    """
+    import duckdb
+
     log = logger or logging.getLogger("polymarket_pipeline")
     if not os.path.exists(orderbook_dir):
         return
 
     data_root = os.path.dirname(os.path.abspath(orderbook_dir))
+    nrows = 0
 
     for dirpath, _dirs, _fnames in os.walk(orderbook_dir):
         with _write_lock(data_root):
@@ -1261,43 +1279,61 @@ def consolidate_orderbook(
 
             rel = os.path.relpath(dirpath, orderbook_dir)
             log.info("Consolidating orderbook partition %s (%d files)...", rel, len(parquet_files))
+            _check_disk_space(dirpath)
 
-            frames = []
-            for fname in parquet_files:
-                try:
-                    df = pq.ParquetFile(os.path.join(dirpath, fname)).read().to_pandas()
-                    frames.append(df)
-                except Exception:
-                    continue
-
-            if not frames:
-                continue
-
-            merged = pd.concat(frames, ignore_index=True)
-            merged = merged.sort_values("ts_ms").reset_index(drop=True)
-            if "outcome" in merged.columns and hasattr(merged["outcome"], "cat"):
-                merged["outcome"] = merged["outcome"].astype(str)
-            merged["outcome"] = merged["outcome"].astype("category")
-
+            file_paths = [os.path.join(dirpath, f) for f in parquet_files]
+            file_paths.sort(key=lambda path: (os.path.getmtime(path), path))
             consolidated_path = os.path.join(dirpath, "part-0.parquet")
-            table = pa.Table.from_pandas(merged, preserve_index=False)
             tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
+
+            files_sql = ", ".join(f"'{_duckdb_escape(p)}'" for p in file_paths)
+            temp_dir = os.path.join(dirpath, ".duckdb_tmp")
+            con = None
             try:
-                _check_disk_space(dirpath)
-                table = _stamp_schema_version(table)
-                pq.write_table(table, tmp_path, compression="zstd")
+                con = duckdb.connect()
+                os.makedirs(temp_dir, exist_ok=True)
+                memory_limit, threads = _configure_duckdb_for_consolidation(
+                    con, temp_dir=temp_dir,
+                )
+
+                result = con.execute(f"""
+                    COPY (
+                        SELECT
+                            ts_ms, market_id, token_id, outcome,
+                            best_bid, best_ask, best_bid_size, best_ask_size
+                        FROM read_parquet(
+                            [{files_sql}],
+                            union_by_name=true
+                        )
+                        ORDER BY ts_ms
+                    ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                """).fetchone()
+                nrows = result[0] if result else 0
+
+                remove_errors: list[str] = []
                 for fname in parquet_files:
                     try:
                         os.remove(os.path.join(dirpath, fname))
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        remove_errors.append(f"{fname}: {exc}")
+                if remove_errors:
+                    log.warning(
+                        "  -> could not remove %d old shard file(s) in %s: %s",
+                        len(remove_errors), rel, "; ".join(remove_errors),
+                    )
                 os.replace(tmp_path, consolidated_path)
             except Exception:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
                 raise
+            finally:
+                try:
+                    if con is not None:
+                        con.close()
+                finally:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
 
-        log.info("  -> %s consolidated: %d rows", rel, len(merged))
+        log.info("  -> %s consolidated: %d rows", rel, nrows)
 
 
 # ---------------------------------------------------------------------------
@@ -1480,7 +1516,7 @@ def optimise_culture_markets_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def optimise_culture_prices_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["timestamp"] = df["timestamp"].astype("int32")
+    df["timestamp"] = df["timestamp"].astype("int64")
     df["price"] = df["price"].astype("float32")
     df["crypto"] = df["crypto"].astype("category")
     df["timeframe"] = df["timeframe"].astype("category")

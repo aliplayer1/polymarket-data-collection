@@ -27,6 +27,8 @@ class PriceHistoryProvider(Protocol):
         fidelity: int = 1,
     ) -> list[dict[str, Any]]: ...
 
+    def fetch_fee_rate_bps(self, token_id: str) -> int | None: ...
+
 
 class MarketDataProvider(MarketProvider, PriceHistoryProvider, Protocol):
     pass

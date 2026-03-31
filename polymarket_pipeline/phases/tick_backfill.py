@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from collections import defaultdict
 
 import pandas as pd
 
-from ..config import TIMEFRAME_SECONDS, HF_CULTURE_REPO_ID
+from ..config import HF_CULTURE_REPO_ID
 from ..models import MarketRecord
 from ..providers import TickBatchProvider
 from ..storage import append_ticks_only, upload_to_huggingface
