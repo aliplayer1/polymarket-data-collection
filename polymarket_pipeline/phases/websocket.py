@@ -117,6 +117,20 @@ class WebSocketPhase:
         orderbook_snapshot: dict[str, list[dict[str, Any]]],
         spot_price_snapshot: list[dict[str, Any]],
     ) -> int:
+        # Flush orderbook BBO rows FIRST — shard writes need no lock, so
+        # they complete even when consolidation/upload holds the write lock.
+        all_ob: list[dict[str, Any]] = []
+        for rows in orderbook_snapshot.values():
+            all_ob.extend(rows)
+        if all_ob:
+            ob_df = pd.DataFrame(all_ob)
+            append_ws_orderbook_staged(
+                ob_df,
+                orderbook_dir=str(self.paths.orderbook_dir),
+                logger=self.logger,
+            )
+
+        # Price, tick, and spot writes require the write lock.
         flushed_rows = 0
         for timeframe, rows in ws_snapshot.items():
             if not rows:
@@ -151,18 +165,6 @@ class WebSocketPhase:
                     ticks_dir=str(data_culture_dir / "ticks"),
                     logger=self.logger,
                 )
-
-        # Flush orderbook BBO rows
-        all_ob: list[dict[str, Any]] = []
-        for rows in orderbook_snapshot.values():
-            all_ob.extend(rows)
-        if all_ob:
-            ob_df = pd.DataFrame(all_ob)
-            append_ws_orderbook_staged(
-                ob_df,
-                orderbook_dir=str(self.paths.orderbook_dir),
-                logger=self.logger,
-            )
 
         # Flush spot price rows
         if spot_price_snapshot:
