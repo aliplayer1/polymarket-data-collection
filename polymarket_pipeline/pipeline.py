@@ -486,7 +486,11 @@ class PolymarketDataPipeline:
             self.logger.info("Historical-only mode enabled. Skipping active markets.")
             active_markets_for_ws = []
         else:
-            active_markets_for_ws = self._collect_active_markets(options, scan_cutoff_ts)
+            # Never apply scan cutoff to active markets — the cutoff is for
+            # incremental historical scans only.  Active markets have future
+            # end_ts values but may have old closed_ts from prior resolution
+            # cycles, which the cutoff would incorrectly filter out.
+            active_markets_for_ws = self._collect_active_markets(options, None)
 
         if not options.websocket_only:
             self.price_history_phase.flush_all()
