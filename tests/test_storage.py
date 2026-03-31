@@ -456,7 +456,7 @@ def test_consolidate_spot_prices_deduplicates(tmp_path):
 # append_ws_orderbook_staged
 # ---------------------------------------------------------------------------
 
-def test_append_ws_orderbook_staged_creates_staging(tmp_path):
+def test_append_ws_orderbook_staged_creates_shard(tmp_path):
     ob_dir = str(tmp_path / "orderbook")
     df = pd.DataFrame({
         "ts_ms": [1710000000000],
@@ -471,14 +471,15 @@ def test_append_ws_orderbook_staged_creates_staging(tmp_path):
         "timeframe": ["5-minute"],
     })
     append_ws_orderbook_staged(df, orderbook_dir=ob_dir)
-    staging = os.path.join(ob_dir, "crypto=BTC", "timeframe=5-minute", "ws_staging.parquet")
-    assert os.path.exists(staging)
-    t = pq.read_table(staging).to_pandas()
+    part_dir = os.path.join(ob_dir, "crypto=BTC", "timeframe=5-minute")
+    shards = [f for f in os.listdir(part_dir) if f.startswith("ws_ob_")]
+    assert len(shards) == 1
+    t = pq.read_table(os.path.join(part_dir, shards[0])).to_pandas()
     assert len(t) == 1
     assert t.iloc[0]["best_bid"] == pytest.approx(0.48)
 
 
-def test_append_ws_orderbook_staged_accumulates(tmp_path):
+def test_append_ws_orderbook_staged_writes_separate_shards(tmp_path):
     ob_dir = str(tmp_path / "orderbook2")
     def _make_row(ts):
         return pd.DataFrame({
@@ -489,9 +490,11 @@ def test_append_ws_orderbook_staged_accumulates(tmp_path):
         })
     append_ws_orderbook_staged(_make_row(1000), orderbook_dir=ob_dir)
     append_ws_orderbook_staged(_make_row(2000), orderbook_dir=ob_dir)
-    staging = os.path.join(ob_dir, "crypto=BTC", "timeframe=5-minute", "ws_staging.parquet")
-    t = pq.read_table(staging).to_pandas()
-    assert len(t) == 2
+    part_dir = os.path.join(ob_dir, "crypto=BTC", "timeframe=5-minute")
+    shards = [f for f in os.listdir(part_dir) if f.startswith("ws_ob_")]
+    assert len(shards) == 2
+    total_rows = sum(len(pq.read_table(os.path.join(part_dir, s))) for s in shards)
+    assert total_rows == 2
 
 
 # ---------------------------------------------------------------------------
@@ -532,3 +535,40 @@ def test_consolidate_orderbook_merges_shards(tmp_path):
     result = pq.read_table(shard_dir / "part-0.parquet").to_pandas()
     assert len(result) == 3
     assert result["ts_ms"].is_monotonic_increasing
+
+
+def test_orderbook_shard_write_then_consolidate(tmp_path):
+    """End-to-end: append_ws_orderbook_staged writes shards, consolidate merges them."""
+    ob_dir = str(tmp_path / "orderbook")
+
+    def _make_batch(ts_values):
+        return pd.DataFrame({
+            "ts_ms": ts_values,
+            "market_id": ["m1"] * len(ts_values),
+            "token_id": ["t1"] * len(ts_values),
+            "outcome": ["Up"] * len(ts_values),
+            "best_bid": [0.48] * len(ts_values),
+            "best_ask": [0.52] * len(ts_values),
+            "best_bid_size": [100.0] * len(ts_values),
+            "best_ask_size": [100.0] * len(ts_values),
+            "crypto": ["BTC"] * len(ts_values),
+            "timeframe": ["5-minute"] * len(ts_values),
+        })
+
+    # Simulate 3 flush cycles writing shard files
+    append_ws_orderbook_staged(_make_batch([1000, 2000]), orderbook_dir=ob_dir)
+    append_ws_orderbook_staged(_make_batch([3000, 4000]), orderbook_dir=ob_dir)
+    append_ws_orderbook_staged(_make_batch([5000]), orderbook_dir=ob_dir)
+
+    part_dir = os.path.join(ob_dir, "crypto=BTC", "timeframe=5-minute")
+    shards = [f for f in os.listdir(part_dir) if f.endswith(".parquet")]
+    assert len(shards) == 3  # one shard per flush
+
+    # Consolidation merges all shards into part-0.parquet
+    consolidate_orderbook(orderbook_dir=ob_dir)
+
+    remaining = os.listdir(part_dir)
+    assert remaining == ["part-0.parquet"]
+    result = pq.read_table(os.path.join(part_dir, "part-0.parquet")).to_pandas()
+    assert len(result) == 5
+    assert list(result["ts_ms"]) == [1000, 2000, 3000, 4000, 5000]

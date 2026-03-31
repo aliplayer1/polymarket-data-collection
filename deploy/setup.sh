@@ -111,6 +111,8 @@ sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requiremen
 cp "$APP_DIR/deploy/polymarket-websocket.service"   /etc/systemd/system/
 cp "$APP_DIR/deploy/polymarket-historical.service"  /etc/systemd/system/
 cp "$APP_DIR/deploy/polymarket-historical.timer"    /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-upload.service"      /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-upload.timer"        /etc/systemd/system/
 cp "$APP_DIR/deploy/polymarket-restart.service"     /etc/systemd/system/
 cp "$APP_DIR/deploy/polymarket-restart.timer"       /etc/systemd/system/
 systemctl daemon-reload
@@ -149,6 +151,7 @@ sudo -u "$SERVICE_USER" bash -c "
 # ── 10. Enable and start continuous services ──────────────────────────────────
 systemctl enable --now polymarket-websocket.service
 systemctl enable --now polymarket-historical.timer
+systemctl enable --now polymarket-upload.timer
 systemctl enable --now polymarket-restart.timer
 
 echo ""
@@ -162,6 +165,10 @@ echo ""
 echo "  Historical sync (every 6 h) + HF upload:"
 echo "    systemctl status polymarket-historical.timer"
 echo "    journalctl -fu polymarket-historical"
+echo ""
+echo "  Tick consolidation + HF upload (every 3 h):"
+echo "    systemctl status polymarket-upload.timer"
+echo "    journalctl -fu polymarket-upload"
 echo ""
 echo "  Daily WebSocket restart (market re-discovery at 00:05 UTC):"
 echo "    systemctl status polymarket-restart.timer"

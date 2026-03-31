@@ -40,6 +40,11 @@ WS_MAX_TOKENS_PER_SHARD = 500
 # would grow unboundedly and eventually OOM.  When this cap is hit the oldest
 # half of each buffer is evicted and an ERROR is logged.
 WS_BUFFER_MAX_ROWS = 600_000
+# Orderbook BBO events flush on a longer cadence than ticks/prices because
+# price_change events generate ~4 000 rows/s across 6 000+ tokens.  30 s
+# keeps per-flush batch size to ~120 K rows and limits shard-file count to
+# ~2/min per partition (≈360 between 3-hour consolidation runs).
+WS_OB_FLUSH_INTERVAL_S: float = 30.0
 
 TIME_FRAMES = tuple(
     tf for d in _MARKET_DEFINITIONS for tf in d.timeframe_names

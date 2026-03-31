@@ -18,6 +18,7 @@ from ..config import (
     WS_FLUSH_BATCH_SIZE,
     WS_FLUSH_INTERVAL_SECONDS,
     WS_MAX_TOKENS_PER_SHARD,
+    WS_OB_FLUSH_INTERVAL_S,
     WS_URL,
 )
 from ..models import MarketRecord
@@ -499,16 +500,28 @@ class WebSocketPhase:
         loop = asyncio.get_running_loop()
         check_interval = 1.0
         last_flush_time = loop.time()
+        last_ob_flush_time = loop.time()
 
         while True:
             await asyncio.sleep(check_interval)
 
+            now = loop.time()
             total_ws_rows = sum(len(values) for values in ws_buffer.values())
             total_tick_rows = sum(len(values) for values in tick_buffer.values())
             total_ob_rows = sum(len(values) for values in orderbook_buffer.values())
             total_spot_rows = len(self.spot_price_buffer)
-            total_all = total_ws_rows + total_tick_rows + total_ob_rows + total_spot_rows
-            elapsed = loop.time() - last_flush_time
+            elapsed = now - last_flush_time
+            ob_elapsed = now - last_ob_flush_time
+
+            # Decide whether to include orderbook in this flush cycle.
+            # Orderbook flushes on a longer cadence (WS_OB_FLUSH_INTERVAL_S)
+            # because price_change events generate ~4 000 rows/s.  The shard-
+            # file write is fast (no read-merge), so batching 30 s of data
+            # keeps file count manageable between consolidation runs.
+            flush_ob = ob_elapsed >= WS_OB_FLUSH_INTERVAL_S
+
+            total_non_ob = total_ws_rows + total_tick_rows + total_spot_rows
+            total_all = total_non_ob + (total_ob_rows if flush_ob else 0)
 
             if total_all == 0 and elapsed < WS_FLUSH_INTERVAL_SECONDS:
                 continue
@@ -526,20 +539,22 @@ class WebSocketPhase:
                 if tick_buffer[timeframe]:
                     tick_snapshot[timeframe] = tick_buffer[timeframe]
                     tick_buffer[timeframe] = []
-            for timeframe in list(orderbook_buffer.keys()):
-                if orderbook_buffer[timeframe]:
-                    orderbook_snapshot[timeframe] = orderbook_buffer[timeframe]
-                    orderbook_buffer[timeframe] = []
+            if flush_ob:
+                for timeframe in list(orderbook_buffer.keys()):
+                    if orderbook_buffer[timeframe]:
+                        orderbook_snapshot[timeframe] = orderbook_buffer[timeframe]
+                        orderbook_buffer[timeframe] = []
+                last_ob_flush_time = now
 
             # Drain spot price buffer (written by RTDS stream in same event loop)
             spot_snapshot = self.spot_price_buffer[:]
             self.spot_price_buffer.clear()
 
             if not ws_snapshot and not tick_snapshot and not orderbook_snapshot and not spot_snapshot:
-                last_flush_time = loop.time()
+                last_flush_time = now
                 continue
 
-            last_flush_time = loop.time()
+            last_flush_time = now
             flushed = await loop.run_in_executor(
                 None, self._flush_snapshot, ws_snapshot, tick_snapshot, orderbook_snapshot, spot_snapshot,
             )

@@ -1147,10 +1147,17 @@ def append_ws_orderbook_staged(
     orderbook_dir: str,
     logger: logging.Logger | None = None,
 ) -> None:
-    """Append orderbook BBO rows to per-partition staging files.
+    """Write orderbook BBO rows as independent shard files per partition.
 
-    Same staging pattern as ``append_ws_ticks_staged``: lightweight sidecar
-    files per (crypto, timeframe) partition, absorbed on consolidation.
+    Unlike the read-merge-write pattern used for ticks, orderbook data
+    generates ~4 000 rows/s and reading back a growing staging file each
+    flush would block the executor for seconds — causing the in-memory
+    buffer to overflow and eventually OOM-kill the process.
+
+    Instead, each flush writes a uniquely-named shard file per partition.
+    No read of existing data and no write-lock are needed (filenames are
+    unique per PID+timestamp).  ``consolidate_orderbook()`` merges all
+    shard files on its next run.
     """
     if rows_df.empty:
         return
@@ -1162,31 +1169,24 @@ def append_ws_orderbook_staged(
             rows_df = rows_df.copy()
             rows_df[col] = rows_df[col].astype(str)
 
-    data_root = os.path.dirname(os.path.abspath(orderbook_dir))
     rows_staged = 0
+    shard_suffix = f"ws_ob_{os.getpid()}_{int(time.monotonic() * 1000)}.parquet"
 
-    with _write_lock(data_root):
-        for (crypto, timeframe), group in rows_df.groupby(
-            ["crypto", "timeframe"], sort=False
-        ):
-            shard_dir = os.path.join(orderbook_dir, f"crypto={crypto}", f"timeframe={timeframe}")
-            os.makedirs(shard_dir, exist_ok=True)
-            staging_path = os.path.join(shard_dir, _WS_STAGING_FILENAME)
+    for (crypto, timeframe), group in rows_df.groupby(
+        ["crypto", "timeframe"], sort=False
+    ):
+        shard_dir = os.path.join(orderbook_dir, f"crypto={crypto}", f"timeframe={timeframe}")
+        os.makedirs(shard_dir, exist_ok=True)
+        shard_path = os.path.join(shard_dir, shard_suffix)
 
-            new_rows = group.drop(columns=["crypto", "timeframe"]).reset_index(drop=True)
-            for col in ("outcome",):
-                if col in new_rows.columns and hasattr(new_rows[col], "cat"):
-                    new_rows[col] = new_rows[col].astype(str)
+        new_rows = group.drop(columns=["crypto", "timeframe"]).reset_index(drop=True)
+        for col in ("outcome",):
+            if col in new_rows.columns and hasattr(new_rows[col], "cat"):
+                new_rows[col] = new_rows[col].astype(str)
 
-            if os.path.exists(staging_path):
-                existing = pq.ParquetFile(staging_path).read().to_pandas()
-                merged = pd.concat([existing, new_rows], ignore_index=True)
-            else:
-                merged = new_rows
-
-            table = pa.Table.from_pandas(merged, preserve_index=False)
-            _write_parquet_atomic(table, staging_path)
-            rows_staged += len(new_rows)
+        table = pa.Table.from_pandas(new_rows, preserve_index=False)
+        _write_parquet_atomic(table, shard_path)
+        rows_staged += len(new_rows)
 
     log.info("Orderbook BBO staged: %d new rows to %s/", rows_staged, orderbook_dir)
 
@@ -1689,7 +1689,7 @@ def upload_to_huggingface(
         # Patterns to exclude from folder uploads: staging files (actively
         # written by the WebSocket service), backfill shards (consolidated
         # into part-0.parquet), and atomic-write temp files.
-        _ignore = ["**/ws_staging.parquet", "**/backfill_*.parquet", "**/*.tmp"]
+        _ignore = ["**/ws_staging.parquet", "**/backfill_*.parquet", "**/ws_ob_*.parquet", "**/*.tmp"]
 
         # Upload prices partition tree
         if os.path.exists(p_dir):
