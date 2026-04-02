@@ -372,7 +372,6 @@ class PolygonTickFetcher:
             "closest":   "before",
             "apikey":    self.polygonscan_key,
         }
-        self._rate_limit_etherscan()
         data = self._etherscan_get(params)
         if data is not None:
             status = str(data.get("status"))
@@ -483,7 +482,6 @@ class PolygonTickFetcher:
                     "offset": self.POLYGONSCAN_LOG_LIMIT,
                     "apikey": self.polygonscan_key,
                 }
-                self._rate_limit_etherscan()
                 data = self._etherscan_get(params)
                 if data is None:
                     return False
@@ -570,6 +568,7 @@ class PolygonTickFetcher:
 
         url = ETHERSCAN_V2_API
         for attempt in range(1, self._MAX_RETRIES + 1):
+            self._rate_limit_etherscan()
             try:
                 resp = self._session.get(url, params=params, timeout=self.timeout)
                 resp.raise_for_status()
@@ -603,13 +602,15 @@ class PolygonTickFetcher:
                             self.logger.warning("Etherscan V2 rate limit (3/sec), retrying in %ds...", wait)
                             time.sleep(wait)
                             continue
-                        # Exhausted retries on rate limit — might be daily limit
-                        # presenting as generic "rate limit".  Flag as exhausted.
-                        self._etherscan_exhausted = True
-                        self._etherscan_exhausted_at = time.monotonic()
+                        # Exhausted retries on transient rate limit.  Do NOT
+                        # set _etherscan_exhausted — with only a few hundred
+                        # calls this is not the 100K daily limit.  Return None
+                        # to fail this single request (stream falls back to
+                        # RPC for this block range) but keep Etherscan
+                        # available for subsequent calls.
                         self.logger.warning(
                             "Etherscan rate limit persists after %d retries (~%d calls this session) — "
-                            "treating as daily limit exhaustion, switching to RPC",
+                            "falling back to RPC for this request only",
                             self._MAX_RETRIES,
                             self._etherscan_call_count,
                         )
