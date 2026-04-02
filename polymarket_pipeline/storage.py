@@ -1690,6 +1690,10 @@ def upload_to_huggingface(
         # written by the WebSocket service), backfill shards (consolidated
         # into part-0.parquet), and atomic-write temp files.
         _ignore = ["**/ws_staging.parquet", "**/backfill_*.parquet", "**/ws_ob_*.parquet", "**/*.tmp"]
+        # Delete remote .parquet files that no longer exist locally.  Without
+        # this, each upload_folder adds a new UUID-named file per partition
+        # while the old ones accumulate indefinitely on the Hub.
+        _delete = ["*.parquet"]
 
         # Upload prices partition tree
         if os.path.exists(p_dir):
@@ -1699,6 +1703,7 @@ def upload_to_huggingface(
                 repo_id=repo,
                 repo_type="dataset",
                 ignore_patterns=_ignore,
+                delete_patterns=_delete,
             )
             log.info("Uploaded %s/ -> data/prices/", p_dir)
 
@@ -1710,6 +1715,7 @@ def upload_to_huggingface(
                 repo_id=repo,
                 repo_type="dataset",
                 ignore_patterns=_ignore,
+                delete_patterns=_delete,
             )
             log.info("Uploaded %s/ -> data/ticks/", t_dir)
 
@@ -1721,6 +1727,7 @@ def upload_to_huggingface(
                 repo_id=repo,
                 repo_type="dataset",
                 ignore_patterns=_ignore,
+                delete_patterns=_delete,
             )
             log.info("Uploaded %s/ -> data/spot_prices/", spot_prices_dir)
 
@@ -1732,6 +1739,7 @@ def upload_to_huggingface(
                 repo_id=repo,
                 repo_type="dataset",
                 ignore_patterns=_ignore,
+                delete_patterns=_delete,
             )
             log.info("Uploaded %s/ -> data/orderbook/", orderbook_dir)
 
