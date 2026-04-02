@@ -240,7 +240,7 @@ def test_persist_normalized_deduplicates_on_rewrite(tmp_path):
 # append_ws_ticks_staged
 # ---------------------------------------------------------------------------
 
-def test_append_ws_ticks_staged_creates_staging_file(tmp_path):
+def test_append_ws_ticks_staged_creates_shard_file(tmp_path):
     ticks_dir = str(tmp_path / "ticks")
     df = pd.DataFrame({
         "market_id": ["m1"],
@@ -258,13 +258,14 @@ def test_append_ws_ticks_staged_creates_staging_file(tmp_path):
         "timeframe": ["5-minute"],
     })
     append_ws_ticks_staged(df, ticks_dir=ticks_dir)
-    staging = os.path.join(ticks_dir, "crypto=BTC", "timeframe=5-minute", "ws_staging.parquet")
-    assert os.path.exists(staging)
-    t = pq.read_table(staging)
+    shard_dir = os.path.join(ticks_dir, "crypto=BTC", "timeframe=5-minute")
+    shard_files = [f for f in os.listdir(shard_dir) if f.startswith("ws_ticks_")]
+    assert len(shard_files) == 1
+    t = pq.ParquetFile(os.path.join(shard_dir, shard_files[0])).read()
     assert len(t) == 1
 
 
-def test_append_ws_ticks_staged_accumulates(tmp_path):
+def test_append_ws_ticks_staged_creates_independent_shards(tmp_path):
     ticks_dir = str(tmp_path / "ticks2")
 
     def _make_row(ts):
@@ -278,9 +279,11 @@ def test_append_ws_ticks_staged_accumulates(tmp_path):
     append_ws_ticks_staged(_make_row(1000), ticks_dir=ticks_dir)
     append_ws_ticks_staged(_make_row(2000), ticks_dir=ticks_dir)
 
-    staging = os.path.join(ticks_dir, "crypto=BTC", "timeframe=5-minute", "ws_staging.parquet")
-    t = pq.read_table(staging)
-    assert len(t) == 2
+    shard_dir = os.path.join(ticks_dir, "crypto=BTC", "timeframe=5-minute")
+    shard_files = [f for f in os.listdir(shard_dir) if f.startswith("ws_ticks_")]
+    assert len(shard_files) == 2
+    total_rows = sum(len(pq.ParquetFile(os.path.join(shard_dir, f)).read()) for f in shard_files)
+    assert total_rows == 2
 
 
 def test_consolidate_ticks_merges_shards_and_deduplicates(tmp_path):
@@ -388,7 +391,7 @@ def test_consolidate_ticks_handles_legacy_shards_without_log_index(tmp_path):
 # append_ws_spot_prices_staged
 # ---------------------------------------------------------------------------
 
-def test_append_ws_spot_prices_staged_creates_staging(tmp_path):
+def test_append_ws_spot_prices_staged_creates_shard(tmp_path):
     spot_dir = str(tmp_path / "spot_prices")
     rows = [
         {"ts_ms": 1710000000000, "symbol": "btcusdt", "price": 67234.50, "source": "binance"},
@@ -396,22 +399,24 @@ def test_append_ws_spot_prices_staged_creates_staging(tmp_path):
         {"ts_ms": 1710000000050, "symbol": "btc/usd", "price": 67200.12, "source": "chainlink"},
     ]
     append_ws_spot_prices_staged(rows, spot_prices_dir=spot_dir)
-    staging = os.path.join(spot_dir, "ws_staging.parquet")
-    assert os.path.exists(staging)
-    t = pq.read_table(staging).to_pandas()
+    shard_files = [f for f in os.listdir(spot_dir) if f.startswith("ws_spot_")]
+    assert len(shard_files) == 1
+    t = pq.ParquetFile(os.path.join(spot_dir, shard_files[0])).read().to_pandas()
     assert len(t) == 3
     assert set(t["source"].unique()) == {"binance", "chainlink"}
     assert t["price"].dtype == "float64"  # full precision
 
 
-def test_append_ws_spot_prices_staged_accumulates(tmp_path):
+def test_append_ws_spot_prices_staged_creates_independent_shards(tmp_path):
     spot_dir = str(tmp_path / "spot_prices2")
     rows1 = [{"ts_ms": 1000, "symbol": "btcusdt", "price": 67000.0, "source": "binance"}]
     rows2 = [{"ts_ms": 2000, "symbol": "btcusdt", "price": 67001.0, "source": "binance"}]
     append_ws_spot_prices_staged(rows1, spot_prices_dir=spot_dir)
     append_ws_spot_prices_staged(rows2, spot_prices_dir=spot_dir)
-    t = pq.read_table(os.path.join(spot_dir, "ws_staging.parquet")).to_pandas()
-    assert len(t) == 2
+    shard_files = [f for f in os.listdir(spot_dir) if f.startswith("ws_spot_")]
+    assert len(shard_files) == 2
+    total_rows = sum(len(pq.ParquetFile(os.path.join(spot_dir, f)).read()) for f in shard_files)
+    assert total_rows == 2
 
 
 def test_append_ws_spot_prices_staged_empty_noop(tmp_path):
