@@ -120,7 +120,8 @@ class PolygonTickFetcher:
         self._block_cache: dict[int, int] = {}  # ts → block number
         self._last_etherscan_ts: float = time.monotonic()    # global rate-limit tracker
         self._last_rpc_logs_ts: float = time.monotonic()       # rate-limit tracker for eth_getLogs
-        self._etherscan_exhausted: bool = False  # daily limit hit → skip Etherscan for rest of run
+        self._etherscan_exhausted: bool = False  # daily limit hit → skip until retry
+        self._etherscan_exhausted_at: float = 0.0  # monotonic timestamp when limit was hit
         self._etherscan_call_count: int = 0      # total Etherscan API calls this session
 
         import threading
@@ -543,14 +544,29 @@ class PolygonTickFetcher:
             cur = chunk_end + 1
         return not had_failure
 
+    # Re-probe Etherscan after this many seconds once the daily limit is hit.
+    # Etherscan resets daily limits every 24h; 4h is a reasonable probe
+    # interval for long-running backfills that span multiple days.
+    _ETHERSCAN_REPROBE_INTERVAL_S = 4 * 3600
+
     def _etherscan_get(self, params: dict) -> dict | None:
         """Make an Etherscan V2 GET request with retry on transient errors.
 
         Sets ``_etherscan_exhausted`` when the daily call limit is detected,
-        causing all subsequent Etherscan calls to be skipped in favour of RPC.
+        causing subsequent Etherscan calls to be skipped in favour of RPC.
+        After ``_ETHERSCAN_REPROBE_INTERVAL_S`` seconds, the flag is cleared
+        and Etherscan is re-probed — the daily limit may have reset.
         """
         if self._etherscan_exhausted:
-            return None
+            elapsed = time.monotonic() - self._etherscan_exhausted_at
+            if elapsed < self._ETHERSCAN_REPROBE_INTERVAL_S:
+                return None
+            # Enough time passed — probe Etherscan to see if the daily limit reset.
+            self._etherscan_exhausted = False
+            self.logger.info(
+                "Etherscan daily limit was hit %.1fh ago — re-probing to check if quota reset",
+                elapsed / 3600,
+            )
 
         url = ETHERSCAN_V2_API
         for attempt in range(1, self._MAX_RETRIES + 1):
@@ -572,6 +588,7 @@ class PolygonTickFetcher:
                     # but resolves after a short wait.
                     if "daily" in combined or "max rate limit" in combined or "max calls" in combined:
                         self._etherscan_exhausted = True
+                        self._etherscan_exhausted_at = time.monotonic()
                         self.logger.warning(
                             "Etherscan daily limit exhausted after ~%d calls this session — "
                             "switching to RPC for remaining tick fetches",
@@ -589,6 +606,7 @@ class PolygonTickFetcher:
                         # Exhausted retries on rate limit — might be daily limit
                         # presenting as generic "rate limit".  Flag as exhausted.
                         self._etherscan_exhausted = True
+                        self._etherscan_exhausted_at = time.monotonic()
                         self.logger.warning(
                             "Etherscan rate limit persists after %d retries (~%d calls this session) — "
                             "treating as daily limit exhaustion, switching to RPC",
