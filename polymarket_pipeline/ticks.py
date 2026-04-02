@@ -747,17 +747,17 @@ class PolygonTickFetcher:
                         self.logger.error("RPC 400: %s | URL: %s", resp.text[:500], self._masked_rpc_url)
                         return None
 
-                    # 413 = request too large for this provider (e.g. block range
-                    # exceeds QuickNode's limit).  Permanent failure — retrying
-                    # the same request won't help.
+                    # 413 = response too large for this provider (e.g. block
+                    # range exceeds QuickNode's limit).  Return None so the
+                    # caller (_fetch_logs_rpc_streamed) can halve the block
+                    # range and retry on the SAME provider with a smaller
+                    # request, rather than rotating to a provider that may
+                    # be rate-limited.
                     if resp.status_code == 413:
                         self.logger.warning(
                             "RPC %s returned 413 Request Entity Too Large; URL: %s",
                             method, self._masked_rpc_url,
                         )
-                        if len(self._rpc_urls) > 1:
-                            self._rotate_rpc()
-                            break  # try next provider
                         return None
 
                     resp.raise_for_status()
