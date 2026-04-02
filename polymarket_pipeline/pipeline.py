@@ -165,6 +165,16 @@ class PolymarketDataPipeline:
 
         checkpoint = self._load_scan_checkpoint()
         if checkpoint is not None:
+            # Cap checkpoint to "now" — a corrupted checkpoint in the future
+            # (e.g. from a market whose end_ts was months ahead) would make
+            # the cutoff unreachable and suppress all backfill.
+            now_ts = int(time.time())
+            if checkpoint > now_ts:
+                self.logger.warning(
+                    "Scan checkpoint %s is in the future (now=%s) — capping to now",
+                    checkpoint, now_ts,
+                )
+                checkpoint = now_ts
             scan_cutoff_ts = checkpoint - 2 * 86400
             cutoff_date = datetime.fromtimestamp(scan_cutoff_ts, tz=timezone.utc).strftime("%Y-%m-%d")
             self.logger.info(
@@ -218,7 +228,7 @@ class PolymarketDataPipeline:
         self.logger.info("Fetching and processing closed markets...")
         fetched_closed = 0
         test_collected = 0
-        max_end_ts_seen = 0
+        max_closed_ts_seen = 0
         relevant_batch: list[MarketRecord] = []
         closed_markets_for_ticks: list[MarketRecord] = []
 
@@ -237,11 +247,18 @@ class PolymarketDataPipeline:
             if fetched_closed % 500 == 0:
                 self.logger.info("Scanned %d closed markets...", fetched_closed)
 
-            if market.end_ts > max_end_ts_seen:
-                max_end_ts_seen = market.end_ts
+            # Track closed_ts (not end_ts) for the checkpoint.  The scan
+            # sorts by closedTime DESC and the relevance check compares
+            # closed_ts against the cutoff.  Using end_ts was wrong because
+            # early-resolved markets (e.g. culture markets) can have end_ts
+            # months in the future, inflating the checkpoint and causing all
+            # subsequent runs to find zero relevant markets.
+            checkpoint_ts = market.closed_ts if market.closed_ts is not None else market.end_ts
+            if checkpoint_ts > max_closed_ts_seen:
+                max_closed_ts_seen = checkpoint_ts
 
-            if not run_options.is_test and fetched_closed % 500 == 0 and max_end_ts_seen > 0:
-                self._save_scan_checkpoint(max_end_ts_seen)
+            if not run_options.is_test and fetched_closed % 500 == 0 and max_closed_ts_seen > 0:
+                self._save_scan_checkpoint(max_closed_ts_seen)
 
             if self._is_market_relevant(market, run_options, scan_cutoff_ts):
                 relevant_batch.append(market)
@@ -254,9 +271,9 @@ class PolymarketDataPipeline:
         if relevant_batch:
             self.price_history_phase.process_market_batch(relevant_batch)
 
-        if max_end_ts_seen > 0 and not run_options.is_test:
-            self._save_scan_checkpoint(max_end_ts_seen)
-            self.logger.info("Scan checkpoint saved (max end_ts: %s)", max_end_ts_seen)
+        if max_closed_ts_seen > 0 and not run_options.is_test:
+            self._save_scan_checkpoint(max_closed_ts_seen)
+            self.logger.info("Scan checkpoint saved (max closed_ts: %s)", max_closed_ts_seen)
 
         return closed_markets_for_ticks
 

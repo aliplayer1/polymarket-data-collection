@@ -1634,19 +1634,14 @@ def upload_to_huggingface(
     api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True)
     log.info("Hugging Face repo: https://huggingface.co/datasets/%s", repo)
 
-    # Hold the cross-process lock for the entire consolidation + upload cycle.
-    # This prevents the historical service from modifying part-0.parquet files
-    # (via persist_normalized / persist_ticks) while the HF uploader reads them.
-    #
-    # The WebSocket service is NOT blocked by this lock: its staging writes
-    # (append_ws_ticks_staged, append_ws_spot_prices_staged,
-    # append_ws_orderbook_staged) all use independent shard files with unique
-    # filenames — no lock required, no read-merge-write.
+    # Phase 1: Consolidate shard files under the write lock.
+    # The lock prevents the historical service from modifying part-0.parquet
+    # files while we merge shards.  Lock is released before the network
+    # upload so other writers aren't blocked during (potentially slow) HF
+    # transfer.  The WebSocket service is never blocked — it uses lock-free
+    # shard files with unique names.
     data_root = os.path.dirname(os.path.abspath(m_path))
     with _write_lock(data_root):
-        # Consolidate any shard/staging files before uploading so that
-        # all data is in the main partition files.  Skip if the caller already
-        # ran consolidation in this session (skip_consolidate=True).
         if not skip_consolidate and os.path.exists(t_dir):
             consolidate_ticks(ticks_dir=t_dir, logger=log)
         if spot_prices_dir and os.path.exists(spot_prices_dir):
@@ -1654,80 +1649,40 @@ def upload_to_huggingface(
         if orderbook_dir and os.path.exists(orderbook_dir):
             consolidate_orderbook(orderbook_dir=orderbook_dir, logger=log)
 
-        # Upload markets table
-        if os.path.exists(m_path):
-            api.upload_file(
-                path_or_fileobj=m_path,
-                path_in_repo="data/markets.parquet",
-                repo_id=repo,
-                repo_type="dataset",
-            )
-            log.info("Uploaded %s -> data/markets.parquet", m_path)
+    # Phase 2: Upload the entire data root in a single commit.
+    # After consolidation the part-0.parquet files are stable — the WS
+    # service only writes new shard files (which are excluded below), and
+    # the historical service won't modify files until its next run.
+    # A single upload_folder call creates one HF commit instead of five,
+    # eliminating redundant remote-file listings and hash comparisons.
+    _ignore = [
+        # WS staging shards (lock-free, never uploaded)
+        "**/ws_staging.parquet",
+        "**/ws_ticks_*.parquet",
+        "**/ws_spot_*.parquet",
+        "**/ws_ob_*.parquet",
+        # Backfill / history shards (consolidated into part-0.parquet)
+        "**/backfill_*.parquet",
+        "**/binance_history_*.parquet",
+        # Atomic-write temp files
+        "**/*.tmp",
+        # Internal state files
+        ".scan_checkpoint",
+        ".write.lock",
+        ".hf_sync_checkpoint",
+        "**/.duckdb_tmp",
+    ]
+    _delete = ["*.parquet"]
 
-        # Patterns to exclude from folder uploads: staging files (actively
-        # written by the WebSocket service), backfill shards (consolidated
-        # into part-0.parquet), and atomic-write temp files.
-        _ignore = [
-            "**/ws_staging.parquet",
-            "**/ws_ticks_*.parquet",
-            "**/ws_spot_*.parquet",
-            "**/ws_ob_*.parquet",
-            "**/backfill_*.parquet",
-            "**/binance_history_*.parquet",
-            "**/*.tmp",
-        ]
-        # Delete remote .parquet files that no longer exist locally.  Without
-        # this, each upload_folder adds a new UUID-named file per partition
-        # while the old ones accumulate indefinitely on the Hub.
-        _delete = ["*.parquet"]
-
-        # Upload prices partition tree
-        if os.path.exists(p_dir):
-            api.upload_folder(
-                folder_path=p_dir,
-                path_in_repo="data/prices",
-                repo_id=repo,
-                repo_type="dataset",
-                ignore_patterns=_ignore,
-                delete_patterns=_delete,
-            )
-            log.info("Uploaded %s/ -> data/prices/", p_dir)
-
-        # Upload ticks partition tree
-        if os.path.exists(t_dir):
-            api.upload_folder(
-                folder_path=t_dir,
-                path_in_repo="data/ticks",
-                repo_id=repo,
-                repo_type="dataset",
-                ignore_patterns=_ignore,
-                delete_patterns=_delete,
-            )
-            log.info("Uploaded %s/ -> data/ticks/", t_dir)
-
-        # Upload spot prices (flat directory)
-        if spot_prices_dir and os.path.exists(spot_prices_dir):
-            api.upload_folder(
-                folder_path=spot_prices_dir,
-                path_in_repo="data/spot_prices",
-                repo_id=repo,
-                repo_type="dataset",
-                ignore_patterns=_ignore,
-                delete_patterns=_delete,
-            )
-            log.info("Uploaded %s/ -> data/spot_prices/", spot_prices_dir)
-
-        # Upload orderbook partition tree
-        if orderbook_dir and os.path.exists(orderbook_dir):
-            api.upload_folder(
-                folder_path=orderbook_dir,
-                path_in_repo="data/orderbook",
-                repo_id=repo,
-                repo_type="dataset",
-                ignore_patterns=_ignore,
-                delete_patterns=_delete,
-            )
-            log.info("Uploaded %s/ -> data/orderbook/", orderbook_dir)
+    if os.path.isdir(data_root):
+        api.upload_folder(
+            folder_path=data_root,
+            path_in_repo="data",
+            repo_id=repo,
+            repo_type="dataset",
+            ignore_patterns=_ignore,
+            delete_patterns=_delete,
+        )
 
     log.info("Upload complete.")
 
