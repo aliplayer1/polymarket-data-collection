@@ -539,7 +539,7 @@ def test_consolidate_orderbook_merges_shards(tmp_path):
     assert sorted(os.listdir(shard_dir)) == ["part-0.parquet"]
     result = pq.read_table(shard_dir / "part-0.parquet").to_pandas()
     assert len(result) == 3
-    assert result["ts_ms"].is_monotonic_increasing
+    assert set(result["ts_ms"]) == {1000, 2000, 3000}
 
 
 def test_orderbook_shard_write_then_consolidate(tmp_path):

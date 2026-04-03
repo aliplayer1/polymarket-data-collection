@@ -93,7 +93,7 @@ def _get_thread_lock(canonical_root: str) -> threading.RLock:
         return _WRITE_LOCKS[canonical_root]
 
 
-def _acquire_flock(fd: Any, lock_path: str) -> None:
+def _acquire_flock(fd: Any, lock_path: str, *, timeout: float | None = None) -> None:
     """Acquire LOCK_EX with stale-PID detection and a hard timeout.
 
     Unlike plain ``flock(LOCK_EX)``, this function never blocks indefinitely:
@@ -102,10 +102,12 @@ def _acquire_flock(fd: Any, lock_path: str) -> None:
       via ``os.kill(pid, 0)``.  If the holder process is dead (stale lock),
       the stamp is cleared and acquisition retries immediately — the OS
       already released the flock when the process exited.
-    - Raises ``TimeoutError`` after ``_FLOCK_TIMEOUT_SECONDS`` so a live but
-      stuck process never permanently blocks the pipeline.
+    - Raises ``TimeoutError`` after ``timeout`` seconds (default:
+      ``_FLOCK_TIMEOUT_SECONDS``) so a live but stuck process never
+      permanently blocks the pipeline.
     """
-    deadline = time.monotonic() + _FLOCK_TIMEOUT_SECONDS
+    effective_timeout = timeout if timeout is not None else _FLOCK_TIMEOUT_SECONDS
+    deadline = time.monotonic() + effective_timeout
     stale_cleared = False
 
     while True:
@@ -151,25 +153,32 @@ def _acquire_flock(fd: Any, lock_path: str) -> None:
         if time.monotonic() >= deadline:
             raise TimeoutError(
                 f"_write_lock: could not acquire {lock_path!r} within "
-                f"{_FLOCK_TIMEOUT_SECONDS:.0f}s — another process may be holding "
+                f"{effective_timeout:.0f}s — another process may be holding "
                 "the lock for an unusually long time"
             )
         time.sleep(_FLOCK_POLL_INTERVAL)
 
 
 @contextmanager
-def _write_lock(data_root: str):
+def _write_lock(data_root: str, *, timeout: float | None = None):
     """Exclusive write lock for a Parquet data root directory.
 
     Acquires both a threading.Lock (in-process) and an fcntl file lock
     (cross-process) before yielding, so the caller can safely execute the
     full read → merge → write cycle without racing another thread or process.
 
+    Parameters
+    ----------
+    timeout:
+        Maximum seconds to wait for the lock.  Defaults to
+        ``_FLOCK_TIMEOUT_SECONDS`` (300 s).  Pass ``0`` for a non-blocking
+        attempt that raises ``TimeoutError`` immediately if the lock is held.
+
     Improvements over naive ``flock(LOCK_EX)``:
     - Uses LOCK_NB with timeout — never hangs forever if the holder dies.
     - PID-stamps the lock file so waiters can detect and clear stale locks.
     - Raises ``TimeoutError`` (not an infinite hang) if the lock cannot be
-      acquired within ``_FLOCK_TIMEOUT_SECONDS``.
+      acquired within the timeout.
     - REENTRANT: Uses thread-local state to detect if this thread already holds
       the lock for the given path, allowing nested calls without deadlock.
     """
@@ -200,7 +209,7 @@ def _write_lock(data_root: str):
         fd = os.fdopen(raw_fd, "r+")
         try:
             if _HAVE_FCNTL:
-                _acquire_flock(fd, lock_path)
+                _acquire_flock(fd, lock_path, timeout=timeout)
 
             _LOCK_STATE.depths[canonical] = 1
             try:
@@ -1269,6 +1278,11 @@ def consolidate_orderbook(
                     con, temp_dir=temp_dir,
                 )
 
+                # Intentionally omit ORDER BY: the global sort is a
+                # blocking operator that requires materializing the full
+                # result in memory/disk — the same OOM trigger that was
+                # already removed from consolidate_ticks.  Downstream
+                # queries can sort on read if needed.
                 result = con.execute(f"""
                     COPY (
                         SELECT
@@ -1278,7 +1292,6 @@ def consolidate_orderbook(
                             [{files_sql}],
                             union_by_name=true
                         )
-                        ORDER BY ts_ms
                     ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
                 """).fetchone()
                 nrows = result[0] if result else 0
@@ -1385,6 +1398,7 @@ def persist_normalized(
     prices_dir: str | None = None,
     logger: logging.Logger | None = None,
     skip_markets: bool = False,
+    lock_timeout: float | None = None,
 ) -> None:
     """Merge new data with existing data on disk and write Parquet.
 
@@ -1408,7 +1422,7 @@ def persist_normalized(
     # canonical lock key, so markets and prices always share the same lock.
     data_root = os.path.dirname(os.path.abspath(m_path))
 
-    with _write_lock(data_root):
+    with _write_lock(data_root, timeout=lock_timeout):
         # --- Markets ---
         if not skip_markets:
             existing_markets = load_markets(m_path)
@@ -1535,11 +1549,12 @@ def persist_culture_normalized(
     prices_dir: str,
     logger: logging.Logger | None = None,
     skip_markets: bool = False,
+    lock_timeout: float | None = None,
 ) -> None:
     log = logger or logging.getLogger("polymarket_pipeline")
     data_root = os.path.dirname(os.path.abspath(markets_path))
 
-    with _write_lock(data_root):
+    with _write_lock(data_root, timeout=lock_timeout):
         if not skip_markets:
             existing_markets = load_culture_markets(markets_path)
             for col in ("crypto", "timeframe"):

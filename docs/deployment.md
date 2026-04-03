@@ -40,12 +40,13 @@ The pipeline runs as two complementary services that operate concurrently and ar
 1.  **In-process**: `threading.RLock` prevents thread-level races.
 2.  **Cross-process**: An `fcntl` exclusive lock on `data/.write.lock` prevents process-level races between the WebSocket service and the historical/upload service.
 
-The cross-process lock has a **5-minute (300 s)** timeout.  The `polymarket-historical.service` (specifically the `--upload` phase) holds this lock for the duration of the Hugging Face upload to ensure the dataset is stable and no files are deleted/replaced by the WebSocket service during the scan.
+The cross-process lock has a **5-minute (300 s)** timeout.  The `--upload` phase holds this lock only during shard consolidation (seconds), then releases it before the network upload to Hugging Face. The WebSocket service is never blocked — it writes lock-free shard files with unique names.
 
 ```text
 Hetzner CAX21 (4 vCPU ARM64 / 8 GB RAM / 80 GB SSD)
   ├── polymarket-websocket.service  → 24/7 WebSocket tick stream (--websocket-only), auto-restart
   ├── polymarket-historical.timer   → incremental historical fetch + HF upload every 6 h
+  ├── polymarket-upload.timer       → consolidate shard files + HF upload every 3 h
   └── polymarket-restart.timer      → restarts WebSocket service daily at 00:05 UTC (new market discovery)
 ```
 
@@ -62,6 +63,8 @@ Hetzner CAX21 (4 vCPU ARM64 / 8 GB RAM / 80 GB SSD)
 | `polymarket-websocket.service` | persistent | Live WebSocket tick stream (`--websocket-only`) |
 | `polymarket-historical.service` | oneshot | Historical scan + HF upload (`--historical-only --upload`) |
 | `polymarket-historical.timer` | timer (every 6 h) | Triggers `polymarket-historical.service` |
+| `polymarket-upload.service` | oneshot | Consolidate shard files + HF upload (`--upload-only`) |
+| `polymarket-upload.timer` | timer (every 3 h) | Triggers `polymarket-upload.service` |
 | `polymarket-restart.service` | oneshot | Restarts `polymarket-websocket.service` |
 | `polymarket-restart.timer` | timer (daily 00:05 UTC) | Triggers `polymarket-restart.service` for market re-discovery |
 

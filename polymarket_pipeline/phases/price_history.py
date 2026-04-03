@@ -233,6 +233,7 @@ class PriceHistoryPhase:
         df: pd.DataFrame,
         *,
         update_cache: bool = True,
+        lock_timeout: float | None = None,
     ) -> pd.DataFrame:
         df = df.assign(market_id=lambda data: data["market_id"].astype(str))
         
@@ -255,6 +256,7 @@ class PriceHistoryPhase:
                 prices_dir=str(self.paths.prices_dir),
                 logger=self.logger,
                 skip_markets=not update_cache,
+                lock_timeout=lock_timeout,
             )
             prices_frames.append(prices_df)
             
@@ -269,6 +271,7 @@ class PriceHistoryPhase:
                 prices_dir=str(data_culture_dir / "prices"),
                 logger=self.logger,
                 skip_markets=not update_cache,
+                lock_timeout=lock_timeout,
             )
             prices_frames.append(culture_prices_df)
 
