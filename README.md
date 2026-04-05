@@ -94,7 +94,7 @@ The runtime is strictly partitioned to maintain isolation between heavily standa
    - `PriceHistoryPhase`: Fetches OHLC data from Gamma/CLOB asynchronously across all mapped tokens.
    - `TickBackfillPhase`: Scans Polygon RPC for trade logs. Automatically **chunks large windows** (e.g. 4-day/7-day/1-month culture markets) into 6-hour segments to ensure memory stability and RPC reliability.
    - `RTDSStreamPhase`: Manages Binance spot prices (Gracefully skipped with `NULL` columns for non-crypto assets).
-   - `WebSocketPhase`: Streams live Polymarket trade events. Features crash-resilient `category` handling for "Culture" markets.
+   - `WebSocketPhase`: Streams live Polymarket trade events with fully lock-free shard writes. Autonomously refreshes market subscriptions every hour. Features crash-resilient `category` handling for "Culture" markets.
 
 ### Advanced Data Reliability
 
@@ -102,6 +102,7 @@ The runtime is strictly partitioned to maintain isolation between heavily standa
 - **Dynamic Timeframe Parsing**: Support for variable date ranges (e.g., "March 27 to April 3") and month-based ranges (e.g., "in April 2026") using advanced regex normalization in `markets.py`.
 - **Streaming Tick Collection**: The `PolygonTickFetcher` uses a memory-efficient callback pattern to process on-chain logs. Events are decoded and filtered as they are streamed from RPC/Etherscan chunks, preventing OOM errors even during high-volume historical backfills.
 - **Etherscan Daily-Limit Auto-Switchover**: Etherscan V2 is the primary source for on-chain tick fetching (3 req/s, 100K/day). The rate limiter is enforced on every HTTP attempt (including retries) across all concurrent threads. When the daily limit is hit, the pipeline seamlessly switches to RPC with automatic multi-provider rotation (e.g., Alchemy + QuickNode). Transient per-second rate limits fall back to RPC for the affected request only, keeping Etherscan available for subsequent calls.
+- **Fully Lock-Free WebSocket Writes**: All five WS data types (prices, ticks, orderbook, spot prices, culture prices) use lock-free shard writes — the WS flush loop holds zero locks, eliminating contention with upload and historical services.
 - **DuckDB Out-of-Core Consolidation**: Tick and orderbook shard consolidation uses DuckDB with configurable memory limits and disk spilling, preventing OOM on large partitions (e.g., BTC/5-minute orderbook with millions of rows).
 - **DuckDB SQL Injection Hardening**: All file paths and environment variables interpolated into DuckDB SQL are escaped via `_duckdb_escape()`. The `PM_DUCKDB_MEMORY_LIMIT` env var is regex-validated.
 - **Culture Data Hub**: Culture-specific data (e.g., Elon Musk tweets) is automatically isolated in `data-culture/` and uploaded to a dedicated Hugging Face repository (`HF_CULTURE_REPO_ID`).
@@ -133,7 +134,7 @@ Recommended local validation:
 | `polymarket_pipeline/markets.py` | Definition validation schemas (`BinaryMarketDefinition`, `MultiOutcomeMarketDefinition`) |
 | `polymarket_pipeline/market_normalization.py` | Populates category/tokens on unified generalized `MarketRecord` |
 | `polymarket_pipeline/models.py` | Dynamic `tokens` map powering the pipeline. |
-| `polymarket_pipeline/storage.py` | Atomic Parquet I/O, DuckDB-based tick/orderbook consolidation, HF Hub upload, cross-process locking |
+| `polymarket_pipeline/storage.py` | Atomic Parquet I/O, lock-free shard writes, DuckDB-based tick/orderbook consolidation, pandas-based price consolidation, HF Hub upload, cross-process locking |
 | `polymarket_pipeline/ticks.py` | On-chain tick fetcher with Etherscan→RPC auto-switchover and multi-provider rotation |
 | `polymarket_pipeline/query.py` | DuckDB SQL query layer over local Parquet files |
 | `polymarket_pipeline/phases/` | Extracted pipeline phases utilizing generalized token processing. |
