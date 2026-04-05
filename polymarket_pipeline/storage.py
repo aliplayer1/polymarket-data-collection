@@ -1887,22 +1887,21 @@ def upload_to_huggingface(
     api.create_repo(repo_id=repo, repo_type="dataset", exist_ok=True)
     log.info("Hugging Face repo: https://huggingface.co/datasets/%s", repo)
 
-    # Phase 1: Consolidate shard files under the write lock.
-    # The lock prevents the historical service from modifying part-0.parquet
-    # files while we merge shards.  Lock is released before the network
-    # upload so other writers aren't blocked during (potentially slow) HF
-    # transfer.  The WebSocket service is never blocked — it uses lock-free
-    # shard files with unique names.
+    # Phase 1: Consolidate shard files.  Each consolidation function
+    # acquires its own per-partition write lock internally, so the lock
+    # is held only for one partition at a time (typically seconds, not
+    # minutes).  No outer lock — other services can interleave between
+    # partitions.  All writers (WS, historical) use lock-free shard files,
+    # so only consolidation itself needs the lock.
     data_root = os.path.dirname(os.path.abspath(m_path))
-    with _write_lock(data_root):
-        if os.path.exists(p_dir):
-            consolidate_prices(prices_dir=p_dir, logger=log)
-        if not skip_consolidate and os.path.exists(t_dir):
-            consolidate_ticks(ticks_dir=t_dir, logger=log)
-        if spot_prices_dir and os.path.exists(spot_prices_dir):
-            consolidate_spot_prices(spot_prices_dir=spot_prices_dir, logger=log)
-        if orderbook_dir and os.path.exists(orderbook_dir):
-            consolidate_orderbook(orderbook_dir=orderbook_dir, logger=log)
+    if os.path.exists(p_dir):
+        consolidate_prices(prices_dir=p_dir, logger=log)
+    if not skip_consolidate and os.path.exists(t_dir):
+        consolidate_ticks(ticks_dir=t_dir, logger=log)
+    if spot_prices_dir and os.path.exists(spot_prices_dir):
+        consolidate_spot_prices(spot_prices_dir=spot_prices_dir, logger=log)
+    if orderbook_dir and os.path.exists(orderbook_dir):
+        consolidate_orderbook(orderbook_dir=orderbook_dir, logger=log)
 
     # Phase 2: Upload the entire data root in a single commit.
     # After consolidation the part-0.parquet files are stable — the WS

@@ -9,7 +9,15 @@ import pandas as pd
 from ..config import PRICE_SUM_TOLERANCE, TIME_FRAMES
 from ..models import MarketRecord
 from ..providers import PriceHistoryProvider
-from ..storage import load_prices_for_timeframe, persist_normalized, split_markets_prices, persist_culture_normalized, split_culture_markets_prices
+from ..storage import (
+    append_ws_culture_prices_staged,
+    append_ws_prices_staged,
+    load_prices_for_timeframe,
+    persist_culture_normalized,
+    persist_normalized,
+    split_culture_markets_prices,
+    split_markets_prices,
+)
 from .shared import PipelinePaths, build_binary_price_frame
 
 
@@ -233,46 +241,69 @@ class PriceHistoryPhase:
         df: pd.DataFrame,
         *,
         update_cache: bool = True,
-        lock_timeout: float | None = None,
     ) -> pd.DataFrame:
+        """Write price data to disk and optionally update the in-memory cache.
+
+        Uses lock-free shard writes for prices (no cross-process lock needed)
+        and a short lock only for market metadata updates.  This prevents the
+        historical service from blocking on the upload service's consolidation
+        lock, which previously caused 5-minute timeout crashes.
+
+        Market metadata (``markets.parquet``) still uses ``persist_normalized``
+        with the write lock, but the write is fast (small file, no merge with
+        millions of price rows).  Price data goes to shard files that the
+        upload service's consolidation phase merges later.
+        """
         df = df.assign(market_id=lambda data: data["market_id"].astype(str))
-        
+
         # Split by category
         if "category" not in df.columns:
             df["category"] = "crypto"
-            
+
         is_culture = df["category"] == "culture"
         culture_df = df[is_culture]
         crypto_df = df[~is_culture]
-        
+
         prices_frames = []
-        
+
         if not crypto_df.empty:
             markets_df, prices_df = split_markets_prices(crypto_df)
-            persist_normalized(
-                markets_df,
-                prices_df,
-                markets_path=str(self.paths.markets_path),
-                prices_dir=str(self.paths.prices_dir),
-                logger=self.logger,
-                skip_markets=not update_cache,
-                lock_timeout=lock_timeout,
-            )
+            if update_cache:
+                # Write market metadata under a short lock (small file, fast).
+                # Prices go to lock-free shard files — no lock needed.
+                persist_normalized(
+                    markets_df,
+                    pd.DataFrame(),  # empty — prices written as shards below
+                    markets_path=str(self.paths.markets_path),
+                    prices_dir=str(self.paths.prices_dir),
+                    logger=self.logger,
+                    skip_markets=False,
+                )
+                append_ws_prices_staged(
+                    prices_df,  # already has crypto/timeframe from split_markets_prices
+                    prices_dir=str(self.paths.prices_dir),
+                    logger=self.logger,
+                )
             prices_frames.append(prices_df)
-            
+
         if not culture_df.empty:
             culture_markets_df, culture_prices_df = split_culture_markets_prices(culture_df)
             data_culture_dir = self.paths.data_dir.parent / "data-culture"
             data_culture_dir.mkdir(parents=True, exist_ok=True)
-            persist_culture_normalized(
-                culture_markets_df,
-                culture_prices_df,
-                markets_path=str(data_culture_dir / "markets.parquet"),
-                prices_dir=str(data_culture_dir / "prices"),
-                logger=self.logger,
-                skip_markets=not update_cache,
-                lock_timeout=lock_timeout,
-            )
+            if update_cache:
+                persist_culture_normalized(
+                    culture_markets_df,
+                    pd.DataFrame(),  # empty — prices written as shards below
+                    markets_path=str(data_culture_dir / "markets.parquet"),
+                    prices_dir=str(data_culture_dir / "prices"),
+                    logger=self.logger,
+                    skip_markets=False,
+                )
+                append_ws_culture_prices_staged(
+                    culture_prices_df,  # already has crypto/timeframe
+                    prices_dir=str(data_culture_dir / "prices"),
+                    logger=self.logger,
+                )
             prices_frames.append(culture_prices_df)
 
         if not update_cache:
@@ -281,18 +312,17 @@ class PriceHistoryPhase:
         existing = self.existing_dfs.get(timeframe, pd.DataFrame())
         dfs_to_concat = [existing] + prices_frames
         dfs_to_concat = [d for d in dfs_to_concat if not d.empty]
-        
+
         merged = (
             pd.concat(dfs_to_concat, ignore_index=True) if dfs_to_concat else existing
         )
         if not merged.empty:
-            # Depending on columns, deduplicate appropriately
-            if "outcome" in merged.columns: # Culture mixed in
+            if "outcome" in merged.columns:
                 merged = merged.drop_duplicates(subset=["market_id", "timestamp", "outcome"], keep="last")
             else:
                 merged = merged.drop_duplicates(subset=["market_id", "timestamp"], keep="last")
             merged = merged.sort_values(["market_id", "timestamp"]).reset_index(drop=True)
-            
+
         self.existing_dfs[timeframe] = merged
         return merged
 
