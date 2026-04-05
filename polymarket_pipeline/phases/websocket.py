@@ -24,7 +24,13 @@ from ..config import (
 from ..models import MarketRecord
 from ..providers import LastTradePriceProvider
 from ..retry import api_call_with_retry
-from ..storage import append_ws_ticks_staged, append_ws_spot_prices_staged, append_ws_orderbook_staged
+from ..storage import (
+    append_ws_culture_prices_staged,
+    append_ws_orderbook_staged,
+    append_ws_prices_staged,
+    append_ws_spot_prices_staged,
+    append_ws_ticks_staged,
+)
 from .rtds_stream import CRYPTO_TO_RTDS_SYMBOL
 from .shared import PipelinePaths, build_binary_price_row, build_binary_tick_row, build_orderbook_row
 
@@ -110,28 +116,22 @@ class WebSocketPhase:
 
         return last_prices
 
-    # Short timeout for the price write lock during WS flush.  If the
-    # upload/consolidation service holds the lock, the price flush is
-    # deferred to the next cycle rather than blocking the entire flush
-    # loop (which would cause orderbook/tick buffers to overflow).
-    _PRICE_FLUSH_LOCK_TIMEOUT = 2.0
-
     def _flush_snapshot(
         self,
         ws_snapshot: dict[str, list[dict[str, Any]]],
         tick_snapshot: dict[str, list[dict[str, Any]]],
         orderbook_snapshot: dict[str, list[dict[str, Any]]],
         spot_price_snapshot: list[dict[str, Any]],
-    ) -> tuple[int, dict[str, list[dict[str, Any]]]]:
-        """Flush buffered data to disk.
+    ) -> int:
+        """Flush all buffered data to disk using lock-free shard writes.
 
-        Returns ``(flushed_price_rows, unflushed_prices)``.  Lock-free
-        writes (orderbook, ticks, spot prices) always succeed.  The price
-        write needs the cross-process lock; if the lock is held by
-        another service, the price data is returned so the caller can
-        put it back into the buffer for the next cycle.
+        Every data type (prices, ticks, orderbook, spot prices) is written
+        as an independent shard file with a unique name.  No read of existing
+        data and no cross-process lock are needed, so this function never
+        blocks on the lock held by the upload or historical services.
+        Consolidation merges shards on its next run.
         """
-        # --- Phase 1: Lock-free shard writes (always succeed) -----------
+        # --- Orderbook ---
         all_ob: list[dict[str, Any]] = []
         for rows in orderbook_snapshot.values():
             all_ob.extend(rows)
@@ -143,6 +143,7 @@ class WebSocketPhase:
                 logger=self.logger,
             )
 
+        # --- Ticks ---
         all_ticks: list[dict[str, Any]] = []
         for rows in tick_snapshot.values():
             all_ticks.extend(rows)
@@ -170,6 +171,7 @@ class WebSocketPhase:
                     logger=self.logger,
                 )
 
+        # --- Spot prices ---
         if spot_price_snapshot:
             append_ws_spot_prices_staged(
                 spot_price_snapshot,
@@ -177,29 +179,40 @@ class WebSocketPhase:
                 logger=self.logger,
             )
 
-        # --- Phase 2: Price write (needs lock, may be deferred) ---------
+        # --- Prices (shard writes, no lock) ---
         flushed_rows = 0
-        unflushed: dict[str, list[dict[str, Any]]] = {}
         if ws_snapshot:
-            try:
-                for timeframe, rows in ws_snapshot.items():
-                    if not rows:
-                        continue
-                    new_df = pd.DataFrame(rows)
-                    self.price_history_phase.persist_dataframe(
-                        timeframe, new_df, update_cache=False,
-                        lock_timeout=self._PRICE_FLUSH_LOCK_TIMEOUT,
-                    )
-                    flushed_rows += len(rows)
-            except TimeoutError:
-                self.logger.debug(
-                    "Write lock busy — deferring price flush to next cycle"
-                )
-                # Return all price data (including already-flushed timeframes
-                # is harmless — persist_dataframe deduplicates on merge).
-                unflushed = ws_snapshot
+            all_price_rows: list[dict[str, Any]] = []
+            for rows in ws_snapshot.values():
+                all_price_rows.extend(rows)
+            if all_price_rows:
+                prices_df = pd.DataFrame(all_price_rows)
+                if "category" not in prices_df.columns:
+                    prices_df["category"] = "crypto"
 
-        return flushed_rows, unflushed
+                is_culture = prices_df["category"] == "culture"
+                crypto_prices = prices_df[~is_culture]
+                culture_prices = prices_df[is_culture]
+
+                if not crypto_prices.empty:
+                    append_ws_prices_staged(
+                        crypto_prices,
+                        prices_dir=str(self.paths.prices_dir),
+                        logger=self.logger,
+                    )
+                    flushed_rows += len(crypto_prices)
+
+                if not culture_prices.empty:
+                    data_culture_dir = self.paths.data_dir.parent / "data-culture"
+                    data_culture_dir.mkdir(parents=True, exist_ok=True)
+                    append_ws_culture_prices_staged(
+                        culture_prices,
+                        prices_dir=str(data_culture_dir / "prices"),
+                        logger=self.logger,
+                    )
+                    flushed_rows += len(culture_prices)
+
+        return flushed_rows
 
     async def _run_ws_shard(
         self,
@@ -582,17 +595,21 @@ class WebSocketPhase:
                 continue
 
             last_flush_time = now
-            flushed, unflushed_prices = await loop.run_in_executor(
-                None, self._flush_snapshot, ws_snapshot, tick_snapshot, orderbook_snapshot, spot_snapshot,
-            )
-
-            # Put deferred price data back into the buffer for the next
-            # cycle.  This happens when the write lock is held by another
-            # service (consolidation/upload).  Prepend so older data is
-            # flushed first once the lock is released.
-            if unflushed_prices:
-                for tf, rows in unflushed_prices.items():
+            try:
+                flushed = await loop.run_in_executor(
+                    None, self._flush_snapshot, ws_snapshot, tick_snapshot, orderbook_snapshot, spot_snapshot,
+                )
+            except Exception as exc:
+                self.logger.error("Flush failed (data will be retried next cycle): %s", exc)
+                # Put snapshots back into buffers so data isn't lost
+                for tf, rows in ws_snapshot.items():
                     ws_buffer[tf] = rows + ws_buffer.get(tf, [])
+                for tf, rows in tick_snapshot.items():
+                    tick_buffer[tf] = rows + tick_buffer.get(tf, [])
+                for tf, rows in orderbook_snapshot.items():
+                    orderbook_buffer[tf] = rows + orderbook_buffer.get(tf, [])
+                self.spot_price_buffer.extend(spot_snapshot)
+                continue
 
             total_flushed = flushed + len(spot_snapshot) + sum(len(r) for r in orderbook_snapshot.values())
             if total_flushed:

@@ -19,12 +19,16 @@ from polymarket_pipeline.storage import (
     _write_lock,
     _write_parquet_atomic,
     _write_partitioned_atomic,
-    append_ws_ticks_staged,
-    append_ws_spot_prices_staged,
+    append_ws_culture_prices_staged,
     append_ws_orderbook_staged,
-    consolidate_ticks,
-    consolidate_spot_prices,
+    append_ws_prices_staged,
+    append_ws_spot_prices_staged,
+    append_ws_ticks_staged,
+    consolidate_culture_prices,
     consolidate_orderbook,
+    consolidate_prices,
+    consolidate_spot_prices,
+    consolidate_ticks,
     load_markets,
     load_prices,
     persist_normalized,
@@ -92,6 +96,54 @@ def test_write_partitioned_atomic_no_tmp_dir_left(tmp_path):
     )
     tmp_dirs = [d for d in os.listdir(tmp_path) if ".tmp." in d]
     assert tmp_dirs == []
+
+
+def test_write_partitioned_atomic_preserves_concurrent_shard_files(tmp_path):
+    """_write_partitioned_atomic must NOT delete lock-free shard files
+    written by concurrent processes (WS service, tick backfill)."""
+    root = str(tmp_path / "prices")
+
+    # First write creates the partition
+    df1 = pd.DataFrame({
+        "market_id": ["m1"], "timestamp": [100], "up_price": [0.5],
+        "down_price": [0.5], "crypto": ["BTC"], "timeframe": ["1-hour"],
+    })
+    _write_partitioned_atomic(
+        pa.Table.from_pandas(df1, preserve_index=False),
+        root, partition_cols=["crypto", "timeframe"],
+    )
+    part_dir = os.path.join(root, "crypto=BTC", "timeframe=1-hour")
+
+    # Simulate concurrent WS shard writes
+    shard_names = [
+        "ws_prices_12345_99999.parquet",
+        "ws_ticks_12345_99999.parquet",
+        "ws_culture_prices_12345_99999.parquet",
+        "ws_ob_12345_99999.parquet",
+        "backfill_12345.parquet",
+    ]
+    for name in shard_names:
+        dummy = pa.table({"x": [1]})
+        pq.write_table(dummy, os.path.join(part_dir, name))
+
+    # Second write should replace part-0.parquet but NOT delete shard files
+    df2 = pd.DataFrame({
+        "market_id": ["m1"], "timestamp": [200], "up_price": [0.6],
+        "down_price": [0.4], "crypto": ["BTC"], "timeframe": ["1-hour"],
+    })
+    _write_partitioned_atomic(
+        pa.Table.from_pandas(df2, preserve_index=False),
+        root, partition_cols=["crypto", "timeframe"],
+    )
+
+    remaining = set(os.listdir(part_dir))
+    # All shard files must survive
+    for name in shard_names:
+        assert name in remaining, f"Shard file {name} was deleted by _write_partitioned_atomic"
+    # part-0.parquet must exist with new content
+    assert "part-0.parquet" in remaining
+    result = pq.ParquetFile(os.path.join(part_dir, "part-0.parquet")).read().to_pandas()
+    assert int(result["timestamp"].iloc[0]) == 200
 
 
 # ---------------------------------------------------------------------------
@@ -577,3 +629,199 @@ def test_orderbook_shard_write_then_consolidate(tmp_path):
     result = pq.read_table(os.path.join(part_dir, "part-0.parquet")).to_pandas()
     assert len(result) == 5
     assert list(result["ts_ms"]) == [1000, 2000, 3000, 4000, 5000]
+
+
+# ---------------------------------------------------------------------------
+# append_ws_prices_staged / consolidate_prices
+# ---------------------------------------------------------------------------
+
+def test_append_ws_prices_staged_creates_shards(tmp_path):
+    prices_dir = str(tmp_path / "prices")
+    df = pd.DataFrame({
+        "market_id": ["m1", "m1"],
+        "crypto": ["BTC", "BTC"],
+        "timeframe": ["1-hour", "1-hour"],
+        "timestamp": [100, 200],
+        "up_price": [0.55, 0.60],
+        "down_price": [0.45, 0.40],
+        # Extra market-metadata cols that should be ignored by the shard writer
+        "volume": [1000.0, 1000.0],
+        "question": ["Will BTC go up?", "Will BTC go up?"],
+        "category": ["crypto", "crypto"],
+    })
+    append_ws_prices_staged(df, prices_dir=prices_dir)
+
+    part_dir = os.path.join(prices_dir, "crypto=BTC", "timeframe=1-hour")
+    shards = [f for f in os.listdir(part_dir) if f.startswith("ws_prices_")]
+    assert len(shards) == 1
+    # Use ParquetFile to read without Hive-partition column inference
+    result = pq.ParquetFile(os.path.join(part_dir, shards[0])).read().to_pandas()
+    assert len(result) == 2
+    assert set(result.columns) == {"market_id", "timestamp", "up_price", "down_price"}
+
+
+def test_consolidate_prices_merges_shards(tmp_path):
+    prices_dir = tmp_path / "prices"
+    part_dir = prices_dir / "crypto=BTC" / "timeframe=1-hour"
+    part_dir.mkdir(parents=True)
+
+    # Existing consolidated data
+    df_existing = pd.DataFrame({
+        "market_id": ["m1"],
+        "timestamp": [100],
+        "up_price": [0.50],
+        "down_price": [0.50],
+    })
+    pq.write_table(
+        pa.Table.from_pandas(df_existing, preserve_index=False),
+        part_dir / "part-0.parquet",
+    )
+
+    # Shard from WS
+    df_shard = pd.DataFrame({
+        "market_id": ["m1", "m1"],
+        "timestamp": [100, 200],  # ts=100 is a duplicate
+        "up_price": [0.55, 0.60],
+        "down_price": [0.45, 0.40],
+    })
+    pq.write_table(
+        pa.Table.from_pandas(df_shard, preserve_index=False),
+        part_dir / "ws_prices_12345_99999.parquet",
+    )
+
+    consolidate_prices(prices_dir=str(prices_dir))
+
+    assert sorted(os.listdir(part_dir)) == ["part-0.parquet"]
+    result = pq.read_table(part_dir / "part-0.parquet").to_pandas()
+    assert len(result) == 2  # deduped: ts=100 (keep last) + ts=200
+    assert set(result["timestamp"]) == {100, 200}
+    # ts=100 should have the shard's values (keep="last")
+    row_100 = result[result["timestamp"] == 100].iloc[0]
+    assert float(row_100["up_price"]) == pytest.approx(0.55, abs=0.01)
+
+
+def test_prices_shard_write_then_consolidate_end_to_end(tmp_path):
+    """End-to-end: staged writes then consolidation produces correct result."""
+    prices_dir = str(tmp_path / "prices")
+
+    def _make_batch(timestamps, up_prices):
+        n = len(timestamps)
+        return pd.DataFrame({
+            "market_id": ["m1"] * n,
+            "crypto": ["ETH"] * n,
+            "timeframe": ["15-minute"] * n,
+            "timestamp": timestamps,
+            "up_price": up_prices,
+            "down_price": [1.0 - p for p in up_prices],
+        })
+
+    append_ws_prices_staged(_make_batch([100, 200], [0.5, 0.6]), prices_dir=prices_dir)
+    append_ws_prices_staged(_make_batch([300], [0.7]), prices_dir=prices_dir)
+
+    part_dir = os.path.join(prices_dir, "crypto=ETH", "timeframe=15-minute")
+    assert len([f for f in os.listdir(part_dir) if f.endswith(".parquet")]) == 2
+
+    consolidate_prices(prices_dir=prices_dir)
+
+    assert os.listdir(part_dir) == ["part-0.parquet"]
+    result = pq.read_table(os.path.join(part_dir, "part-0.parquet")).to_pandas()
+    assert len(result) == 3
+    assert list(result.sort_values("timestamp")["timestamp"]) == [100, 200, 300]
+
+
+# ---------------------------------------------------------------------------
+# append_ws_culture_prices_staged / consolidate_culture_prices
+# ---------------------------------------------------------------------------
+
+def test_append_ws_culture_prices_staged_creates_shards(tmp_path):
+    prices_dir = str(tmp_path / "prices")
+    df = pd.DataFrame({
+        "market_id": ["m1", "m1"],
+        "crypto": ["ELON-TWEETS", "ELON-TWEETS"],
+        "timeframe": ["7-day", "7-day"],
+        "timestamp": [100, 200],
+        "token_id": ["t1", "t2"],
+        "outcome": ["Yes", "No"],
+        "price": [0.70, 0.30],
+        # Extra cols that should be ignored
+        "volume": [500.0, 500.0],
+        "category": ["culture", "culture"],
+    })
+    append_ws_culture_prices_staged(df, prices_dir=prices_dir)
+
+    part_dir = os.path.join(prices_dir, "crypto=ELON-TWEETS", "timeframe=7-day")
+    shards = [f for f in os.listdir(part_dir) if f.startswith("ws_culture_prices_")]
+    assert len(shards) == 1
+    # Use ParquetFile to read without Hive-partition column inference
+    result = pq.ParquetFile(os.path.join(part_dir, shards[0])).read().to_pandas()
+    assert len(result) == 2
+    assert set(result.columns) == {"market_id", "timestamp", "token_id", "outcome", "price"}
+
+
+def test_consolidate_culture_prices_deduplicates_on_three_columns(tmp_path):
+    prices_dir = tmp_path / "prices"
+    part_dir = prices_dir / "crypto=ELON-TWEETS" / "timeframe=7-day"
+    part_dir.mkdir(parents=True)
+
+    # Existing data
+    df_existing = pd.DataFrame({
+        "market_id": ["m1", "m1"],
+        "timestamp": [100, 100],
+        "token_id": ["t1", "t2"],
+        "outcome": ["Yes", "No"],
+        "price": [0.60, 0.40],
+    })
+    pq.write_table(
+        pa.Table.from_pandas(df_existing, preserve_index=False),
+        part_dir / "part-0.parquet",
+    )
+
+    # Shard with updated price for (m1, 100, "Yes") and a new row
+    df_shard = pd.DataFrame({
+        "market_id": ["m1", "m1"],
+        "timestamp": [100, 200],
+        "token_id": ["t1", "t3"],
+        "outcome": ["Yes", "Maybe"],
+        "price": [0.70, 0.15],
+    })
+    pq.write_table(
+        pa.Table.from_pandas(df_shard, preserve_index=False),
+        part_dir / "ws_culture_prices_12345_99999.parquet",
+    )
+
+    consolidate_culture_prices(prices_dir=str(prices_dir))
+
+    assert sorted(os.listdir(part_dir)) == ["part-0.parquet"]
+    result = pq.read_table(part_dir / "part-0.parquet").to_pandas()
+    # 3 unique (market_id, timestamp, outcome) combos:
+    # (m1, 100, Yes) — updated to 0.70
+    # (m1, 100, No) — kept at 0.40
+    # (m1, 200, Maybe) — new
+    assert len(result) == 3
+    yes_row = result[result["outcome"] == "Yes"].iloc[0]
+    assert float(yes_row["price"]) == pytest.approx(0.70, abs=0.01)
+
+
+def test_consolidate_prices_skips_partition_without_shards(tmp_path):
+    """Consolidation is a no-op when only part-0.parquet exists (no shards)."""
+    prices_dir = tmp_path / "prices"
+    part_dir = prices_dir / "crypto=BTC" / "timeframe=1-hour"
+    part_dir.mkdir(parents=True)
+
+    df = pd.DataFrame({
+        "market_id": ["m1"],
+        "timestamp": [100],
+        "up_price": [0.50],
+        "down_price": [0.50],
+    })
+    pq.write_table(
+        pa.Table.from_pandas(df, preserve_index=False),
+        part_dir / "part-0.parquet",
+    )
+
+    consolidate_prices(prices_dir=str(prices_dir))
+
+    # Still just part-0.parquet, unchanged
+    assert os.listdir(part_dir) == ["part-0.parquet"]
+    result = pq.read_table(part_dir / "part-0.parquet").to_pandas()
+    assert len(result) == 1

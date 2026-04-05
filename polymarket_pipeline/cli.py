@@ -171,13 +171,17 @@ def main() -> None:
 
             import os
             from .config import HF_CULTURE_REPO_ID
+            from .storage import consolidate_culture_prices
             culture_root = paths.data_dir.parent / "data-culture"
             if culture_root.exists():
                 logger.info("Uploading culture dataset to Hugging Face...")
+                culture_prices_dir = str(culture_root / "prices")
+                if os.path.exists(culture_prices_dir):
+                    consolidate_culture_prices(prices_dir=culture_prices_dir, logger=logger)
                 upload_to_huggingface(
                     repo_id=os.environ.get("HF_CULTURE_REPO_ID", HF_CULTURE_REPO_ID),
                     markets_path=str(culture_root / "markets.parquet"),
-                    prices_dir=str(culture_root / "prices"),
+                    prices_dir=culture_prices_dir,
                     ticks_dir=str(culture_root / "ticks"),
                     logger=logger,
                     skip_consolidate=False,

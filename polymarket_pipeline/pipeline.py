@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from py_clob_client.client import ClobClient
 
 from .api import PolymarketApi
-from .config import CHAIN_ID, CLOB_HOST, PRICE_SUM_TOLERANCE, TIME_FRAMES
+from .config import CHAIN_ID, CLOB_HOST, PRICE_SUM_TOLERANCE, TIME_FRAMES, WS_MARKET_REFRESH_INTERVAL_S
 from .models import MarketRecord
 from .phases import PipelinePaths, PriceHistoryPhase, PythPricePhase, RTDSStreamPhase, TickBackfillPhase, WebSocketPhase
 from .phases.binance_history import BinanceHistoryPhase
@@ -21,7 +21,7 @@ from .providers import (
     TickBatchProvider,
 )
 from .settings import PipelineRunOptions, RuntimeSettings
-from .storage import consolidate_ticks, load_markets, load_prices_for_timeframe, upload_to_huggingface
+from .storage import consolidate_culture_prices, consolidate_ticks, load_markets, load_prices_for_timeframe, upload_to_huggingface
 from .ticks import PolygonTickFetcher
 
 
@@ -128,7 +128,11 @@ class PolymarketDataPipeline:
     def run_historical_tick_backfill(self, markets: list[MarketRecord]) -> int:
         return self.tick_backfill_phase.run(markets)
 
-    async def run_websocket(self, active_markets: list[MarketRecord]) -> None:
+    async def run_websocket(
+        self,
+        active_markets: list[MarketRecord],
+        run_options: PipelineRunOptions | None = None,
+    ) -> None:
         # Start RTDS first and let it warm up so the spot price cache is
         # populated before the first WS trade events arrive.
         rtds_task = asyncio.create_task(self.rtds_stream_phase.run())
@@ -137,11 +141,62 @@ class PolymarketDataPipeline:
             "RTDS warm-up complete (%d symbols cached)",
             len(self._spot_price_cache),
         )
+        loop = asyncio.get_running_loop()
         try:
-            await self.websocket_phase.run(active_markets)
+            while True:
+                if not active_markets:
+                    self.logger.warning(
+                        "No active markets for WebSocket — retrying in 60s"
+                    )
+                    await asyncio.sleep(60)
+                    active_markets = await self._refresh_markets(loop, run_options)
+                    continue
+
+                ws_task = asyncio.create_task(
+                    self.websocket_phase.run(active_markets)
+                )
+                # Run WS until the refresh interval elapses (or the task
+                # exits early, which shouldn't happen in normal operation).
+                done, _ = await asyncio.wait(
+                    {ws_task}, timeout=WS_MARKET_REFRESH_INTERVAL_S,
+                )
+                if ws_task in done:
+                    # WS phase exited on its own — propagate any exception
+                    ws_task.result()
+                    break
+
+                # Timeout — cancel the current WS phase (triggers its
+                # final-flush logic) and re-subscribe with fresh markets.
+                ws_task.cancel()
+                await asyncio.gather(ws_task, return_exceptions=True)
+
+                self.logger.info("Refreshing active market subscriptions...")
+                active_markets = await self._refresh_markets(loop, run_options)
+                self.logger.info(
+                    "Market refresh complete: %d active markets",
+                    len(active_markets),
+                )
         finally:
             rtds_task.cancel()
             await asyncio.gather(rtds_task, return_exceptions=True)
+
+    async def _refresh_markets(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        run_options: PipelineRunOptions | None,
+    ) -> list[MarketRecord]:
+        """Re-fetch active markets from the Gamma API (runs in executor)."""
+        if run_options is None:
+            run_options = PipelineRunOptions(websocket_only=True)
+        try:
+            return await loop.run_in_executor(
+                None, self._collect_active_markets, run_options, None,
+            )
+        except Exception as exc:
+            self.logger.error(
+                "Market refresh failed: %s — will retry next cycle", exc,
+            )
+            return []
 
     def _scan_checkpoint_path(self) -> str:
         return str(self.paths.scan_checkpoint_path())
@@ -577,10 +632,13 @@ class PolymarketDataPipeline:
                 culture_root = self.paths.data_dir.parent / "data-culture"
                 if culture_root.exists():
                     self.logger.info("Uploading culture dataset to Hugging Face...")
+                    culture_prices_dir = str(culture_root / "prices")
+                    if os.path.exists(culture_prices_dir):
+                        consolidate_culture_prices(prices_dir=culture_prices_dir, logger=self.logger)
                     upload_to_huggingface(
                         repo_id=os.environ.get("HF_CULTURE_REPO_ID", HF_CULTURE_REPO_ID),
                         markets_path=str(culture_root / "markets.parquet"),
-                        prices_dir=str(culture_root / "prices"),
+                        prices_dir=culture_prices_dir,
                         ticks_dir=str(culture_root / "ticks"),
                         logger=self.logger,
                         skip_consolidate=False,
@@ -600,7 +658,7 @@ class PolymarketDataPipeline:
                 len(active_markets_for_ws),
             )
             try:
-                asyncio.run(self.run_websocket(active_markets_for_ws))
+                asyncio.run(self.run_websocket(active_markets_for_ws, options))
             except KeyboardInterrupt:
                 self.logger.info("Stopped by user")
             self.print_summary()

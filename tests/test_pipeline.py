@@ -142,7 +142,7 @@ def test_pipeline_test_mode_uses_test_output_and_skips_websocket(tmp_path, monke
     report_calls: list[str] = []
     websocket_calls: list[list[str]] = []
 
-    async def _record_websocket(markets: list[MarketRecord]) -> None:
+    async def _record_websocket(markets: list[MarketRecord], run_options=None) -> None:
         websocket_calls.append([market.market_id for market in markets])
 
     pipeline._print_test_report = lambda: report_calls.append("printed")
@@ -170,7 +170,7 @@ def test_pipeline_websocket_only_fetches_active_markets_and_runs_stream(tmp_path
     websocket_calls: list[list[str]] = []
     summary_calls: list[str] = []
 
-    async def _record_websocket(markets: list[MarketRecord]) -> None:
+    async def _record_websocket(markets: list[MarketRecord], run_options=None) -> None:
         websocket_calls.append([market.market_id for market in markets])
 
     pipeline.load_existing_data = lambda: load_calls.append("loaded")
@@ -198,7 +198,7 @@ def test_pipeline_historical_only_runs_tick_backfill_without_websocket(tmp_path,
     summary_calls: list[str] = []
     consolidate_calls: list[str] = []
 
-    async def _record_websocket(markets: list[MarketRecord]) -> None:
+    async def _record_websocket(markets: list[MarketRecord], run_options=None) -> None:
         websocket_calls.append([market.market_id for market in markets])
 
     monkeypatch.setattr(

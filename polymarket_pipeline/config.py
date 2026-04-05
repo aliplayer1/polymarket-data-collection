@@ -45,6 +45,12 @@ WS_BUFFER_MAX_ROWS = 600_000
 # keeps per-flush batch size to ~120 K rows and limits shard-file count to
 # ~2/min per partition (≈360 between 3-hour consolidation runs).
 WS_OB_FLUSH_INTERVAL_S: float = 30.0
+# How often (seconds) to re-fetch active markets from the Gamma API and
+# update WebSocket subscriptions.  This replaces the need for the daily
+# polymarket-restart.timer — the WS phase handles market rotation
+# autonomously.  1 hour catches new markets within their first prediction
+# window for all timeframes except 5-minute.
+WS_MARKET_REFRESH_INTERVAL_S: float = 3600.0
 
 TIME_FRAMES = tuple(
     tf for d in _MARKET_DEFINITIONS for tf in d.timeframe_names

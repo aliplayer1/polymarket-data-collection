@@ -34,8 +34,9 @@ accumulates at most a few hours of WS fills (typically < 1 MB per partition).
 The next `persist_ticks()` call (i.e. the --historical-only pass, every 6 h) reads
 every *.parquet file in the partition via ``pq.ParquetDataset`` — including the
 staging file — merges them all, deduplicates, and writes a single consolidated file
-via ``_write_partitioned_atomic()``, which deletes all previous shards (including
-``ws_staging.parquet``) as part of its atomic rename step.
+via ``_write_partitioned_atomic()``, which atomically replaces the stable
+``part-{i}.parquet`` files and cleans up any stale shards (including
+``ws_staging.parquet``) afterward.
 """
 
 from __future__ import annotations
@@ -1173,6 +1174,223 @@ def append_ws_orderbook_staged(
     log.info("Orderbook BBO staged: %d new rows to %s/", rows_staged, orderbook_dir)
 
 
+def append_ws_prices_staged(
+    prices_df: pd.DataFrame,
+    *,
+    prices_dir: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Write WebSocket crypto price rows as independent shard files per partition.
+
+    Each flush writes a uniquely-named ``ws_prices_{pid}_{ts}.parquet`` file.
+    No read of existing data and no write-lock are needed.
+    ``consolidate_prices()`` merges all shard files on its next run.
+    """
+    if prices_df.empty:
+        return
+
+    log = logger or logging.getLogger("polymarket_pipeline")
+
+    for col in ("crypto", "timeframe"):
+        if col in prices_df.columns and hasattr(prices_df[col], "cat"):
+            prices_df = prices_df.copy()
+            prices_df[col] = prices_df[col].astype(str)
+
+    rows_staged = 0
+    shard_suffix = f"ws_prices_{os.getpid()}_{int(time.monotonic() * 1000)}.parquet"
+
+    for (crypto, timeframe), group in prices_df.groupby(
+        ["crypto", "timeframe"], sort=False
+    ):
+        shard_dir = os.path.join(prices_dir, f"crypto={crypto}", f"timeframe={timeframe}")
+        os.makedirs(shard_dir, exist_ok=True)
+        shard_path = os.path.join(shard_dir, shard_suffix)
+
+        # Keep only price columns — partition columns are in the directory path,
+        # and market metadata columns (question, volume, etc.) belong in markets.parquet.
+        price_cols = ["market_id", "timestamp", "up_price", "down_price"]
+        new_rows = group[price_cols].reset_index(drop=True)
+        new_rows["timestamp"] = new_rows["timestamp"].astype("int64")
+        new_rows["up_price"] = new_rows["up_price"].astype("float32")
+        new_rows["down_price"] = new_rows["down_price"].astype("float32")
+
+        table = pa.Table.from_pandas(new_rows, schema=PRICES_SCHEMA, preserve_index=False)
+        _write_parquet_atomic(table, shard_path)
+        rows_staged += len(new_rows)
+
+    log.info("WS prices staged: %d new rows to %s/", rows_staged, prices_dir)
+
+
+def append_ws_culture_prices_staged(
+    prices_df: pd.DataFrame,
+    *,
+    prices_dir: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Write WebSocket culture price rows as independent shard files per partition.
+
+    Each flush writes a uniquely-named ``ws_culture_prices_{pid}_{ts}.parquet``
+    file.  No read of existing data and no write-lock are needed.
+    ``consolidate_culture_prices()`` merges all shard files on its next run.
+    """
+    if prices_df.empty:
+        return
+
+    log = logger or logging.getLogger("polymarket_pipeline")
+
+    for col in ("crypto", "timeframe", "outcome"):
+        if col in prices_df.columns and hasattr(prices_df[col], "cat"):
+            prices_df = prices_df.copy()
+            prices_df[col] = prices_df[col].astype(str)
+
+    rows_staged = 0
+    shard_suffix = f"ws_culture_prices_{os.getpid()}_{int(time.monotonic() * 1000)}.parquet"
+
+    for (crypto, timeframe), group in prices_df.groupby(
+        ["crypto", "timeframe"], sort=False
+    ):
+        shard_dir = os.path.join(prices_dir, f"crypto={crypto}", f"timeframe={timeframe}")
+        os.makedirs(shard_dir, exist_ok=True)
+        shard_path = os.path.join(shard_dir, shard_suffix)
+
+        price_cols = ["market_id", "timestamp", "token_id", "outcome", "price"]
+        new_rows = group[price_cols].reset_index(drop=True)
+        new_rows["timestamp"] = new_rows["timestamp"].astype("int64")
+        new_rows["price"] = new_rows["price"].astype("float32")
+        new_rows["outcome"] = new_rows["outcome"].astype(str)
+
+        table = pa.Table.from_pandas(new_rows, schema=CULTURE_PRICES_SCHEMA, preserve_index=False)
+        _write_parquet_atomic(table, shard_path)
+        rows_staged += len(new_rows)
+
+    log.info("WS culture prices staged: %d new rows to %s/", rows_staged, prices_dir)
+
+
+def consolidate_prices(
+    *,
+    prices_dir: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Consolidate WS price shard files into canonical part-0.parquet per partition.
+
+    Walks the Hive-partitioned prices directory.  For each leaf partition that
+    contains shard files (``ws_prices_*.parquet``), reads all ``.parquet`` files,
+    deduplicates on ``(market_id, timestamp)``, and writes a single
+    ``part-0.parquet``.  Shard files are removed after successful merge.
+    """
+    _consolidate_partitioned_prices(
+        root_dir=prices_dir,
+        dedup_cols=["market_id", "timestamp"],
+        sort_cols=["market_id", "timestamp"],
+        shard_prefix="ws_prices_",
+        label="prices",
+        logger=logger,
+    )
+
+
+def consolidate_culture_prices(
+    *,
+    prices_dir: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Consolidate WS culture-price shard files per partition.
+
+    Same as ``consolidate_prices`` but deduplicates on
+    ``(market_id, timestamp, outcome)`` to handle multi-outcome markets.
+    """
+    _consolidate_partitioned_prices(
+        root_dir=prices_dir,
+        dedup_cols=["market_id", "timestamp", "outcome"],
+        sort_cols=["market_id", "timestamp", "outcome"],
+        shard_prefix="ws_culture_prices_",
+        label="culture prices",
+        logger=logger,
+    )
+
+
+def _consolidate_partitioned_prices(
+    *,
+    root_dir: str,
+    dedup_cols: list[str],
+    sort_cols: list[str],
+    shard_prefix: str,
+    label: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Shared implementation for partition-level price shard consolidation."""
+    log = logger or logging.getLogger("polymarket_pipeline")
+    if not os.path.exists(root_dir):
+        return
+
+    data_root = os.path.dirname(os.path.abspath(root_dir))
+
+    for dirpath, _dirs, _fnames in os.walk(root_dir):
+        # Only process leaf partition directories that contain shard files
+        parquet_files = [f for f in os.listdir(dirpath) if f.endswith(".parquet")]
+        has_shards = any(f.startswith(shard_prefix) for f in parquet_files)
+        if not has_shards:
+            continue
+
+        with _write_lock(data_root):
+            # Re-check inside lock (files may have been consolidated by another process)
+            parquet_files = [f for f in os.listdir(dirpath) if f.endswith(".parquet")]
+            has_shards = any(f.startswith(shard_prefix) for f in parquet_files)
+            if not has_shards:
+                continue
+
+            rel = os.path.relpath(dirpath, root_dir)
+            log.info("Consolidating %s partition %s (%d files)...", label, rel, len(parquet_files))
+
+            frames = []
+            for fname in parquet_files:
+                fpath = os.path.join(dirpath, fname)
+                try:
+                    df = pq.ParquetFile(fpath).read().to_pandas()
+                    frames.append(df)
+                except Exception:
+                    continue
+
+            if not frames:
+                continue
+
+            merged = pd.concat(frames, ignore_index=True)
+            # Flatten category columns before dedup/sort
+            for col in dedup_cols:
+                if col in merged.columns and hasattr(merged[col], "cat"):
+                    merged[col] = merged[col].astype(str)
+            merged = (
+                merged.drop_duplicates(subset=dedup_cols, keep="last")
+                .sort_values(sort_cols)
+                .reset_index(drop=True)
+            )
+
+            consolidated_path = os.path.join(dirpath, "part-0.parquet")
+            tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
+            try:
+                _check_disk_space(dirpath)
+                table = pa.Table.from_pandas(merged, preserve_index=False)
+                table = _stamp_schema_version(table)
+                pq.write_table(table, tmp_path, compression="zstd")
+                # Place consolidated file first, then remove old shards.
+                # If the process crashes between these steps, orphan shards
+                # remain but no data is lost — the next consolidation run
+                # will merge them again (dedup handles it).
+                os.replace(tmp_path, consolidated_path)
+                for fname in parquet_files:
+                    if fname == "part-0.parquet":
+                        continue  # already replaced above
+                    try:
+                        os.remove(os.path.join(dirpath, fname))
+                    except OSError:
+                        pass
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
+
+            log.info("  -> %s consolidated: %d rows", rel, len(merged))
+
+
 def consolidate_spot_prices(
     *,
     spot_prices_dir: str,
@@ -1352,6 +1570,13 @@ def _write_partitioned_atomic(table: pa.Table, root_dir: str, partition_cols: li
     The outer ``_write_lock`` still serialises the full read→merge→write
     cycle; the per-PID tmp is defence-in-depth against any unforeseen
     path where the lock is not held.
+
+    Uses stable ``part-{i}.parquet`` filenames (instead of PyArrow's default
+    UUID-based names) combined with ``os.replace`` (atomic on POSIX) so that
+    files are never absent — only atomically swapped.  This prevents TOCTOU
+    races where a concurrent reader (e.g. HF ``upload_folder``) lists a file
+    and then fails to open it because a writer deleted it between listing and
+    reading.
     """
     _check_disk_space(os.path.dirname(os.path.abspath(root_dir)) or ".")
     table = _stamp_schema_version(table)
@@ -1364,27 +1589,40 @@ def _write_partitioned_atomic(table: pa.Table, root_dir: str, partition_cols: li
             root_path=tmp_dir,
             partition_cols=partition_cols,
             compression="zstd",
+            basename_template="part-{i}.parquet",
         )
         # Merge: move new partition files into the real directory.
-        # Remove any pre-existing Parquet files in each destination partition
-        # first so that UUID-named files from previous writes don't accumulate
-        # alongside the new ones (each partition is rewritten wholesale).
+        # Replace-then-clean: os.replace atomically swaps the file so that
+        # concurrent readers always see a valid file (old or new content).
+        # Stale files from previous writes (e.g. UUID-named files or extra
+        # part-N files when the row-group count shrinks) are removed AFTER
+        # the new files are in place — never before.
         os.makedirs(root_dir, exist_ok=True)
         for dirpath, _, filenames in os.walk(tmp_dir):
             rel = os.path.relpath(dirpath, tmp_dir)
             target_dir = os.path.join(root_dir, rel)
             os.makedirs(target_dir, exist_ok=True)
-            # Purge stale Parquet files before placing the new file
-            for old_f in os.listdir(target_dir):
-                if old_f.endswith(".parquet"):
-                    try:
-                        os.remove(os.path.join(target_dir, old_f))
-                    except OSError:
-                        pass
+            new_files = set(filenames)
             for fname in filenames:
                 src = os.path.join(dirpath, fname)
                 dst = os.path.join(target_dir, fname)
                 os.replace(src, dst)
+            # Remove stale Parquet files that aren't part of the new write.
+            # Skip lock-free shard files written by concurrent processes
+            # (WS service, tick backfill) — those are merged by their own
+            # consolidation functions and must not be deleted here.
+            for old_f in os.listdir(target_dir):
+                if old_f.endswith(".parquet") and old_f not in new_files:
+                    if old_f.startswith((
+                        "ws_ticks_", "ws_prices_", "ws_culture_prices_",
+                        "ws_spot_", "ws_ob_", "ws_staging",
+                        "backfill_", "binance_history_",
+                    )):
+                        continue
+                    try:
+                        os.remove(os.path.join(target_dir, old_f))
+                    except OSError:
+                        pass
     finally:
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir)
@@ -1657,6 +1895,8 @@ def upload_to_huggingface(
     # shard files with unique names.
     data_root = os.path.dirname(os.path.abspath(m_path))
     with _write_lock(data_root):
+        if os.path.exists(p_dir):
+            consolidate_prices(prices_dir=p_dir, logger=log)
         if not skip_consolidate and os.path.exists(t_dir):
             consolidate_ticks(ticks_dir=t_dir, logger=log)
         if spot_prices_dir and os.path.exists(spot_prices_dir):
@@ -1674,6 +1914,8 @@ def upload_to_huggingface(
         # WS staging shards (lock-free, never uploaded)
         "**/ws_staging.parquet",
         "**/ws_ticks_*.parquet",
+        "**/ws_prices_*.parquet",
+        "**/ws_culture_prices_*.parquet",
         "**/ws_spot_*.parquet",
         "**/ws_ob_*.parquet",
         # Backfill / history shards (consolidated into part-0.parquet)
@@ -1690,14 +1932,32 @@ def upload_to_huggingface(
     _delete = ["*.parquet"]
 
     if os.path.isdir(data_root):
-        api.upload_folder(
-            folder_path=data_root,
-            path_in_repo="data",
-            repo_id=repo,
-            repo_type="dataset",
-            ignore_patterns=_ignore,
-            delete_patterns=_delete,
-        )
+        # Retry on transient file-not-found errors caused by concurrent
+        # writers atomically replacing Parquet files between the SDK's
+        # directory scan and file read.  The stable-filename fix in
+        # _write_partitioned_atomic prevents most occurrences, but a
+        # retry is belt-and-suspenders for edge cases.
+        _max_upload_attempts = 3
+        for _attempt in range(1, _max_upload_attempts + 1):
+            try:
+                api.upload_folder(
+                    folder_path=data_root,
+                    path_in_repo="data",
+                    repo_id=repo,
+                    repo_type="dataset",
+                    ignore_patterns=_ignore,
+                    delete_patterns=_delete,
+                )
+                break
+            except ValueError as exc:
+                if "is not a file" in str(exc) and _attempt < _max_upload_attempts:
+                    log.warning(
+                        "Upload attempt %d/%d: transient file race (%s) — retrying in 5s...",
+                        _attempt, _max_upload_attempts, exc,
+                    )
+                    time.sleep(5)
+                else:
+                    raise
 
     log.info("Upload complete.")
 
