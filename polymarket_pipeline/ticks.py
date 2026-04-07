@@ -438,6 +438,14 @@ class PolygonTickFetcher:
             sources.append(("Etherscan", self._fetch_logs_etherscan_v2_streamed))
         if self.rpc_url:
             sources.append(("RPC", self._fetch_logs_rpc_streamed))
+
+        source_names = [s[0] for s in sources]
+        self.logger.info(
+            "Log source order: %s (etherscan_calls=%d, exhausted=%s)",
+            " → ".join(source_names) if source_names else "NONE",
+            self._etherscan_call_count,
+            self._etherscan_exhausted,
+        )
         # If prefer_rpc is False but Etherscan is exhausted, Etherscan
         # can still serve as a last-resort if RPC also fails and a new
         # day has started.  Not added here to keep things simple — the
@@ -582,10 +590,13 @@ class PolygonTickFetcher:
                     message_str = str(data.get("message", "")).lower()
                     combined = result_str + " " + message_str
 
-                    # Daily limit: "max rate limit reached" or contains "daily"
-                    # Distinct from per-second: per-second says "rate limit"
-                    # but resolves after a short wait.
-                    if "daily" in combined or "max rate limit" in combined or "max calls" in combined:
+                    # Daily limit: only when the message explicitly mentions
+                    # "daily" or "per day".  The generic "Max rate limit
+                    # reached" message is a PER-SECOND throttle — not the
+                    # 100K daily quota — and must fall through to the
+                    # transient retry branch below.
+                    is_daily = "daily" in combined or "per day" in combined
+                    if is_daily:
                         self._etherscan_exhausted = True
                         self._etherscan_exhausted_at = time.monotonic()
                         self.logger.warning(
@@ -596,7 +607,7 @@ class PolygonTickFetcher:
                         return None
 
                     # Per-second rate limit — transient, retry with backoff
-                    if "rate limit" in combined:
+                    if "rate limit" in combined or "max rate" in combined or "max calls" in combined:
                         if attempt < self._MAX_RETRIES:
                             wait = min(2**attempt + 5, 30)
                             self.logger.warning("Etherscan V2 rate limit (3/sec), retrying in %ds...", wait)
