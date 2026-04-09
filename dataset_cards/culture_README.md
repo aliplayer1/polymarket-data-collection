@@ -63,20 +63,42 @@ duckdb.sql("""
 
 ### `markets` — Market metadata
 
-One row per market with question text, resolution, timeframe, and a JSON `tokens` map of token IDs to outcome labels.
+One row per market with question text, resolution, timeframe, a JSON
+`tokens` map, and identity fields (`slug`, `event_slug`, `bucket_index`,
+`bucket_label`) that let you group markets into their parent event and
+reason about bucket ordering without parsing the question text.
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `market_id` | string | Polymarket market identifier |
 | `question` | string | Market question text |
 | `crypto` | string | Event category (e.g. "ELON-TWEETS") |
-| `timeframe` | string | Market timeframe (4-day, 7-day, 1-month) |
+| `timeframe` | string | Market timeframe — see **Timeframe semantics** below |
 | `volume` | float32 | Market volume in USDC |
-| `resolution` | int8 | Market resolution |
+| `resolution` | int8 | `1` = this bucket won, `0` = it lost, `-1` = unresolved / still open |
 | `start_ts` | int64 | Market start timestamp (epoch seconds) |
 | `end_ts` | int64 | Market end timestamp (epoch seconds) |
+| `closed_ts` | int64 | `closedTime` from Gamma — when the market closed on-chain (`0` if still open) |
 | `condition_id` | string | On-chain condition identifier |
-| `tokens` | string | JSON map of token ID to outcome label |
+| `tokens` | string | JSON map of outcome label → token ID |
+| `slug` | string | Full market slug (includes the bucket suffix, e.g. `elon-musk-of-tweets-april-3-april-10-280-299`) |
+| `event_slug` | string | Parent event slug (bucket suffix stripped, e.g. `elon-musk-of-tweets-april-3-april-10`) — groups all buckets of a single event |
+| `bucket_index` | int32 | Polymarket's `groupItemThreshold` — canonical ordering within an event (`-1` if unknown) |
+| `bucket_label` | string | Polymarket's `groupItemTitle` — e.g. `"280-299"` or `"240+"` |
+
+### Timeframe semantics
+
+Values in the `timeframe` column refer to each market's **total trading
+lifetime on Polymarket**, not the resolution window of the underlying
+question. A market labelled `4-day` is a 48-hour Elon tweet-count
+market (the resolution window is 2 days) that was tradeable for
+approximately 4 days before closing. The mapping is:
+
+| `timeframe` | Resolution window | Polymarket tier |
+|---|---|---|
+| `4-day` | 48 hours (2-day question) | `48h` |
+| `7-day` | 7 days | `weekly` |
+| `1-month` | 1 calendar month | `monthly` |
 
 ### `prices` — Long-format price history
 
@@ -111,6 +133,27 @@ Individual trades from on-chain events and WebSocket captures. Same schema as th
 | `source` | string | "onchain" or "websocket" |
 | `spot_price_usdt` | float32 | Not applicable for culture markets |
 | `spot_price_ts_ms` | int64 | Not applicable for culture markets |
+
+## Known issues & historical caveats
+
+- **Tick coverage is limited.** The `ticks` subset currently contains
+  only websocket-captured trades from late March 2026 onward, covering
+  a subset of markets. On-chain backfill is planned but not yet in place,
+  so the `prices` subset (last-trade snapshots at ~60 s cadence) is the
+  primary time series for historical analysis.
+- **Sparse bucket coverage on pre-April events.** Events that closed
+  before the pipeline's full rollout may have missing low-tweet-count
+  buckets in `markets.parquet` (the lowest-price buckets were pruned
+  from Polymarket's API response). Newer events have complete coverage.
+  Use `bucket_index` (rather than positional ordering within the event)
+  to identify buckets — it matches Polymarket's canonical grouping even
+  when some sibling buckets are absent from the dataset.
+- **`resolution` backfill.** Prior to April 2026 the pipeline wrote
+  `resolution = -1` for every culture market because it checked for a
+  `resolved` boolean that Polymarket's Gamma API doesn't actually emit.
+  The fix (price-based detection + metadata-refresh on re-scan) populates
+  this field for newly-closed events going forward, and backfills older
+  events on each full scan.
 
 ## Pipeline
 

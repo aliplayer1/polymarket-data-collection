@@ -89,9 +89,11 @@ One row per market. Contains market question, resolution, timeframe, token IDs, 
 | `resolution` | int8 | Market resolution (1=Up, 0=Down, -1=unknown) |
 | `start_ts` | int64 | Market start timestamp (epoch seconds) |
 | `end_ts` | int64 | Market end timestamp (epoch seconds) |
+| `closed_ts` | int64 | `closedTime` from Gamma — when the market closed on-chain (`0` if still open) |
 | `condition_id` | string | On-chain condition identifier |
 | `up_token_id` | string | CLOB token ID for "Up" outcome |
 | `down_token_id` | string | CLOB token ID for "Down" outcome |
+| `slug` | string | Polymarket market slug |
 | `fee_rate_bps` | int16 | Taker fee rate in basis points (-1 = unknown) |
 
 ### `prices` — OHLC price history
