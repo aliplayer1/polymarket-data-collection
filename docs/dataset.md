@@ -59,7 +59,7 @@ Deduplication is applied on `(market_id, timestamp_ms, token_id, tx_hash)` so re
 
 The primary storage format is **Parquet with Zstandard compression**, split into two normalised tables:
 
-**`data/markets.parquet`** — one row per market (metadata):
+**`data/markets.parquet`** — one row per binary market (metadata):
 
 | Column | Type | Description |
 | -------- | ------ | ------------- |
@@ -69,6 +69,34 @@ The primary storage format is **Parquet with Zstandard compression**, split into
 | `timeframe` | dict(int8→string) | Market prediction window — dictionary-encoded |
 | `volume` | float32 | Total market volume at collection time |
 | `resolution` | int8 | `1` = Up won, `0` = Down won, `-1` = unresolved |
+| `start_ts` | int64 | Market start timestamp (epoch seconds) |
+| `end_ts` | int64 | Market end timestamp (epoch seconds) |
+| `closed_ts` | int64 | `closedTime` from Gamma (`0` if still open) |
+| `condition_id` | string | On-chain condition identifier |
+| `up_token_id` | string | CLOB token ID for "Up" outcome |
+| `down_token_id` | string | CLOB token ID for "Down" outcome |
+| `slug` | string | Polymarket market slug |
+| `fee_rate_bps` | int16 | Taker fee rate (basis points); `-1` = unknown |
+
+**`data-culture/markets.parquet`** — one row per multi-outcome bucket:
+
+| Column | Type | Description |
+| -------- | ------ | ------------- |
+| `market_id` | string | Unique market identifier |
+| `question` | string | Full question text |
+| `crypto` | dict(int8→string) | Category (e.g. `ELON-TWEETS`) |
+| `timeframe` | dict(int8→string) | `4-day` (48h resolution window), `7-day` (weekly), `1-month` (monthly) |
+| `volume` | float32 | Total market volume |
+| `resolution` | int8 | **Per-bucket**: `1` = this bucket was the winning outcome, `0` = it lost, `-1` = unresolved |
+| `start_ts` | int64 | Market start timestamp (epoch seconds) |
+| `end_ts` | int64 | Market end timestamp (epoch seconds) |
+| `closed_ts` | int64 | `closedTime` from Gamma (`0` if still open) |
+| `condition_id` | string | On-chain condition identifier |
+| `tokens` | string | JSON map `{outcome_label: token_id}` |
+| `slug` | string | Full market slug (includes bucket suffix, e.g. `elon-musk-of-tweets-april-3-april-10-280-299`) |
+| `event_slug` | string | Parent event slug (bucket suffix stripped) — groups all buckets of one event |
+| `bucket_index` | int32 | Polymarket's canonical `groupItemThreshold` (`-1` if unknown) |
+| `bucket_label` | string | Polymarket's `groupItemTitle` — e.g. `"280-299"`, `"240+"` |
 
 **`data/prices/`** — one row per tick (Hive-partitioned: `crypto=X/timeframe=Y/*.parquet`):
 
@@ -80,6 +108,10 @@ The primary storage format is **Parquet with Zstandard compression**, split into
 | `down_price` | float32 | Implied probability the price will go **down** (0–1) |
 
 This normalised design eliminates metadata repetition: the `question` string (often 80+ bytes) is stored exactly once per market instead of once per tick. Dictionary-encoded categoricals (`crypto`, `timeframe`) reduce repeated strings to 1-byte indices. Float32 prices halve storage with negligible precision loss for ML.
+
+### Resolution semantics
+
+For both binary and culture markets, `resolution` is populated by a **price-based detector** (`market_normalization._binary_resolution_from_prices()`): a market is treated as resolved when `closed=True` AND one outcome in `outcomePrices` is `>= 0.99`. The Gamma API does **not** expose a `resolved` boolean on its market objects — prior versions of the pipeline checked for one and ended up writing `resolution=-1` for every culture market. The price-based path is the primary signal; the legacy per-token `winner` flag is kept as a fallback for older Gamma response shapes. Newly-closed events get their `resolution` backfilled on the next historical scan via the metadata-refresh path, even when their price history is already fully cached (see `PriceHistoryPhase._persist_metadata_only()`).
 
 ### Hive Partitioning
 

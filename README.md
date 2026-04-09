@@ -81,14 +81,14 @@ cp .env.example .env   # then fill in your keys
 The runtime is strictly partitioned to maintain isolation between heavily standardized Crypto data and dynamic Culture data:
 
 1. **Dual-Root Storage Architecture**
-   - **`data/`**: The strictly tabular, Hive-partitioned home of `crypto` Up/Down binary datasets. Features rigid `up_price` and `down_price` tables.
-   - **`data-culture/`**: The home of multi-outcome events like Elon Musk tweets. Features completely dynamic JSON `tokens` dictionary columns in `markets.parquet` and long-format `(market_id, timestamp, token_id, outcome, price)` schemas in `prices/` capable of supporting 10+ distinct outcomes concurrently without schema mutations.
+   - **`data/`**: The strictly tabular, Hive-partitioned home of `crypto` Up/Down binary datasets. Features rigid `up_price` and `down_price` tables. The `markets.parquet` row for each binary market carries `slug`, `closed_ts`, `resolution` (`1`=Up, `0`=Down, `-1`=unresolved), `fee_rate_bps`, and the full set of identity/timestamp fields.
+   - **`data-culture/`**: The home of multi-outcome events like Elon Musk tweets. Features completely dynamic JSON `tokens` dictionary columns in `markets.parquet` and long-format `(market_id, timestamp, token_id, outcome, price)` schemas in `prices/` capable of supporting 10+ distinct outcomes concurrently without schema mutations. The culture `markets.parquet` also includes `slug`, `event_slug` (parent event), `bucket_index` (Polymarket's canonical `groupItemThreshold`), `bucket_label` (`groupItemTitle`), `closed_ts`, and `resolution` — the latter is **per-bucket**: `1` means that bucket was the winning outcome of the parent event, `0` means it lost, `-1` means unresolved.
 
 2. **Externalized market definitions** (`polymarket_pipeline/market_definitions.json`, `polymarket_pipeline/markets.py`)  
    Supported market families (Binary & Multi-Outcome), asset aliases, and vocabulary now live in bundled JSON-backed definitions instead of being hardcoded across multiple modules.
 
 3. **Normalization + settings** (`polymarket_pipeline/market_normalization.py`, `polymarket_pipeline/settings.py`)  
-   Raw Gamma payloads are converted into generalized `MarketRecord` objects, natively leveraging internal dictionary maps (`tokens: dict[str, str]`) instead of hardcoded UP/DOWN bindings.
+   Raw Gamma payloads are converted into generalized `MarketRecord` objects, natively leveraging internal dictionary maps (`tokens: dict[str, str]`) instead of hardcoded UP/DOWN bindings. `slug`, `event_slug`, `bucket_index`, `bucket_label`, and `closed_ts` are extracted directly from the Gamma response (`groupItemThreshold`, `groupItemTitle`, `slug`, `closedTime`). Resolution is detected via `_binary_resolution_from_prices()` — which checks `closed=True` AND `outcomePrices[0] >= 0.99` — because the Gamma API does not expose a `resolved` boolean on its market objects.
 
 4. **Pipeline phases** (`polymarket_pipeline/pipeline.py`, `polymarket_pipeline/phases/`)  
    - `PriceHistoryPhase`: Fetches OHLC data from Gamma/CLOB asynchronously across all mapped tokens.
@@ -106,6 +106,8 @@ The runtime is strictly partitioned to maintain isolation between heavily standa
 - **DuckDB Out-of-Core Consolidation**: Tick and orderbook shard consolidation uses DuckDB with configurable memory limits and disk spilling, preventing OOM on large partitions (e.g., BTC/5-minute orderbook with millions of rows).
 - **DuckDB SQL Injection Hardening**: All file paths and environment variables interpolated into DuckDB SQL are escaped via `_duckdb_escape()`. The `PM_DUCKDB_MEMORY_LIMIT` env var is regex-validated.
 - **Culture Data Hub**: Culture-specific data (e.g., Elon Musk tweets) is automatically isolated in `data-culture/` and uploaded to a dedicated Hugging Face repository (`HF_CULTURE_REPO_ID`).
+- **Metadata-Refresh Backfill**: When a historical scan encounters a closed market whose price history is already fully cached, the `PriceHistoryPhase` no longer skips it silently — instead it batches the market into a metadata-only persist pass that rewrites only the relevant rows of `markets.parquet`. This is how the `resolution` field gets populated for events that closed *after* their prices were first captured.
+- **Deterministic Consolidation**: Pandas-based consolidation (`_consolidate_partitioned_prices`, `consolidate_spot_prices`) now sorts input files by `(mtime, filename)` before concatenating, so `drop_duplicates(keep="last")` reliably picks the most recently written duplicate. Prior to this, the dedup winner depended on `os.listdir()` order, which is filesystem- and Python-version-specific (silently caused older prices to overwrite newer ones on ARM64 / Python 3.12).
 
 ### Extending Supported Markets
 
