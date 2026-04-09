@@ -66,9 +66,11 @@ def build_binary_price_frame(
             "question": question,
             "start_ts": market.start_ts,
             "end_ts": market.end_ts,
+            "closed_ts": market.closed_ts if market.closed_ts is not None else 0,
             "condition_id": market.condition_id,
             "up_token_id": market.up_token_id,
             "down_token_id": market.down_token_id,
+            "slug": market.slug or "",
             "fee_rate_bps": market.fee_rate_bps if market.fee_rate_bps is not None else -1,
             "category": market.category,
         }
@@ -95,9 +97,11 @@ def build_binary_price_row(
         "question": market.question,
         "start_ts": market.start_ts,
         "end_ts": market.end_ts,
+        "closed_ts": market.closed_ts if market.closed_ts is not None else 0,
         "condition_id": market.condition_id,
         "up_token_id": market.up_token_id,
         "down_token_id": market.down_token_id,
+        "slug": market.slug or "",
         "fee_rate_bps": market.fee_rate_bps if market.fee_rate_bps is not None else -1,
         "category": market.category,
     }

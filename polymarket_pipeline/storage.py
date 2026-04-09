@@ -239,9 +239,11 @@ MARKETS_SCHEMA = pa.schema([
     ("resolution", pa.int8()),  # 0 / 1 / -1 (= unresolved)
     ("start_ts", pa.int64()),
     ("end_ts", pa.int64()),
+    ("closed_ts", pa.int64()),  # closedTime from Gamma (0 = still open)
     ("condition_id", pa.string()),
     ("up_token_id", pa.string()),
     ("down_token_id", pa.string()),
+    ("slug", pa.string()),                # market-level slug
     ("fee_rate_bps", pa.int16()),  # taker fee rate (basis points); -1 = unknown
 ])
 
@@ -262,8 +264,13 @@ CULTURE_MARKETS_SCHEMA = pa.schema([
     ("resolution", pa.int8()),
     ("start_ts", pa.int64()),
     ("end_ts", pa.int64()),
+    ("closed_ts", pa.int64()),      # closedTime from Gamma (0 = still open)
     ("condition_id", pa.string()),
-    ("tokens", pa.string()), # JSON serialized dict
+    ("tokens", pa.string()),        # JSON serialized dict
+    ("slug", pa.string()),          # market-level slug (includes bucket suffix)
+    ("event_slug", pa.string()),    # parent event slug (derived)
+    ("bucket_index", pa.int32()),   # Polymarket groupItemThreshold (-1 = unknown)
+    ("bucket_label", pa.string()),  # groupItemTitle — e.g. "280-299", "240+"
 ])
 
 CULTURE_PRICES_SCHEMA = pa.schema([
@@ -480,6 +487,13 @@ def _resolution_to_int8(val: Any) -> int:
 # Split a flat DataFrame into the two normalised tables
 # ---------------------------------------------------------------------------
 
+_BINARY_MARKETS_EMPTY_COLS = [
+    "market_id", "question", "crypto", "timeframe", "volume", "resolution",
+    "start_ts", "end_ts", "closed_ts", "condition_id", "up_token_id",
+    "down_token_id", "slug", "fee_rate_bps",
+]
+
+
 def split_markets_prices(flat_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split a legacy flat DataFrame into (markets_df, prices_df).
 
@@ -488,26 +502,29 @@ def split_markets_prices(flat_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
         volume, resolution, question
     """
     if flat_df.empty:
-        markets_df = pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "up_token_id", "down_token_id", "fee_rate_bps"])
+        markets_df = pd.DataFrame(columns=_BINARY_MARKETS_EMPTY_COLS)
         prices_df = pd.DataFrame(columns=["market_id", "timestamp", "up_price", "down_price", "crypto", "timeframe"])
         return markets_df, prices_df
 
     # Markets: one row per market_id, keep last-seen metadata
+    agg_spec = {
+        "question": "last",
+        "crypto": "last",
+        "timeframe": "last",
+        "volume": "last",
+        "resolution": "last",
+        "start_ts": "last",
+        "end_ts": "last",
+        "condition_id": "last",
+        "up_token_id": "last",
+        "down_token_id": "last",
+    }
+    for col in ("closed_ts", "slug", "fee_rate_bps"):
+        if col in flat_df.columns:
+            agg_spec[col] = "last"
     markets_df = (
         flat_df.groupby("market_id", sort=False)
-        .agg({
-            "question": "last",
-            "crypto": "last",
-            "timeframe": "last",
-            "volume": "last",
-            "resolution": "last",
-            "start_ts": "last",
-            "end_ts": "last",
-            "condition_id": "last",
-            "up_token_id": "last",
-            "down_token_id": "last",
-            **({"fee_rate_bps": "last"} if "fee_rate_bps" in flat_df.columns else {}),
-        })
+        .agg(agg_spec)
         .reset_index()
     )
 
@@ -528,18 +545,24 @@ def optimise_markets_df(df: pd.DataFrame) -> pd.DataFrame:
     df["timeframe"] = df["timeframe"].astype("category")
     df["volume"] = df["volume"].astype("float32")
     df["resolution"] = df["resolution"].apply(_resolution_to_int8).astype("int8")
-    
+
     # New columns
     if "start_ts" in df.columns:
         df["start_ts"] = pd.to_numeric(df["start_ts"], errors="coerce").fillna(0).astype("int64")
     if "end_ts" in df.columns:
         df["end_ts"] = pd.to_numeric(df["end_ts"], errors="coerce").fillna(0).astype("int64")
+    if "closed_ts" not in df.columns:
+        df["closed_ts"] = 0
+    df["closed_ts"] = pd.to_numeric(df["closed_ts"], errors="coerce").fillna(0).astype("int64")
     if "condition_id" in df.columns:
         df["condition_id"] = df["condition_id"].astype("string")
     if "up_token_id" in df.columns:
         df["up_token_id"] = df["up_token_id"].astype("string")
     if "down_token_id" in df.columns:
         df["down_token_id"] = df["down_token_id"].astype("string")
+    if "slug" not in df.columns:
+        df["slug"] = ""
+    df["slug"] = df["slug"].fillna("").astype("string")
     if "fee_rate_bps" not in df.columns:
         df["fee_rate_bps"] = -1
     df["fee_rate_bps"] = pd.to_numeric(df["fee_rate_bps"], errors="coerce").fillna(-1).astype("int16")
@@ -587,7 +610,7 @@ def load_markets(markets_path: str | None = None) -> pd.DataFrame:
     path = markets_path or PARQUET_MARKETS_PATH
     if os.path.exists(path):
         return pq.read_table(path).to_pandas()
-    return pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "up_token_id", "down_token_id", "fee_rate_bps"])
+    return pd.DataFrame(columns=_BINARY_MARKETS_EMPTY_COLS)
 
 
 def _read_hive_partitioned_robust(
@@ -1727,16 +1750,35 @@ def optimise_culture_markets_df(df: pd.DataFrame) -> pd.DataFrame:
     df["timeframe"] = df["timeframe"].astype("category")
     df["volume"] = df["volume"].astype("float32")
     df["resolution"] = df["resolution"].apply(_resolution_to_int8).astype("int8")
-    
+
     if "start_ts" in df.columns:
         df["start_ts"] = pd.to_numeric(df["start_ts"], errors="coerce").fillna(0).astype("int64")
     if "end_ts" in df.columns:
         df["end_ts"] = pd.to_numeric(df["end_ts"], errors="coerce").fillna(0).astype("int64")
+    if "closed_ts" not in df.columns:
+        df["closed_ts"] = 0
+    df["closed_ts"] = pd.to_numeric(df["closed_ts"], errors="coerce").fillna(0).astype("int64")
     if "condition_id" in df.columns:
         df["condition_id"] = df["condition_id"].astype("string")
     if "tokens" in df.columns:
         df["tokens"] = df["tokens"].astype("string")
-    
+
+    # Identity / grouping fields (default to empty / -1 for backwards
+    # compatibility with pre-existing parquet files written by earlier
+    # pipeline versions).
+    if "slug" not in df.columns:
+        df["slug"] = ""
+    df["slug"] = df["slug"].fillna("").astype("string")
+    if "event_slug" not in df.columns:
+        df["event_slug"] = ""
+    df["event_slug"] = df["event_slug"].fillna("").astype("string")
+    if "bucket_index" not in df.columns:
+        df["bucket_index"] = -1
+    df["bucket_index"] = pd.to_numeric(df["bucket_index"], errors="coerce").fillna(-1).astype("int32")
+    if "bucket_label" not in df.columns:
+        df["bucket_label"] = ""
+    df["bucket_label"] = df["bucket_label"].fillna("").astype("string")
+
     return df
 
 def optimise_culture_prices_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -1748,30 +1790,47 @@ def optimise_culture_prices_df(df: pd.DataFrame) -> pd.DataFrame:
     df["outcome"] = df["outcome"].astype("category")
     return df
 
+_CULTURE_MARKETS_EMPTY_COLS = [
+    "market_id", "question", "crypto", "timeframe", "volume", "resolution",
+    "start_ts", "end_ts", "closed_ts", "condition_id", "tokens",
+    "slug", "event_slug", "bucket_index", "bucket_label",
+]
+
+
 def load_culture_markets(markets_path: str) -> pd.DataFrame:
     if os.path.exists(markets_path):
         return pq.read_table(markets_path).to_pandas()
-    return pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "tokens"])
+    return pd.DataFrame(columns=_CULTURE_MARKETS_EMPTY_COLS)
+
 
 def split_culture_markets_prices(flat_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     if flat_df.empty:
-        markets_df = pd.DataFrame(columns=["market_id", "question", "crypto", "timeframe", "volume", "resolution", "start_ts", "end_ts", "condition_id", "tokens"])
+        markets_df = pd.DataFrame(columns=_CULTURE_MARKETS_EMPTY_COLS)
         prices_df = pd.DataFrame(columns=["market_id", "timestamp", "token_id", "outcome", "price", "crypto", "timeframe"])
         return markets_df, prices_df
 
+    # Aggregate market metadata — "last" so the most recent observation
+    # (e.g. a closed/resolved market) overrides earlier open snapshots.
+    agg_spec = {
+        "question": "last",
+        "crypto": "last",
+        "timeframe": "last",
+        "volume": "last",
+        "resolution": "last",
+        "start_ts": "last",
+        "end_ts": "last",
+        "condition_id": "last",
+        "tokens": "last",
+    }
+    # Only include identity fields that exist (keeps backward compatibility
+    # with code paths that don't supply them — e.g. older tests).
+    for col in ("closed_ts", "slug", "event_slug", "bucket_index", "bucket_label"):
+        if col in flat_df.columns:
+            agg_spec[col] = "last"
+
     markets_df = (
         flat_df.groupby("market_id", sort=False)
-        .agg({
-            "question": "last",
-            "crypto": "last",
-            "timeframe": "last",
-            "volume": "last",
-            "resolution": "last",
-            "start_ts": "last",
-            "end_ts": "last",
-            "condition_id": "last",
-            "tokens": "last",
-        })
+        .agg(agg_spec)
         .reset_index()
     )
 

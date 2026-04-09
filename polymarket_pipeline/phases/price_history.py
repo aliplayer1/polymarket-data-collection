@@ -153,8 +153,13 @@ class PriceHistoryPhase:
                         df["resolution"] = market.resolution
                         df["start_ts"] = market.start_ts
                         df["end_ts"] = market.end_ts
+                        df["closed_ts"] = market.closed_ts if market.closed_ts is not None else 0
                         df["condition_id"] = market.condition_id
                         df["tokens"] = json.dumps(market.tokens)
+                        df["slug"] = market.slug or ""
+                        df["event_slug"] = market.event_slug or ""
+                        df["bucket_index"] = market.bucket_index if market.bucket_index is not None else -1
+                        df["bucket_label"] = market.bucket_label or ""
                         df["category"] = "culture"
                         frames.append(df)
             if not frames:

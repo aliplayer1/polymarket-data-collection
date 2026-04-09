@@ -825,3 +825,114 @@ def test_consolidate_prices_skips_partition_without_shards(tmp_path):
     assert os.listdir(part_dir) == ["part-0.parquet"]
     result = pq.read_table(part_dir / "part-0.parquet").to_pandas()
     assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# Culture markets: identity/grouping fields round-trip
+# ---------------------------------------------------------------------------
+
+def test_persist_culture_markets_roundtrip_new_fields(tmp_path):
+    """Writing a culture market with slug/event_slug/bucket_index/bucket_label
+    should round-trip through parquet (new schema)."""
+    from polymarket_pipeline.storage import (
+        persist_culture_normalized,
+        load_culture_markets,
+    )
+
+    markets_path = str(tmp_path / "markets.parquet")
+    prices_dir = str(tmp_path / "prices")
+
+    markets_df = pd.DataFrame({
+        "market_id": ["m-260-279"],
+        "question": ["Will Elon Musk post 260-279 tweets from March 31 to April 7, 2026?"],
+        "crypto": ["ELON-TWEETS"],
+        "timeframe": ["7-day"],
+        "volume": [12345.0],
+        "resolution": [1],  # won
+        "start_ts": [1743456000],
+        "end_ts": [1744041600],
+        "closed_ts": [1744041605],
+        "condition_id": ["0xabc"],
+        "tokens": ['{"Yes":"tok-yes","No":"tok-no"}'],
+        "slug": ["elon-musk-of-tweets-march-31-april-7-260-279"],
+        "event_slug": ["elon-musk-of-tweets-march-31-april-7"],
+        "bucket_index": [13],
+        "bucket_label": ["260-279"],
+    })
+    prices_df = pd.DataFrame({
+        "market_id": ["m-260-279"],
+        "timestamp": [1743500000],
+        "token_id": ["tok-yes"],
+        "outcome": ["Yes"],
+        "price": [0.05],
+        "crypto": ["ELON-TWEETS"],
+        "timeframe": ["7-day"],
+    })
+
+    persist_culture_normalized(
+        markets_df, prices_df,
+        markets_path=markets_path, prices_dir=prices_dir,
+    )
+
+    loaded = load_culture_markets(markets_path)
+    assert len(loaded) == 1
+    row = loaded.iloc[0]
+    assert row["market_id"] == "m-260-279"
+    assert row["resolution"] == 1
+    assert row["slug"] == "elon-musk-of-tweets-march-31-april-7-260-279"
+    assert row["event_slug"] == "elon-musk-of-tweets-march-31-april-7"
+    assert int(row["bucket_index"]) == 13
+    assert row["bucket_label"] == "260-279"
+    assert int(row["closed_ts"]) == 1744041605
+
+
+def test_persist_culture_markets_backcompat_missing_new_fields(tmp_path):
+    """Old writers that didn't emit the new identity columns should still
+    produce valid parquet (columns default to empty/-1)."""
+    from polymarket_pipeline.storage import (
+        persist_culture_normalized,
+        load_culture_markets,
+    )
+
+    markets_path = str(tmp_path / "markets.parquet")
+    prices_dir = str(tmp_path / "prices")
+
+    # Minimal legacy columns — no slug / event_slug / bucket_* / closed_ts
+    markets_df = pd.DataFrame({
+        "market_id": ["legacy-1"],
+        "question": ["legacy market"],
+        "crypto": ["ELON-TWEETS"],
+        "timeframe": ["7-day"],
+        "volume": [0.0],
+        "resolution": [None],
+        "start_ts": [0],
+        "end_ts": [0],
+        "condition_id": ["c1"],
+        "tokens": ['{}'],
+    })
+    prices_df = pd.DataFrame({
+        "market_id": ["legacy-1"],
+        "timestamp": [100],
+        "token_id": ["tok-1"],
+        "outcome": ["Yes"],
+        "price": [0.5],
+        "crypto": ["ELON-TWEETS"],
+        "timeframe": ["7-day"],
+    })
+
+    persist_culture_normalized(
+        markets_df, prices_df,
+        markets_path=markets_path, prices_dir=prices_dir,
+    )
+
+    loaded = load_culture_markets(markets_path)
+    assert len(loaded) == 1
+    row = loaded.iloc[0]
+    # Defaults for the new columns
+    assert row["slug"] == ""
+    assert row["event_slug"] == ""
+    assert int(row["bucket_index"]) == -1
+    assert row["bucket_label"] == ""
+    assert int(row["closed_ts"]) == 0
+    # Resolution still maps None → -1
+    assert int(row["resolution"]) == -1
