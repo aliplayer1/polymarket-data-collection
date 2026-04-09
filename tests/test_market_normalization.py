@@ -161,3 +161,149 @@ def test_normalize_gamma_market_supports_elon_musk_tweets() -> None:
     assert market_monthly.market_type == "elon-musk-tweets"
     assert market_monthly.crypto == "ELON-TWEETS"
     assert market_monthly.timeframe == "1-month"
+
+
+# ---------------------------------------------------------------------------
+# Culture market identity: slug, event_slug, bucket_index, bucket_label
+# ---------------------------------------------------------------------------
+
+def test_normalize_gamma_market_captures_group_fields() -> None:
+    """Culture markets should surface groupItemThreshold / groupItemTitle."""
+    raw_market = {
+        "id": "elon-3",
+        "slug": "elon-musk-of-tweets-april-3-april-10-280-299",
+        "question": "Will Elon Musk post 280-299 tweets from April 3 to April 10, 2026?",
+        "startDate": "2026-03-27T00:00:00Z",
+        "endDate": "2026-04-10T16:00:00Z",
+        "closed": False,
+        "groupItemThreshold": "14",
+        "groupItemTitle": "280-299",
+        "tokens": [
+            {"outcome": "Yes", "tokenId": "tok-yes"},
+            {"outcome": "No", "tokenId": "tok-no"},
+        ],
+    }
+    m = normalize_gamma_market(raw_market, is_active=True, logger=logging.getLogger("test"))
+    assert m is not None
+    assert m.slug == "elon-musk-of-tweets-april-3-april-10-280-299"
+    assert m.event_slug == "elon-musk-of-tweets-april-3-april-10"
+    assert m.bucket_index == 14
+    assert m.bucket_label == "280-299"
+
+
+def test_normalize_gamma_market_handles_plus_suffix_bucket() -> None:
+    """The '240+' bucket slugifies to '240-plus' in Polymarket URLs."""
+    raw_market = {
+        "id": "elon-4",
+        "slug": "elon-musk-of-tweets-march-26-march-28-240-plus",
+        "question": "Will Elon Musk post 240+ tweets from March 26 to March 28, 2026?",
+        "startDate": "2026-03-23T12:00:00Z",
+        "endDate": "2026-03-28T12:00:00Z",
+        "closed": False,
+        "groupItemThreshold": "8",
+        "groupItemTitle": "240+",
+        "tokens": [
+            {"outcome": "Yes", "tokenId": "tok-yes"},
+            {"outcome": "No", "tokenId": "tok-no"},
+        ],
+    }
+    m = normalize_gamma_market(raw_market, is_active=True, logger=logging.getLogger("test"))
+    assert m is not None
+    assert m.event_slug == "elon-musk-of-tweets-march-26-march-28"
+    assert m.bucket_index == 8
+    assert m.bucket_label == "240+"
+
+
+# ---------------------------------------------------------------------------
+# Resolution detection
+# ---------------------------------------------------------------------------
+
+def test_normalize_gamma_market_resolution_from_prices_culture_winner() -> None:
+    """A closed culture bucket whose YES price is 1.0 is resolution=1 (won)."""
+    raw_market = {
+        "id": "elon-5",
+        "slug": "elon-musk-of-tweets-march-31-april-7-260-279",
+        "question": "Will Elon Musk post 260-279 tweets from March 31 to April 7, 2026?",
+        "startDate": "2026-03-24T12:00:00Z",
+        "endDate": "2026-04-07T16:00:00Z",
+        "closed": True,
+        "closedTime": "2026-04-07T16:00:05Z",
+        "groupItemThreshold": "13",
+        "groupItemTitle": "260-279",
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["1", "0"]',
+        "tokens": [
+            {"outcome": "Yes", "tokenId": "tok-yes"},
+            {"outcome": "No", "tokenId": "tok-no"},
+        ],
+    }
+    m = normalize_gamma_market(raw_market, is_active=False, logger=logging.getLogger("test"))
+    assert m is not None
+    assert m.resolution == 1
+    assert m.bucket_index == 13
+
+
+def test_normalize_gamma_market_resolution_from_prices_culture_loser() -> None:
+    """A closed culture bucket whose YES price is 0 is resolution=0 (lost)."""
+    raw_market = {
+        "id": "elon-6",
+        "slug": "elon-musk-of-tweets-march-31-april-7-100-119",
+        "question": "Will Elon Musk post 100-119 tweets from March 31 to April 7, 2026?",
+        "startDate": "2026-03-24T12:00:00Z",
+        "endDate": "2026-04-07T16:00:00Z",
+        "closed": True,
+        "closedTime": "2026-04-07T16:00:05Z",
+        "groupItemThreshold": "5",
+        "groupItemTitle": "100-119",
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0", "1"]',
+        "tokens": [
+            {"outcome": "Yes", "tokenId": "tok-yes"},
+            {"outcome": "No", "tokenId": "tok-no"},
+        ],
+    }
+    m = normalize_gamma_market(raw_market, is_active=False, logger=logging.getLogger("test"))
+    assert m is not None
+    assert m.resolution == 0
+
+
+def test_normalize_gamma_market_resolution_unresolved_while_open() -> None:
+    """An open market with fluctuating prices is resolution=None."""
+    raw_market = {
+        "id": "elon-7",
+        "slug": "elon-musk-of-tweets-april-10-april-17-100-119",
+        "question": "Will Elon Musk post 100-119 tweets from April 10 to April 17, 2026?",
+        "startDate": "2026-04-03T00:00:00Z",
+        "endDate": "2026-04-17T16:00:00Z",
+        "closed": False,
+        "groupItemThreshold": "5",
+        "groupItemTitle": "100-119",
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0.15", "0.85"]',
+        "tokens": [
+            {"outcome": "Yes", "tokenId": "tok-yes"},
+            {"outcome": "No", "tokenId": "tok-no"},
+        ],
+    }
+    m = normalize_gamma_market(raw_market, is_active=True, logger=logging.getLogger("test"))
+    assert m is not None
+    assert m.resolution is None
+
+
+def test_normalize_gamma_market_binary_resolution_from_prices() -> None:
+    """Binary (crypto) market: price-based fallback works without per-token winner flag."""
+    raw_market = {
+        "id": "btc-1",
+        "question": "Bitcoin Up or Down - 5-Minute market",
+        "startDate": "2026-03-08T10:00:00Z",
+        "endDate": "2026-03-08T10:05:00Z",
+        "closed": True,
+        "closedTime": "2026-03-08T10:05:00Z",
+        "volume": "123.45",
+        "outcomes": '["Up", "Down"]',
+        "outcomePrices": '["1", "0"]',
+        "clobTokenIds": '["tok-up", "tok-down"]',
+    }
+    m = normalize_gamma_market(raw_market, is_active=False, logger=logging.getLogger("test"))
+    assert m is not None
+    assert m.resolution == 1  # Up won

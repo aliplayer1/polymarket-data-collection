@@ -29,6 +29,12 @@ class MarketRecord:
     # Fee schedule (fetched from CLOB API; None if not yet fetched)
     fee_rate_bps: int | None = None
 
+    # Identity / grouping fields (captured from Gamma API)
+    slug: str | None = None            # Polymarket market slug
+    event_slug: str | None = None      # Parent event slug (derived by stripping bucket suffix)
+    bucket_index: int | None = None    # Polymarket's groupItemThreshold — canonical ordering
+    bucket_label: str | None = None    # groupItemTitle — e.g. "280-299", "240+"
+
     def __post_init__(self):
         if not self.tokens and self.up_token_id and self.down_token_id:
             self.tokens = {
