@@ -18,7 +18,7 @@ from ..storage import (
     split_culture_markets_prices,
     split_markets_prices,
 )
-from .shared import PipelinePaths, build_binary_price_frame
+from .shared import PipelinePaths, build_binary_price_frame, market_record_to_markets_df
 
 
 class PriceHistoryPhase:
@@ -348,6 +348,8 @@ class PriceHistoryPhase:
         if not batch:
             return
 
+        metadata_only_markets: list[MarketRecord] = []
+
         with ThreadPoolExecutor(max_workers=min(3, len(batch))) as executor:
             # Fetch fee rates in parallel (crypto only, best-effort)
             fee_futures = [
@@ -376,9 +378,69 @@ class PriceHistoryPhase:
                     if market_df is not None and not market_df.empty:
                         self.pending_dfs[market.timeframe].append(market_df)
                         self.logger.info("  -> Fetched %s rows", len(market_df))
+                    else:
+                        # No new price history — but market metadata may still
+                        # have changed (e.g. a closed event just got its
+                        # resolution populated). Refresh metadata-only so
+                        # markets.parquet eventually converges to the truth.
+                        metadata_only_markets.append(market)
                 except Exception as exc:
                     self.logger.error("Failed to process market %s: %s", market.market_id, exc)
+
+        if metadata_only_markets:
+            self._persist_metadata_only(metadata_only_markets)
+
         self.flush_if_needed()
+
+    def _persist_metadata_only(self, markets: list[MarketRecord]) -> None:
+        """Write updated market metadata (no prices) for markets whose
+        price history is already fully cached.
+
+        This backfills the ``resolution`` column for events that closed
+        after their prices were first captured — without it, those rows
+        stayed at -1 forever because the price-history path treated them
+        as "nothing to do".
+        """
+        if not markets:
+            return
+
+        # Split crypto vs culture; persist via the corresponding function
+        crypto_rows = [m for m in markets if m.category == "crypto"]
+        culture_rows = [m for m in markets if m.category == "culture"]
+
+        if crypto_rows:
+            import pandas as pd
+            df = pd.concat([market_record_to_markets_df(m) for m in crypto_rows], ignore_index=True)
+            from ..storage import persist_normalized
+            try:
+                persist_normalized(
+                    df, pd.DataFrame(),
+                    markets_path=str(self.paths.markets_path),
+                    prices_dir=str(self.paths.prices_dir),
+                    logger=self.logger,
+                    skip_markets=False,
+                )
+                self.logger.info("Metadata refresh (crypto): %d markets", len(crypto_rows))
+            except Exception as exc:
+                self.logger.debug("Metadata-only refresh failed (crypto): %s", exc)
+
+        if culture_rows:
+            import pandas as pd
+            df = pd.concat([market_record_to_markets_df(m) for m in culture_rows], ignore_index=True)
+            from ..storage import persist_culture_normalized
+            data_culture_dir = self.paths.data_dir.parent / "data-culture"
+            data_culture_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                persist_culture_normalized(
+                    df, pd.DataFrame(),
+                    markets_path=str(data_culture_dir / "markets.parquet"),
+                    prices_dir=str(data_culture_dir / "prices"),
+                    logger=self.logger,
+                    skip_markets=False,
+                )
+                self.logger.info("Metadata refresh (culture): %d markets", len(culture_rows))
+            except Exception as exc:
+                self.logger.debug("Metadata-only refresh failed (culture): %s", exc)
 
     def flush_if_needed(self, *, threshold: int = 10) -> None:
         for timeframe in list(self.pending_dfs.keys()):

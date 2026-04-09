@@ -159,6 +159,53 @@ def build_spot_price_row(
     }
 
 
+def market_record_to_markets_df(market: MarketRecord) -> pd.DataFrame:
+    """Serialize a single MarketRecord into a 1-row markets_df.
+
+    Used by the metadata-refresh path in the historical phase: when a market's
+    price history is already fully cached, we still want to persist any
+    updated market-level metadata (resolution, volume, closed_ts) so that
+    events that closed *after* their prices were first captured eventually
+    get a populated resolution field.
+
+    Returns a DataFrame whose schema matches what ``split_markets_prices``
+    (for crypto) or ``split_culture_markets_prices`` (for culture) would
+    produce, minus the grouping overhead. The caller selects the right
+    persistence function based on ``market.category``.
+    """
+    import json as _json
+
+    base: dict[str, Any] = {
+        "market_id": market.market_id,
+        "question": market.question,
+        "crypto": market.crypto,
+        "timeframe": market.timeframe,
+        "volume": market.volume,
+        "resolution": market.resolution,
+        "start_ts": market.start_ts,
+        "end_ts": market.end_ts,
+        "closed_ts": market.closed_ts if market.closed_ts is not None else 0,
+        "condition_id": market.condition_id,
+        "slug": market.slug or "",
+    }
+
+    if market.category == "culture":
+        base.update({
+            "tokens": _json.dumps(market.tokens),
+            "event_slug": market.event_slug or "",
+            "bucket_index": market.bucket_index if market.bucket_index is not None else -1,
+            "bucket_label": market.bucket_label or "",
+        })
+    else:
+        base.update({
+            "up_token_id": market.up_token_id,
+            "down_token_id": market.down_token_id,
+            "fee_rate_bps": market.fee_rate_bps if market.fee_rate_bps is not None else -1,
+        })
+
+    return pd.DataFrame([base])
+
+
 def build_orderbook_row(
     market: MarketRecord,
     *,
