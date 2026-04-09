@@ -1364,6 +1364,17 @@ def _consolidate_partitioned_prices(
             rel = os.path.relpath(dirpath, root_dir)
             log.info("Consolidating %s partition %s (%d files)...", label, rel, len(parquet_files))
 
+            # Deterministic read order so that the newer data wins
+            # drop_duplicates(keep="last"). Sort by (mtime, filename):
+            # oldest file first, ties broken lexicographically. This
+            # matches consolidate_orderbook's pattern and removes the
+            # dependence on os.listdir() order, which is filesystem-
+            # and OS-specific (passes on ext4/Python 3.10 locally but
+            # fails on the ARM64 server with Python 3.12).
+            parquet_files.sort(
+                key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
+            )
+
             frames = []
             for fname in parquet_files:
                 fpath = os.path.join(dirpath, fname)
@@ -1436,6 +1447,11 @@ def consolidate_spot_prices(
             return
 
         log.info("Consolidating spot prices (%d files)...", len(parquet_files))
+        # Deterministic read order: oldest file first so drop_duplicates(
+        # keep="last") selects the most recently written duplicate.
+        parquet_files.sort(
+            key=lambda f: (os.path.getmtime(os.path.join(spot_prices_dir, f)), f)
+        )
         frames = []
         for fname in parquet_files:
             try:
