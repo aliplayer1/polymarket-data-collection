@@ -301,6 +301,12 @@ TICKS_SCHEMA = pa.schema([
     # delivered a price yet or for historical on-chain ticks without live context.
     ("spot_price_usdt", pa.float32()),   # e.g. 67234.50 for BTC/USDT
     ("spot_price_ts_ms", pa.int64()),    # Binance timestamp of the spot price (epoch ms)
+    # Local ``time.time_ns()`` at the moment the WS recv loop delivered the
+    # message.  Combined with ``timestamp_ms`` (server-side) and
+    # ``spot_price_ts_ms`` this gives three clocks, exposing asyncio
+    # backpressure and clock skew directly.  Nullable — on-chain backfill
+    # ticks and pre-v4 Parquet files have no local recv timestamp.
+    ("local_recv_ts_ns", pa.int64()),
     # partition columns (crypto, timeframe) are implicit
 ])
 
@@ -326,7 +332,21 @@ ORDERBOOK_SCHEMA = pa.schema([
     ("best_ask",       pa.float32()),
     ("best_bid_size",  pa.float32()),
     ("best_ask_size",  pa.float32()),
+    # Nanosecond-precision local receipt timestamp.  Pre-v4 Parquet files
+    # have no such column; union_by_name consolidation fills NULL.
+    ("local_recv_ts_ns", pa.int64()),
     # partition columns (crypto, timeframe) implicit
+])
+
+# Heartbeat rows emitted on a fixed cadence by the WS flush loop even when
+# no data is flowing, so downstream gap-scanning is O(scan-one-file).
+# Flat directory (no partitioning): volume is tiny (~6 rows / 10 s).
+HEARTBEATS_SCHEMA = pa.schema([
+    ("ts_ms",              pa.int64()),   # when this heartbeat was emitted
+    ("source",             pa.string()),  # "clob_ws" / "rtds_binance" / "rtds_chainlink"
+    ("shard_key",          pa.string()),  # shard_idx for CLOB, symbol for RTDS
+    ("event_type",         pa.string()),  # e.g. "price_change", "btcusdt"
+    ("last_event_age_ms",  pa.int64()),   # ms since last real event (-1 = never seen)
 ])
 
 # ---------------------------------------------------------------------------
@@ -336,7 +356,12 @@ ORDERBOOK_SCHEMA = pa.schema([
 # Increment this when any schema column is added, removed, or its type changes.
 # The version is stored as ``b"schema_version"`` in each Parquet file's
 # key-value metadata so consumers can detect and handle schema evolution.
-STORAGE_SCHEMA_VERSION = 3
+#
+# v3 → v4 (April 2026): added nullable ``local_recv_ts_ns`` to TICKS_SCHEMA
+# and ORDERBOOK_SCHEMA for the three-clock observability scheme.  Pre-v4
+# files are read back transparently via ``union_by_name=true`` in DuckDB
+# consolidation; reads fill NULL for the missing column.
+STORAGE_SCHEMA_VERSION = 4
 
 
 def _stamp_schema_version(table: pa.Table) -> pa.Table:
@@ -731,7 +756,7 @@ def load_prices_for_timeframe(timeframe: str, prices_dir: str | None = None) -> 
 _TICKS_EMPTY_COLS = [
     "market_id", "timestamp_ms", "token_id", "outcome", "side",
     "price", "size_usdc", "tx_hash", "block_number", "log_index", "source",
-    "spot_price_usdt", "spot_price_ts_ms",
+    "spot_price_usdt", "spot_price_ts_ms", "local_recv_ts_ns",
     "crypto", "timeframe",
 ]
 _TICKS_DEDUP_COLS = ["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"]
@@ -979,6 +1004,7 @@ def consolidate_ticks(
                 log_index_sql = _col_sql("log_index", "0")
                 spot_price_usdt_sql = "src.spot_price_usdt" if "spot_price_usdt" in present_cols else "NULL::FLOAT AS spot_price_usdt"
                 spot_price_ts_ms_sql = "src.spot_price_ts_ms" if "spot_price_ts_ms" in present_cols else "NULL::BIGINT AS spot_price_ts_ms"
+                local_recv_ts_ns_sql = "src.local_recv_ts_ns" if "local_recv_ts_ns" in present_cols else "NULL::BIGINT AS local_recv_ts_ns"
 
                 result = con.execute(f"""
                     COPY (
@@ -1000,6 +1026,7 @@ def consolidate_ticks(
                                 src.source,
                                 {spot_price_usdt_sql},
                                 {spot_price_ts_ms_sql},
+                                {local_recv_ts_ns_sql},
                                 ((f.file_order::BIGINT << 32) + src.file_row_number::BIGINT) AS sort_key
                             FROM read_parquet(
                                 [{files_sql}],
@@ -1145,6 +1172,44 @@ def append_ws_spot_prices_staged(
     _write_parquet_atomic(table, shard_path)
 
     log.info("Spot prices staged: %d new rows to %s/", len(rows), spot_prices_dir)
+
+
+def append_ws_heartbeats_staged(
+    rows: list[dict],
+    *,
+    heartbeats_dir: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Write WS heartbeat rows as an independent shard file.
+
+    Each flush writes ``ws_hb_{pid}_{ts}.parquet``.  No read, no lock —
+    the filename is unique per PID+monotonic-ms.  ``consolidate_heartbeats``
+    merges them on its next run.
+
+    Rows must carry the ``HEARTBEATS_SCHEMA`` columns
+    (``ts_ms, source, shard_key, event_type, last_event_age_ms``).
+    Missing columns get NULL in the output.
+    """
+    if not rows:
+        return
+
+    log = logger or logging.getLogger("polymarket_pipeline")
+    df = pd.DataFrame(rows)
+    # Coerce dtypes to match schema.
+    if "ts_ms" in df.columns:
+        df["ts_ms"] = pd.to_numeric(df["ts_ms"], errors="coerce").fillna(0).astype("int64")
+    if "last_event_age_ms" in df.columns:
+        df["last_event_age_ms"] = pd.to_numeric(df["last_event_age_ms"], errors="coerce").fillna(-1).astype("int64")
+    for col in ("source", "shard_key", "event_type"):
+        if col in df.columns:
+            df[col] = df[col].astype(str)
+
+    os.makedirs(heartbeats_dir, exist_ok=True)
+    shard_name = f"ws_hb_{os.getpid()}_{int(time.monotonic() * 1000)}.parquet"
+    shard_path = os.path.join(heartbeats_dir, shard_name)
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    _write_parquet_atomic(table, shard_path)
+    log.debug("Heartbeats staged: %d new rows to %s/", len(rows), heartbeats_dir)
 
 
 def append_ws_orderbook_staged(
@@ -1490,6 +1555,79 @@ def consolidate_spot_prices(
     log.info("Spot prices consolidated: %d rows", len(merged))
 
 
+def consolidate_heartbeats(
+    *,
+    heartbeats_dir: str,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Merge heartbeat shard files into a single sorted ``part-0.parquet``.
+
+    Volume is tiny (~6 rows / 10 s / shard), so pandas is fine — no
+    DuckDB needed.  Dedup key is ``(ts_ms, source, shard_key)``.
+    """
+    log = logger or logging.getLogger("polymarket_pipeline")
+    if not os.path.exists(heartbeats_dir):
+        return
+
+    parquet_files = [f for f in os.listdir(heartbeats_dir) if f.endswith(".parquet")]
+    if not parquet_files or parquet_files == ["part-0.parquet"]:
+        return
+
+    data_root = os.path.dirname(os.path.abspath(heartbeats_dir))
+    with _write_lock(data_root):
+        parquet_files = [f for f in os.listdir(heartbeats_dir) if f.endswith(".parquet")]
+        if not parquet_files or parquet_files == ["part-0.parquet"]:
+            return
+
+        log.info("Consolidating heartbeats (%d files)...", len(parquet_files))
+        parquet_files.sort(
+            key=lambda f: (os.path.getmtime(os.path.join(heartbeats_dir, f)), f)
+        )
+        frames = []
+        for fname in parquet_files:
+            try:
+                df = pq.ParquetFile(os.path.join(heartbeats_dir, fname)).read().to_pandas()
+                frames.append(df)
+            except Exception:
+                continue
+
+        if not frames:
+            return
+
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged.drop_duplicates(subset=["ts_ms", "source", "shard_key"], keep="last")
+        merged = merged.sort_values("ts_ms").reset_index(drop=True)
+
+        consolidated_path = os.path.join(heartbeats_dir, "part-0.parquet")
+        tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
+        try:
+            table = pa.Table.from_pandas(merged, schema=HEARTBEATS_SCHEMA, preserve_index=False)
+            _check_disk_space(heartbeats_dir)
+            stamped = _stamp_schema_version(table)
+            pq.write_table(stamped, tmp_path, compression="zstd")
+            remove_errors: list[str] = []
+            for fname in parquet_files:
+                try:
+                    os.remove(os.path.join(heartbeats_dir, fname))
+                except OSError as exc:
+                    remove_errors.append(f"{fname}: {exc}")
+            if remove_errors:
+                log.warning(
+                    "  -> could not remove %d old heartbeat shard file(s): %s",
+                    len(remove_errors), "; ".join(remove_errors),
+                )
+            os.replace(tmp_path, consolidated_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+
+        log.info("  -> heartbeats consolidated: %d rows", len(merged))
+
+
 def consolidate_orderbook(
     *,
     orderbook_dir: str,
@@ -1540,11 +1678,20 @@ def consolidate_orderbook(
                 # result in memory/disk — the same OOM trigger that was
                 # already removed from consolidate_ticks.  Downstream
                 # queries can sort on read if needed.
+                #
+                # ``union_by_name=true`` tolerates old pre-v4 shard files
+                # that lack ``local_recv_ts_ns``; DuckDB fills NULL.  We
+                # still reference the column in SELECT so the output file
+                # always carries the v4 schema shape.
+                desc_res = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{files_sql}], union_by_name=true)").fetchall()
+                present_cols = {row[0] for row in desc_res}
+                local_recv_sql = "local_recv_ts_ns" if "local_recv_ts_ns" in present_cols else "NULL::BIGINT AS local_recv_ts_ns"
                 result = con.execute(f"""
                     COPY (
                         SELECT
                             ts_ms, market_id, token_id, outcome,
-                            best_bid, best_ask, best_bid_size, best_ask_size
+                            best_bid, best_ask, best_bid_size, best_ask_size,
+                            {local_recv_sql}
                         FROM read_parquet(
                             [{files_sql}],
                             union_by_name=true
@@ -1654,7 +1801,7 @@ def _write_partitioned_atomic(table: pa.Table, root_dir: str, partition_cols: li
                 if old_f.endswith(".parquet") and old_f not in new_files:
                     if old_f.startswith((
                         "ws_ticks_", "ws_prices_", "ws_culture_prices_",
-                        "ws_spot_", "ws_ob_", "ws_staging",
+                        "ws_spot_", "ws_ob_", "ws_hb_", "ws_staging",
                         "backfill_", "binance_history_",
                     )):
                         continue
@@ -1933,6 +2080,7 @@ def upload_to_huggingface(
     ticks_dir: str | None = None,
     spot_prices_dir: str | None = None,
     orderbook_dir: str | None = None,
+    heartbeats_dir: str | None = None,
     logger: logging.Logger | None = None,
     skip_consolidate: bool = False,
 ) -> None:
@@ -1977,6 +2125,8 @@ def upload_to_huggingface(
         consolidate_spot_prices(spot_prices_dir=spot_prices_dir, logger=log)
     if orderbook_dir and os.path.exists(orderbook_dir):
         consolidate_orderbook(orderbook_dir=orderbook_dir, logger=log)
+    if heartbeats_dir and os.path.exists(heartbeats_dir):
+        consolidate_heartbeats(heartbeats_dir=heartbeats_dir, logger=log)
 
     # Phase 2: Upload the entire data root in a single commit.
     # After consolidation the part-0.parquet files are stable — the WS
@@ -1992,6 +2142,7 @@ def upload_to_huggingface(
         "**/ws_culture_prices_*.parquet",
         "**/ws_spot_*.parquet",
         "**/ws_ob_*.parquet",
+        "**/ws_hb_*.parquet",
         # Backfill / history shards (consolidated into part-0.parquet)
         "**/backfill_*.parquet",
         "**/binance_history_*.parquet",

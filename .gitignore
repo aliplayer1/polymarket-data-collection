@@ -21,10 +21,16 @@ data-culture/
 test_output/
 test_output_parquet/
 test_data_15m/
+# Local runtime-test dirs produced when running the pipeline against live APIs
+# for validation (not part of the repo).
+runtime_test/
+runtime_test_hist/
 
 # -- Logs ----------------------------------------------------------------------
 *.log
 *.log.*
+# Log dir created by configure_logging() when --log-file is unset
+logs/
 
 # -- Misc formats produced during analysis -------------------------------------
 *.csv

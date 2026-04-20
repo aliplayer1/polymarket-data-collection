@@ -1,0 +1,21 @@
+[Unit]
+Description=Polymarket WebSocket Death Alert
+
+# Triggered via OnFailure= from other polymarket-*.service units.  This
+# is the systemd-only alert path — atexit/signal handlers inside the
+# pipeline cover graceful shutdowns, but StartLimit exhaustion or hard
+# crashes (OOM kill, SIGKILL) skip Python entirely.  This unit fires a
+# webhook in those cases so operators learn about the outage without
+# tailing journalctl.
+
+[Service]
+Type=oneshot
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket
+
+EnvironmentFile=/opt/polymarket/.env
+
+# Non-fatal: if the webhook endpoint is unreachable, the alert unit
+# itself just succeeds silently — we never want alerting-of-alerts.
+ExecStart=/opt/polymarket/.venv/bin/python -c "from polymarket_pipeline.alerts import send_alert; send_alert('systemd_failure', 'a polymarket service reached OnFailure — check journalctl')"

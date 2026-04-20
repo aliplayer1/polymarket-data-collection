@@ -1,50 +1,53 @@
-"""RTDSStreamPhase — maintains a live spot-price cache from Polymarket RTDS.
+"""RTDSStreamPhase — Polymarket RTDS live spot-price cache.
 
-Polymarket RTDS WebSocket: wss://ws-live-data.polymarket.com
+URL: wss://ws-live-data.polymarket.com
 Docs: https://docs.polymarket.com/market-data/websocket/rtds
 
-The phase populates two shared in-memory dicts:
+The phase maintains two live dict caches (``latest_prices`` for Binance,
+``chainlink_prices`` for the Chainlink oracle) that other components read
+without locking — both writers and readers run on the same asyncio event
+loop.  Every price update is also appended to ``spot_price_buffer`` for
+persistence to ``data/spot_prices/`` by the WS flush loop.
 
-- ``latest_prices`` — Binance spot prices used by WebSocketPhase to embed
-  into tick rows.  Same asyncio event loop → no lock needed.
-- ``chainlink_prices`` — Chainlink reference prices (resolution oracle).
+Connection architecture
+-----------------------
+Two independent WebSocket connections are maintained: one for
+``crypto_prices`` (Binance feed, ~1–5 Hz per symbol) and one for
+``crypto_prices_chainlink`` (~0.1 Hz per symbol).  A stall on either
+feed no longer takes the other down — this directly addresses the
+"btcusdt silent while Chainlink/ETH alive" failure class observed in
+production.
 
-It also buffers every received price update (Binance + Chainlink) into
-``spot_price_buffer``, which the caller drains periodically and flushes
-to the ``data/spot_prices/`` Parquet table.
+Each connection carries a data-level watchdog (:class:`DataHeartbeat`)
+that forces a reconnect when any subscribed symbol goes silent for
+longer than its per-feed threshold.  TCP-level keepalive + NODELAY are
+set directly on the socket after connect.
 
-Cache structures::
-
-    latest_prices: dict[str, tuple[float, int]]
-    #  key   = RTDS symbol  ("btcusdt", "ethusdt", "solusdt")
-    #  value = (spot_price_usdt, binance_timestamp_ms)
-
-    chainlink_prices: dict[str, tuple[float, int]]
-    #  key   = Chainlink symbol  ("btc/usd", "eth/usd")
-    #  value = (price_usd, chainlink_timestamp_ms)
-
-Subscription message — subscribes to BOTH Binance and Chainlink feeds:
-    {
-        "action": "subscribe",
-        "subscriptions": [
-            {"topic": "crypto_prices", "type": "*"},
-            {"topic": "crypto_prices_chainlink", "type": "*"}
-        ]
-    }
-
-Keep-alive: send plain "PING" text every 5 seconds.
-No authentication required for the crypto_prices topic.
+Backoff is exponential with multiplicative jitter and a 30 s cap; clean
+closes with prior data trigger an immediate reconnect for fast MTTR on
+Polymarket's routine ~2 h server-initiated drops.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from typing import Any
+import time
 
 import websockets
 
-from ..config import MAX_WS_RECONNECT_DELAY_SECONDS
+from ..config import (
+    WS_STALENESS_RTDS_BINANCE_S,
+    WS_STALENESS_RTDS_CHAINLINK_S,
+    WS_WATCHDOG_CHECK_INTERVAL_S,
+    WS_WATCHDOG_GRACE_PERIOD_S,
+)
+from .ws_messages import parse_rtds_update, rtds_subscribe_payload
+from .ws_watchdog import (
+    DataHeartbeat,
+    DropOldestBuffer,
+    configure_tcp_socket,
+    jittered_backoff,
+)
 
 _RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 _PING_INTERVAL_SECONDS = 5.0
@@ -63,181 +66,238 @@ CRYPTO_TO_RTDS_SYMBOL: dict[str, str] = {
 }
 
 
+class _WatchdogStale(Exception):
+    """Raised by the per-session watchdog to force reconnect."""
+
+
 class RTDSStreamPhase:
-    """Populates shared price caches and a persistent buffer from Polymarket RTDS.
+    """Populate shared price caches + persistent buffer from Polymarket RTDS.
 
     Usage::
 
         binance_cache: dict[str, tuple[float, int]] = {}
         chainlink_cache: dict[str, tuple[float, int]] = {}
         spot_buffer: list[dict] = []
-        phase = RTDSStreamPhase(binance_cache, chainlink_cache, spot_buffer, logger=log)
-        task  = asyncio.create_task(phase.run())
+        heartbeats: dict[str, DataHeartbeat] = {}
+        phase = RTDSStreamPhase(
+            binance_cache, chainlink_cache, spot_buffer,
+            heartbeat_registry=heartbeats, logger=log,
+        )
+        task = asyncio.create_task(phase.run())
 
-    Other tasks can then read ``binance_cache.get("btcusdt")`` to obtain
-    ``(spot_price_usdt, binance_ts_ms)`` or ``None``.
-
-    The ``spot_price_buffer`` accumulates rows for the spot_prices Parquet table.
-    The caller is responsible for draining and flushing it periodically.
+    ``heartbeat_registry`` is optional.  When provided, the phase registers
+    one :class:`DataHeartbeat` per feed under keys ``"rtds_binance"`` and
+    ``"rtds_chainlink"`` so the WS flush loop can emit heartbeat rows.
     """
 
     def __init__(
         self,
         latest_prices: dict[str, tuple[float, int]],
         chainlink_prices: dict[str, tuple[float, int]] | None = None,
-        spot_price_buffer: list[dict[str, Any]] | None = None,
+        spot_price_buffer: DropOldestBuffer | None = None,
         *,
+        heartbeat_registry: dict[str, DataHeartbeat] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         self.latest_prices = latest_prices
         self.chainlink_prices = chainlink_prices if chainlink_prices is not None else {}
-        self.spot_price_buffer = spot_price_buffer if spot_price_buffer is not None else []
+        # Default to a 10 000-row drop-oldest ring if the caller didn't
+        # pass one — keeps stand-alone instantiation from the test suite
+        # working without depending on WebSocketPhase config.
+        self.spot_price_buffer: DropOldestBuffer = (
+            spot_price_buffer if spot_price_buffer is not None else DropOldestBuffer(10_000)
+        )
         self.logger = logger or logging.getLogger("polymarket_pipeline.rtds")
+        self._heartbeat_registry = heartbeat_registry
+
+        # Per-symbol heartbeats — one DataHeartbeat per feed, keyed by symbol.
+        self._binance_hb = DataHeartbeat(
+            stale_after={s: WS_STALENESS_RTDS_BINANCE_S for s in _SUPPORTED_BINANCE_SYMBOLS},
+            grace_period_s=WS_WATCHDOG_GRACE_PERIOD_S,
+        )
+        self._chainlink_hb = DataHeartbeat(
+            stale_after={s: WS_STALENESS_RTDS_CHAINLINK_S for s in _SUPPORTED_CHAINLINK_SYMBOLS},
+            grace_period_s=WS_WATCHDOG_GRACE_PERIOD_S,
+        )
+        if self._heartbeat_registry is not None:
+            self._heartbeat_registry["rtds_binance"] = self._binance_hb
+            self._heartbeat_registry["rtds_chainlink"] = self._chainlink_hb
 
     # ------------------------------------------------------------------
-    # Internal: single connection attempt
+    # Per-feed connection
     # ------------------------------------------------------------------
 
-    async def _run_connection(self) -> bool:
-        """Connect, subscribe, and update caches until disconnected.
+    async def _run_feed(
+        self,
+        feed_name: str,
+        topic: str,
+        supported_symbols: frozenset[str],
+        hb: DataHeartbeat,
+        cache: dict[str, tuple[float, int]],
+        source_label: str,
+    ) -> None:
+        """One independent RTDS WebSocket connection for a single topic.
 
-        Returns True if at least one valid price update was received during
-        this connection, False otherwise (used to decide whether to reset the
-        reconnect backoff counter).
+        ``feed_name`` is used for log prefixes.  ``source_label`` is the
+        ``source`` column value written into ``spot_price_buffer``.
         """
-        received_data = False
+        reconnect_attempts = 0
 
-        # Subscribe to both Binance and Chainlink feeds.
-        # Using type "*" (not "update") ensures we receive both snapshot and
-        # update messages — filtered mode returns only a snapshot with no
-        # live updates for some topic configurations.
-        subscribe_msg = json.dumps({
-            "action": "subscribe",
-            "subscriptions": [
-                {"topic": "crypto_prices", "type": "*"},
-                {"topic": "crypto_prices_chainlink", "type": "*"},
-            ],
-        })
-
-        async with websockets.connect(
-            _RTDS_WS_URL,
-            max_size=10 * 1024 * 1024,  # 10MB cap to prevent OOM from oversized messages
-            open_timeout=10,          # fail fast on DNS/TCP hangs
-            ping_interval=None,       # we manage pings manually per RTDS docs
-        ) as ws:
-            self.logger.info("RTDS: connected, subscribing to Binance + Chainlink feeds")
-            await ws.send(subscribe_msg)
-
-            async def _ping_loop() -> None:
-                while True:
-                    await asyncio.sleep(_PING_INTERVAL_SECONDS)
-                    try:
-                        await ws.send("PING")
-                    except Exception:
-                        break  # outer recv will raise and trigger reconnect
-
-            ping_task = asyncio.create_task(_ping_loop())
+        while True:
+            session_started = time.monotonic()
+            prior_data = False
             try:
-                while True:
-                    raw = await ws.recv()
+                async with websockets.connect(
+                    _RTDS_WS_URL,
+                    max_size=10 * 1024 * 1024,
+                    open_timeout=10,
+                    close_timeout=5,
+                    ping_interval=None,  # we manage PINGs manually per RTDS docs
+                ) as ws:
+                    configure_tcp_socket(ws, self.logger)
+                    hb.reset()
+                    self.logger.info("RTDS[%s]: connected, subscribing", feed_name)
+                    await ws.send(rtds_subscribe_payload(topic))
 
-                    # RTDS responds to PING with "PONG"
-                    if raw == "PONG":
-                        continue
+                    async def _ping_loop() -> None:
+                        while True:
+                            await asyncio.sleep(_PING_INTERVAL_SECONDS)
+                            try:
+                                await ws.send("PING")
+                            except Exception:
+                                return
 
+                    async def _recv_loop() -> None:
+                        nonlocal prior_data
+                        while True:
+                            raw = await ws.recv()
+                            update = parse_rtds_update(raw)
+                            if update is None:
+                                continue
+                            if update.topic != topic:
+                                continue
+                            if update.symbol not in supported_symbols:
+                                continue
+                            cache[update.symbol] = (update.price, update.ts_ms)
+                            self.spot_price_buffer.append({
+                                "ts_ms": update.ts_ms,
+                                "symbol": update.symbol,
+                                "price": update.price,
+                                "source": source_label,
+                            })
+                            hb.mark(update.symbol)
+                            prior_data = True
+
+                    async def _watchdog_loop() -> None:
+                        while True:
+                            await asyncio.sleep(WS_WATCHDOG_CHECK_INTERVAL_S)
+                            stale = hb.stale_keys()
+                            if stale:
+                                keys_str = ", ".join(f"{k}({age:.1f}s)" for k, age in stale)
+                                self.logger.warning(
+                                    "RTDS[%s]: stale symbols (%s) — forcing reconnect",
+                                    feed_name, keys_str,
+                                )
+                                raise _WatchdogStale(keys_str)
+
+                    ping_task = asyncio.create_task(_ping_loop())
+                    recv_task = asyncio.create_task(_recv_loop())
+                    watch_task = asyncio.create_task(_watchdog_loop())
                     try:
-                        msg: dict[str, Any] = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
+                        done, _ = await asyncio.wait(
+                            {recv_task, watch_task},
+                            return_when=asyncio.FIRST_EXCEPTION,
+                        )
+                    finally:
+                        for t in (ping_task, recv_task, watch_task):
+                            if not t.done():
+                                t.cancel()
+                        await asyncio.gather(
+                            ping_task, recv_task, watch_task,
+                            return_exceptions=True,
+                        )
+                    for task in done:
+                        exc = task.exception()
+                        if exc is None:
+                            continue
+                        if isinstance(exc, _WatchdogStale):
+                            raise exc
+                        if isinstance(exc, websockets.exceptions.ConnectionClosedOK):
+                            break
+                        raise exc
 
-                    msg_type = msg.get("type")
-                    if msg_type != "update":
-                        continue
+                # Clean exit from `async with`.  Fast reconnect when data
+                # was flowing; back off only when the server closed us out
+                # without ever sending anything.
+                session_duration = time.monotonic() - session_started
+                if prior_data:
+                    reconnect_attempts = 0
+                    self.logger.info(
+                        "RTDS[%s]: clean close after %.0fs session — immediate reconnect",
+                        feed_name, session_duration,
+                    )
+                    continue
+                delay = jittered_backoff(reconnect_attempts)
+                reconnect_attempts += 1
+                self.logger.warning(
+                    "RTDS[%s]: clean close with no data — sleeping %.1fs",
+                    feed_name, delay,
+                )
+                await asyncio.sleep(delay)
 
-                    payload = msg.get("payload")
-                    if not isinstance(payload, dict):
-                        continue
-
-                    topic = msg.get("topic", "")
-                    symbol = str(payload.get("symbol", "")).lower()
-                    value = payload.get("value")
-                    timestamp_ms = payload.get("timestamp")
-
-                    if value is None or timestamp_ms is None:
-                        continue
-
-                    try:
-                        price = float(value)
-                        ts_ms = int(timestamp_ms)
-                    except (ValueError, TypeError):
-                        continue
-
-                    # Validate price
-                    if price <= 0.0 or not (price == price):  # NaN check
-                        continue
-
-                    if topic == "crypto_prices" and symbol in _SUPPORTED_BINANCE_SYMBOLS:
-                        # Binance spot price
-                        self.latest_prices[symbol] = (price, ts_ms)
-                        self.spot_price_buffer.append({
-                            "ts_ms": ts_ms,
-                            "symbol": symbol,
-                            "price": price,
-                            "source": "binance",
-                        })
-                        received_data = True
-
-                    elif topic == "crypto_prices_chainlink" and symbol in _SUPPORTED_CHAINLINK_SYMBOLS:
-                        # Chainlink reference price (resolution oracle)
-                        self.chainlink_prices[symbol] = (price, ts_ms)
-                        self.spot_price_buffer.append({
-                            "ts_ms": ts_ms,
-                            "symbol": symbol,
-                            "price": price,
-                            "source": "chainlink",
-                        })
-                        received_data = True
-
-            finally:
-                ping_task.cancel()
-                await asyncio.gather(ping_task, return_exceptions=True)
-
-        return received_data
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                return
+            except _WatchdogStale as exc:
+                # Stale data means the prior session WAS healthy up to
+                # ``stale_after`` seconds ago → reset backoff.
+                reconnect_attempts = 0
+                delay = jittered_backoff(0)
+                self.logger.warning(
+                    "RTDS[%s]: watchdog stale (%s). Reconnecting in %.1fs",
+                    feed_name, exc, delay,
+                )
+                await asyncio.sleep(delay)
+            except Exception as exc:
+                delay = jittered_backoff(reconnect_attempts)
+                reconnect_attempts += 1
+                self.logger.warning(
+                    "RTDS[%s]: %s — %s. Reconnecting in %.1fs",
+                    feed_name, type(exc).__name__, exc, delay,
+                )
+                await asyncio.sleep(delay)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        """Run the RTDS cache updater indefinitely (until task is cancelled)."""
-        reconnect_attempts = 0
-
-        while True:
-            try:
-                received_data = await self._run_connection()
-                # Only reset backoff if we received real data — prevents tight
-                # reconnect loops when the server keeps cleanly closing.
-                if received_data:
-                    reconnect_attempts = 0
-                else:
-                    reconnect_delay = min(
-                        5 * (2 ** reconnect_attempts), MAX_WS_RECONNECT_DELAY_SECONDS
-                    )
-                    reconnect_attempts += 1
-                    self.logger.warning(
-                        "RTDS: clean close with no data. Reconnecting in %.1fs...",
-                        reconnect_delay,
-                    )
-                    await asyncio.sleep(reconnect_delay)
-            except (asyncio.CancelledError, KeyboardInterrupt):
-                return
-            except Exception as exc:
-                reconnect_delay = min(
-                    5 * (2 ** reconnect_attempts), MAX_WS_RECONNECT_DELAY_SECONDS
-                )
-                reconnect_attempts += 1
-                self.logger.warning(
-                    "RTDS: %s — %s. Reconnecting in %.1fs...",
-                    type(exc).__name__, exc, reconnect_delay,
-                )
-                await asyncio.sleep(reconnect_delay)
+        """Run both RTDS feeds concurrently until cancelled."""
+        binance_task = asyncio.create_task(
+            self._run_feed(
+                feed_name="binance",
+                topic="crypto_prices",
+                supported_symbols=_SUPPORTED_BINANCE_SYMBOLS,
+                hb=self._binance_hb,
+                cache=self.latest_prices,
+                source_label="binance",
+            )
+        )
+        chainlink_task = asyncio.create_task(
+            self._run_feed(
+                feed_name="chainlink",
+                topic="crypto_prices_chainlink",
+                supported_symbols=_SUPPORTED_CHAINLINK_SYMBOLS,
+                hb=self._chainlink_hb,
+                cache=self.chainlink_prices,
+                source_label="chainlink",
+            )
+        )
+        try:
+            await asyncio.gather(binance_task, chainlink_task)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            for t in (binance_task, chainlink_task):
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(binance_task, chainlink_task, return_exceptions=True)

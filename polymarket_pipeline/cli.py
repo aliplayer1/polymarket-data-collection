@@ -1,6 +1,9 @@
 import argparse
+import atexit
 import logging
+import logging.handlers
 import os
+import queue
 from os import PathLike
 
 from dotenv import load_dotenv
@@ -8,18 +11,97 @@ from dotenv import load_dotenv
 load_dotenv()  # reads .env into os.environ before settings/config are imported
 
 
+# Bounded queue capacity for the async log handler.  Log records that
+# would overflow this queue are dropped at the emitter — we prefer
+# dropping log lines over stalling the WS recv loop.
+_LOG_QUEUE_MAXSIZE = 10_000
+
+# Reconnect-log retention: 10 MB × 5 files ≈ 50 MB max on disk.  Long
+# enough to cover a week of healthy operation plus a burst incident.
+_RECONNECT_LOG_MAX_BYTES = 10 * 1024 * 1024
+_RECONNECT_LOG_BACKUPS = 5
+
+
+def _install_async_wrapper(real_handlers: list[logging.Handler]) -> logging.handlers.QueueListener:
+    """Move slow I/O off the emitter thread via QueueHandler + QueueListener.
+
+    The recv loop runs on the main asyncio thread; synchronous stderr /
+    disk writes from ``logger.info(...)`` during heavy logging can stall
+    the loop for milliseconds.  QueueHandler does only a ``queue.put``
+    (sub-µs); the listener thread drains and invokes the real handlers
+    off-loop.
+
+    Returns the listener so the caller can register an atexit stop hook.
+    """
+    log_queue: queue.Queue = queue.Queue(maxsize=_LOG_QUEUE_MAXSIZE)
+    queue_handler = logging.handlers.QueueHandler(log_queue)
+    listener = logging.handlers.QueueListener(
+        log_queue, *real_handlers, respect_handler_level=True,
+    )
+    listener.start()
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.addHandler(queue_handler)
+    root.setLevel(logging.INFO)
+    return listener
+
+
+def _configure_reconnect_log(log_dir: str) -> None:
+    """Attach a rotating jsonl handler to ``polymarket_pipeline.ws_reconnects``.
+
+    Keeps reconnect events out of the main pipeline log (they would be
+    noisy during incidents) and makes them trivially greppable:
+    ``jq '.' < ws_reconnects.jsonl``.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, "ws_reconnects.jsonl")
+    handler = logging.handlers.RotatingFileHandler(
+        path,
+        maxBytes=_RECONNECT_LOG_MAX_BYTES,
+        backupCount=_RECONNECT_LOG_BACKUPS,
+    )
+    # Raw JSON — the message itself is already json.dumps(payload) from
+    # the emitter, so we don't want level/timestamp prefixes.
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    reconnect_logger = logging.getLogger("polymarket_pipeline.ws_reconnects")
+    reconnect_logger.propagate = False
+    for h in list(reconnect_logger.handlers):
+        reconnect_logger.removeHandler(h)
+    reconnect_logger.addHandler(handler)
+    reconnect_logger.setLevel(logging.INFO)
+
+
 def configure_logging(log_file: str | PathLike[str] | None = None) -> logging.Logger:
+    """Set up async-wrapped logging + the dedicated reconnect log.
+
+    ``log_file`` controls where the main pipeline log goes.  The
+    reconnect jsonl lands in the same directory (or ``./logs/`` when no
+    log file is configured).
+    """
     fmt = "%(asctime)s | %(levelname)s | %(message)s"
-    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    real_handlers: list[logging.Handler] = [logging.StreamHandler()]
+    log_dir: str
     if log_file:
         log_path = os.fspath(log_file)
-        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-        handlers.append(logging.FileHandler(log_path))
-    logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
+        log_dir = os.path.dirname(os.path.abspath(log_path)) or "."
+        os.makedirs(log_dir, exist_ok=True)
+        real_handlers.append(logging.FileHandler(log_path))
+    else:
+        log_dir = os.path.abspath("logs")
+    for handler in real_handlers:
+        handler.setFormatter(logging.Formatter(fmt))
+
+    listener = _install_async_wrapper(real_handlers)
+    atexit.register(listener.stop)
+
+    _configure_reconnect_log(log_dir)
+
     return logging.getLogger("polymarket_pipeline")
 
 
 def main() -> None:
+    from .alerts import install_death_alerts, send_alert_async
     from .pipeline import PolymarketDataPipeline
     from .settings import PipelineRunOptions, RuntimeSettings
 
@@ -153,6 +235,14 @@ def main() -> None:
     run_options = PipelineRunOptions.from_args(args)
 
     logger = configure_logging(runtime_settings.log_file_str)
+
+    # Install death alerts immediately after logging is set up, on the main
+    # thread (``signal.signal`` rejects secondary threads on POSIX).  This
+    # ensures SIGTERM from ``systemctl stop`` surfaces as a webhook even
+    # if the pipeline dies before the WS phase starts.
+    install_death_alerts()
+    send_alert_async("boot", "process booted")
+
     try:
         if run_options.upload_only:
             from .storage import upload_to_huggingface
@@ -166,6 +256,7 @@ def main() -> None:
                 ticks_dir=str(paths.ticks_dir),
                 spot_prices_dir=str(paths.spot_prices_dir),
                 orderbook_dir=str(paths.orderbook_dir),
+                heartbeats_dir=str(paths.heartbeats_dir),
                 logger=logger,
             )
 

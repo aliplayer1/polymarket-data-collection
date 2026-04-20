@@ -6,6 +6,7 @@ from polymarket_pipeline.parsing import (
     extract_crypto,
     extract_timeframe,
     normalize_timeframe_input,
+    parse_iso_timestamp,
 )
 
 
@@ -83,3 +84,48 @@ def test_combined(question: str, tf: str, crypto: str) -> None:
 ])
 def test_normalize_timeframe_input(raw: str, expected: str) -> None:
     assert normalize_timeframe_input(raw) == expected
+
+
+# ---------------------------------------------------------------------------
+# parse_iso_timestamp — Gamma emits non-standard formats; regression guards
+# ---------------------------------------------------------------------------
+
+# The canonical epoch for 2026-04-20 20:35:26 UTC.  Reused across cases.
+_EPOCH_2026_04_20 = 1776717326
+
+
+@pytest.mark.parametrize("value,expected", [
+    # Gamma ``closedTime`` quirk: space separator + bare 2-digit offset.
+    # Python 3.10's ``fromisoformat`` rejects this natively — the parser
+    # must normalise before delegating.
+    ("2026-04-20 20:35:26+00",        _EPOCH_2026_04_20),
+    # Gamma ``closedTime`` with non-UTC bare offset
+    ("2026-04-20 15:35:26-05",        _EPOCH_2026_04_20),
+    # Standard ISO + explicit offset
+    ("2026-04-20T20:35:26+00:00",     _EPOCH_2026_04_20),
+    # Z form
+    ("2026-04-20T20:35:26Z",          _EPOCH_2026_04_20),
+    # Fractional seconds — 3 digits (standard, accepted by Python)
+    ("2026-04-20T20:35:26.123Z",      _EPOCH_2026_04_20),
+    # 5 fractional digits (Gamma ``createdAt`` emits this; Python 3.10 rejects)
+    ("2026-04-20T20:35:26.12345Z",    _EPOCH_2026_04_20),
+    # 7 fractional digits (truncate beyond microsecond resolution)
+    ("2026-04-20T20:35:26.1234567Z",  _EPOCH_2026_04_20),
+    # Date-only
+    ("2026-04-20",                    1776643200),
+])
+def test_parse_iso_timestamp_accepts_gamma_formats(value: str, expected: int) -> None:
+    # The parser may or may not treat naive date-only strings as midnight
+    # UTC vs. midnight local; assert roughly-correct epoch for the date-only
+    # case rather than an exact match.
+    got = parse_iso_timestamp(value)
+    if value == "2026-04-20":
+        assert got is not None
+        assert abs(got - expected) < 86_400  # within a day
+    else:
+        assert got == expected, f"{value!r}: got {got}, expected {expected}"
+
+
+@pytest.mark.parametrize("value", [None, "", "  ", "not a date", "2026-13-45"])
+def test_parse_iso_timestamp_returns_none_for_invalid(value) -> None:
+    assert parse_iso_timestamp(value) is None

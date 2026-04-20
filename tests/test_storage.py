@@ -20,11 +20,13 @@ from polymarket_pipeline.storage import (
     _write_parquet_atomic,
     _write_partitioned_atomic,
     append_ws_culture_prices_staged,
+    append_ws_heartbeats_staged,
     append_ws_orderbook_staged,
     append_ws_prices_staged,
     append_ws_spot_prices_staged,
     append_ws_ticks_staged,
     consolidate_culture_prices,
+    consolidate_heartbeats,
     consolidate_orderbook,
     consolidate_prices,
     consolidate_spot_prices,
@@ -884,6 +886,57 @@ def test_persist_culture_markets_roundtrip_new_fields(tmp_path):
     assert int(row["bucket_index"]) == 13
     assert row["bucket_label"] == "260-279"
     assert int(row["closed_ts"]) == 1744041605
+
+
+def test_schema_version_is_v4() -> None:
+    # Sentinel test: bumping the schema version is a deliberate act that
+    # downstream consumers depend on, so fail loudly if it regresses.
+    assert STORAGE_SCHEMA_VERSION == 4
+
+
+def test_heartbeats_append_and_consolidate_roundtrip(tmp_path):
+    hb_dir = str(tmp_path / "heartbeats")
+    rows1 = [
+        {"ts_ms": 1000, "source": "clob_ws", "shard_key": "0",
+         "event_type": "price_change", "last_event_age_ms": 500},
+        {"ts_ms": 1010, "source": "rtds_binance", "shard_key": "btcusdt",
+         "event_type": "btcusdt", "last_event_age_ms": 100},
+    ]
+    rows2 = [
+        {"ts_ms": 2000, "source": "clob_ws", "shard_key": "0",
+         "event_type": "price_change", "last_event_age_ms": 700},
+    ]
+    append_ws_heartbeats_staged(rows1, heartbeats_dir=hb_dir)
+    # Next shard has a later monotonic timestamp
+    time.sleep(0.01)
+    append_ws_heartbeats_staged(rows2, heartbeats_dir=hb_dir)
+
+    shards = [f for f in os.listdir(hb_dir) if f.endswith(".parquet")]
+    assert len(shards) == 2, shards
+    consolidate_heartbeats(heartbeats_dir=hb_dir)
+    after = [f for f in os.listdir(hb_dir) if f.endswith(".parquet")]
+    assert after == ["part-0.parquet"]
+
+    df = pq.ParquetFile(os.path.join(hb_dir, "part-0.parquet")).read().to_pandas()
+    assert len(df) == 3
+    assert set(df["source"]) == {"clob_ws", "rtds_binance"}
+
+
+def test_heartbeats_empty_rows_noop(tmp_path):
+    hb_dir = str(tmp_path / "heartbeats")
+    append_ws_heartbeats_staged([], heartbeats_dir=hb_dir)
+    # Directory should not exist (no rows, no side-effect)
+    assert not os.path.exists(hb_dir)
+
+
+def test_ticks_schema_has_local_recv_ts_ns():
+    from polymarket_pipeline.storage import TICKS_SCHEMA
+    assert "local_recv_ts_ns" in TICKS_SCHEMA.names
+
+
+def test_orderbook_schema_has_local_recv_ts_ns():
+    from polymarket_pipeline.storage import ORDERBOOK_SCHEMA
+    assert "local_recv_ts_ns" in ORDERBOOK_SCHEMA.names
 
 
 def test_persist_culture_markets_backcompat_missing_new_fields(tmp_path):

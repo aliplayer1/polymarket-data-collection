@@ -108,13 +108,16 @@ sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/pip" install --upgrade pip wheel -q
 sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/pip" install -r "$APP_DIR/requirements.txt" -q
 
 # ── 7. systemd service files ──────────────────────────────────────────────────
-cp "$APP_DIR/deploy/polymarket-websocket.service"   /etc/systemd/system/
-cp "$APP_DIR/deploy/polymarket-historical.service"  /etc/systemd/system/
-cp "$APP_DIR/deploy/polymarket-historical.timer"    /etc/systemd/system/
-cp "$APP_DIR/deploy/polymarket-upload.service"      /etc/systemd/system/
-cp "$APP_DIR/deploy/polymarket-upload.timer"        /etc/systemd/system/
-cp "$APP_DIR/deploy/polymarket-restart.service"     /etc/systemd/system/
-cp "$APP_DIR/deploy/polymarket-restart.timer"       /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-websocket.service"        /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-websocket-alert.service"  /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-historical.service"       /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-historical.timer"         /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-upload.service"           /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-upload.timer"             /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-restart.service"          /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-restart.timer"            /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-gap-audit.service"        /etc/systemd/system/
+cp "$APP_DIR/deploy/polymarket-gap-audit.timer"          /etc/systemd/system/
 systemctl daemon-reload
 
 # ── 8. Check credentials before proceeding ────────────────────────────────────
@@ -153,6 +156,7 @@ systemctl enable --now polymarket-websocket.service
 systemctl enable --now polymarket-historical.timer
 systemctl enable --now polymarket-upload.timer
 systemctl enable --now polymarket-restart.timer
+systemctl enable --now polymarket-gap-audit.timer
 
 echo ""
 echo "════════════════════════════════════════════════════════════════════"

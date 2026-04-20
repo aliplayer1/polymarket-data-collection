@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Polymarket WS gap audit daily
+
+[Timer]
+# Daily at 06:30 UTC — after the 06:00 historical + consolidation run so
+# the audit sees freshly consolidated heartbeat data.
+OnCalendar=*-*-* 06:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

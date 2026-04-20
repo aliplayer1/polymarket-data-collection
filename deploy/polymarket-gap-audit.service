@@ -1,0 +1,26 @@
+[Unit]
+Description=Polymarket WS Gap Audit
+After=network-online.target
+Wants=network-online.target
+# Emit a one-shot death webhook if the scanner itself crashes — must be
+# in [Unit], not [Service].
+OnFailure=polymarket-websocket-alert.service
+
+[Service]
+Type=oneshot
+User=polymarket
+Group=polymarket
+WorkingDirectory=/opt/polymarket
+
+EnvironmentFile=/opt/polymarket/.env
+
+# Scan heartbeats + reconnect log, emit .gap_manifest.json.  Alert on
+# findings (non-zero exit) so operators see sustained degradation even
+# if the individual webhooks (buffer_drop, reconnect_burst) were missed.
+ExecStart=/opt/polymarket/.venv/bin/python /opt/polymarket/scripts/audit_ws_gaps.py \
+    --data-dir /opt/polymarket/data \
+    --log-dir /var/log/polymarket \
+    --alert
+
+[Install]
+WantedBy=multi-user.target

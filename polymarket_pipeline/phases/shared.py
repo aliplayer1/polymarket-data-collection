@@ -17,6 +17,7 @@ class PipelinePaths:
     ticks_dir: Path
     spot_prices_dir: Path
     orderbook_dir: Path
+    heartbeats_dir: Path
 
     @classmethod
     def from_root(cls, root: str | Path) -> "PipelinePaths":
@@ -28,6 +29,7 @@ class PipelinePaths:
             ticks_dir=data_dir / "ticks",
             spot_prices_dir=data_dir / "spot_prices",
             orderbook_dir=data_dir / "orderbook",
+            heartbeats_dir=data_dir / "heartbeats",
         )
 
     def ensure_data_dir(self) -> None:
@@ -122,6 +124,7 @@ def build_binary_tick_row(
     source: str,
     spot_price_usdt: float | None = None,
     spot_price_ts_ms: int | None = None,
+    local_recv_ts_ns: int | None = None,
 ) -> dict[str, Any]:
     return {
         "timestamp_ms": timestamp_ms,
@@ -139,6 +142,7 @@ def build_binary_tick_row(
         "source": source,
         "spot_price_usdt": spot_price_usdt,
         "spot_price_ts_ms": spot_price_ts_ms,
+        "local_recv_ts_ns": local_recv_ts_ns,
         "category": market.category,
     }
 
@@ -216,6 +220,7 @@ def build_orderbook_row(
     best_ask: float,
     best_bid_size: float,
     best_ask_size: float,
+    local_recv_ts_ns: int | None = None,
 ) -> dict[str, Any]:
     """Build a single row for the orderbook Parquet table."""
     return {
@@ -229,4 +234,5 @@ def build_orderbook_row(
         "best_ask": best_ask,
         "best_bid_size": best_bid_size,
         "best_ask_size": best_ask_size,
+        "local_recv_ts_ns": local_recv_ts_ns,
     }

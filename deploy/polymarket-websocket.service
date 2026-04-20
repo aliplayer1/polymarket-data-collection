@@ -2,6 +2,10 @@
 Description=Polymarket WebSocket Live Tick Stream
 After=network-online.target
 Wants=network-online.target
+# Alert when systemd gives up restarting — the in-process signal /
+# atexit hooks only cover graceful shutdowns, not StartLimit exhaustion
+# or OOM kills.
+OnFailure=polymarket-websocket-alert.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 

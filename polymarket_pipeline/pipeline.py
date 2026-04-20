@@ -95,13 +95,23 @@ class PolymarketDataPipeline:
         # Structure: {"btcusdt": (67234.50, 1710000000087), ...}
         self._spot_price_cache: dict[str, tuple[float, int]] = {}
         self._chainlink_price_cache: dict[str, tuple[float, int]] = {}
-        # Spot price buffer: RTDS appends rows, WS flush loop drains to Parquet.
-        self._spot_price_buffer: list[dict] = []
+        # Spot price buffer: RTDS appends rows, WS flush loop drains to
+        # Parquet.  Bounded drop-oldest ring absorbs sustained RTDS rates
+        # (~30 updates/s combined) without unbounded memory growth if the
+        # flush loop stalls.
+        from .config import WS_SPOT_BUFFER_MAX
+        from .phases.ws_watchdog import DataHeartbeat, DropOldestBuffer  # local to avoid cycle
+        self._spot_price_buffer: DropOldestBuffer = DropOldestBuffer(WS_SPOT_BUFFER_MAX)
+        # Shared heartbeat registry: CLOB shards + RTDS feeds each register
+        # their DataHeartbeat instances so the WS flush loop can emit
+        # heartbeat rows for the full WebSocket surface area.
+        self._heartbeat_registry: dict[str, DataHeartbeat] = {}
 
         self.rtds_stream_phase = RTDSStreamPhase(
             self._spot_price_cache,
             self._chainlink_price_cache,
             self._spot_price_buffer,
+            heartbeat_registry=self._heartbeat_registry,
             logger=self.logger,
         )
         self.websocket_phase = WebSocketPhase(
@@ -111,6 +121,7 @@ class PolymarketDataPipeline:
             paths=default_paths,
             spot_price_cache=self._spot_price_cache,
             spot_price_buffer=self._spot_price_buffer,
+            heartbeat_registry=self._heartbeat_registry,
         )
 
     def _set_paths(self, paths: PipelinePaths) -> None:
@@ -623,6 +634,7 @@ class PolymarketDataPipeline:
                     ticks_dir=self._parquet_ticks_dir,
                     spot_prices_dir=str(self.paths.spot_prices_dir),
                     orderbook_dir=str(self.paths.orderbook_dir),
+                    heartbeats_dir=str(self.paths.heartbeats_dir),
                     logger=self.logger,
                     skip_consolidate=True,
                 )
