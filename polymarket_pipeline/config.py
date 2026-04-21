@@ -132,6 +132,25 @@ WS_HEARTBEAT_INTERVAL_S: float = 10.0
 WS_RECONNECT_BURST_THRESHOLD: int = 5
 WS_RECONNECT_BURST_WINDOW_S: float = 60.0
 
+# --- Subgraph tick source (replaces Etherscan/RPC OrderFilled scraping) ---
+# Primary: Goldsky's public hosting of Polymarket's official orderbook-subgraph.
+# No API key required; responds <300ms on typical queries.
+SUBGRAPH_URL_PRIMARY: str = (
+    "https://api.goldsky.com/api/public/"
+    "project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
+)
+# Fallback: The Graph decentralized network — same subgraph manifest.
+# ``{api_key}`` is substituted from the ``SUBGRAPH_API_KEY`` env var at
+# runtime.  Fallback is disabled when no API key is available.
+SUBGRAPH_URL_FALLBACK: str = (
+    "https://gateway.thegraph.com/api/{api_key}/subgraphs/id/"
+    "Bx1W4S7kDVxs9gC3s2G6DS8kdNBJNVhMviCtin2DiBp"
+)
+SUBGRAPH_PAGE_SIZE: int = 1000           # subgraph server-side max
+SUBGRAPH_REQUEST_INTERVAL_S: float = 0.2 # 5 req/s polite throttle (global)
+SUBGRAPH_TIMEOUT_S: int = 30
+SUBGRAPH_MAX_RETRIES: int = 3            # per endpoint before failover
+
 FILTER_KEYWORD = _DEFAULT_MARKET_DEFINITION.question_keywords[0]
 CRYPTO_ALIASES = {}
 for _d in _MARKET_DEFINITIONS:

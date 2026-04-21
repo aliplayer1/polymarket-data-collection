@@ -58,13 +58,8 @@ class PolymarketDataPipeline:
             last_trade_price_provider or ClobLastTradePriceProvider(self._clob_client)
         )
         self.tick_provider = tick_provider
-        if self.tick_provider is None and (self.settings.rpc_urls or self.settings.polygonscan_key):
-            self.tick_provider = PolygonTickFetcher(
-                rpc_url=self.settings.rpc_urls,
-                polygonscan_key=self.settings.polygonscan_key,
-                logger=self.logger,
-                prefer_rpc=self.settings.prefer_rpc,
-            )
+        if self.tick_provider is None:
+            self.tick_provider = self._build_tick_provider()
 
         default_paths = self.settings.resolve_paths(PipelineRunOptions())
         self.paths = default_paths
@@ -123,6 +118,57 @@ class PolymarketDataPipeline:
             spot_price_buffer=self._spot_price_buffer,
             heartbeat_registry=self._heartbeat_registry,
         )
+
+    def _build_tick_provider(self):
+        """Construct the tick provider per ``PM_BACKFILL_MODE``.
+
+        - ``subgraph`` (default): new Polymarket orderbook-subgraph path.
+          Fast, rate-limit-free, single query per window.  Uses
+          ``SUBGRAPH_API_KEY`` env var for optional fallback to The
+          Graph network when the primary (Goldsky) is unreachable.
+        - ``rpc`` (legacy fallback): the original Etherscan/RPC
+          ``eth_getLogs`` path.  Kept as a dormant rollback option for
+          ~2 weeks post-deploy.  Requires ``POLYGON_RPC_URL`` and/or
+          ``POLYGONSCAN_API_KEY``.
+        - any other value: tick backfill disabled (phase no-ops).
+        """
+        mode = os.environ.get("PM_BACKFILL_MODE", "subgraph").strip().lower()
+        if mode == "subgraph":
+            from .config import SUBGRAPH_URL_FALLBACK, SUBGRAPH_URL_PRIMARY
+            from .phases.subgraph_ticks import SubgraphTickFetcher
+            from .subgraph_client import SubgraphClient
+            api_key = os.environ.get("SUBGRAPH_API_KEY")
+            client = SubgraphClient(
+                primary_url=SUBGRAPH_URL_PRIMARY,
+                fallback_url=SUBGRAPH_URL_FALLBACK,
+                api_key=api_key,
+                logger=self.logger,
+            )
+            self.logger.info(
+                "Tick backfill mode: SUBGRAPH (fallback=%s)",
+                "enabled" if api_key else "disabled",
+            )
+            return SubgraphTickFetcher(client, logger=self.logger)
+        if mode == "rpc":
+            if not (self.settings.rpc_urls or self.settings.polygonscan_key):
+                self.logger.warning(
+                    "PM_BACKFILL_MODE=rpc but no POLYGON_RPC_URL or "
+                    "POLYGONSCAN_API_KEY configured — tick backfill disabled.",
+                )
+                return None
+            self.logger.info("Tick backfill mode: RPC (legacy Etherscan + eth_getLogs)")
+            return PolygonTickFetcher(
+                rpc_url=self.settings.rpc_urls,
+                polygonscan_key=self.settings.polygonscan_key,
+                logger=self.logger,
+                prefer_rpc=self.settings.prefer_rpc,
+            )
+        self.logger.warning(
+            "Unknown PM_BACKFILL_MODE=%r — tick backfill disabled. "
+            "Valid values: 'subgraph' (default) or 'rpc'.",
+            mode,
+        )
+        return None
 
     def _set_paths(self, paths: PipelinePaths) -> None:
         self.paths = paths

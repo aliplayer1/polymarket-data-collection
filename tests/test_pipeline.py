@@ -3,10 +3,28 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import pytest
+
 from polymarket_pipeline.models import MarketRecord
 from polymarket_pipeline.pipeline import PolymarketDataPipeline
 from polymarket_pipeline.settings import PipelineRunOptions, RuntimeSettings
 from polymarket_pipeline.storage import load_markets, load_prices
+
+
+@pytest.fixture(autouse=True)
+def _disable_live_tick_provider(monkeypatch):
+    """Force ``PM_BACKFILL_MODE=rpc`` for all pipeline tests.
+
+    Without this, the pipeline constructor defaults to ``mode=subgraph``
+    and builds a live ``SubgraphTickFetcher`` — which then attempts
+    real network calls during the historical phase of these tests.
+    Setting mode to ``rpc`` with no RPC config makes
+    ``_build_tick_provider`` return ``None``, cleanly disabling tick
+    backfill in isolation tests.  Tests that need a tick provider pass
+    one explicitly via ``tick_provider=`` on the pipeline constructor.
+    """
+    monkeypatch.setenv("PM_BACKFILL_MODE", "rpc")
+    yield
 
 
 class DummyLastTradePriceProvider:

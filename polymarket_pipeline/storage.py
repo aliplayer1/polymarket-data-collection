@@ -307,6 +307,12 @@ TICKS_SCHEMA = pa.schema([
     # backpressure and clock skew directly.  Nullable — on-chain backfill
     # ticks and pre-v4 Parquet files have no local recv timestamp.
     ("local_recv_ts_ns", pa.int64()),
+    # v5: unique order hash per fill within a transaction.  Populated by
+    # the subgraph tick fetcher; NULL for WS ticks and pre-v5 on-chain
+    # rows (which carry log_index as the dedup discriminator instead).
+    # Consolidation uses ``COALESCE(order_hash, '')`` in the dedup key so
+    # both paths cohabit correctly.
+    ("order_hash", pa.string()),
     # partition columns (crypto, timeframe) are implicit
 ])
 
@@ -361,7 +367,13 @@ HEARTBEATS_SCHEMA = pa.schema([
 # and ORDERBOOK_SCHEMA for the three-clock observability scheme.  Pre-v4
 # files are read back transparently via ``union_by_name=true`` in DuckDB
 # consolidation; reads fill NULL for the missing column.
-STORAGE_SCHEMA_VERSION = 4
+#
+# v4 → v5 (April 2026): added nullable ``order_hash`` to TICKS_SCHEMA so
+# subgraph-sourced fills have a unique per-fill discriminator within a
+# transaction (replacing ``log_index`` which the subgraph doesn't
+# expose).  Consolidation's dedup key uses ``COALESCE(order_hash, '')``
+# so legacy on-chain rows and WS rows keep their previous dedup shape.
+STORAGE_SCHEMA_VERSION = 5
 
 
 def _stamp_schema_version(table: pa.Table) -> pa.Table:
@@ -757,8 +769,13 @@ _TICKS_EMPTY_COLS = [
     "market_id", "timestamp_ms", "token_id", "outcome", "side",
     "price", "size_usdc", "tx_hash", "block_number", "log_index", "source",
     "spot_price_usdt", "spot_price_ts_ms", "local_recv_ts_ns",
+    "order_hash",
     "crypto", "timeframe",
 ]
+# Dedup key.  ``order_hash`` is folded in via ``COALESCE(order_hash, '')``
+# inside the consolidation SQL so legacy rows (NULL order_hash) dedup
+# with their historical behaviour and subgraph rows (populated
+# order_hash) don't collapse multi-fill transactions.
 _TICKS_DEDUP_COLS = ["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"]
 
 
@@ -1005,6 +1022,8 @@ def consolidate_ticks(
                 spot_price_usdt_sql = "src.spot_price_usdt" if "spot_price_usdt" in present_cols else "NULL::FLOAT AS spot_price_usdt"
                 spot_price_ts_ms_sql = "src.spot_price_ts_ms" if "spot_price_ts_ms" in present_cols else "NULL::BIGINT AS spot_price_ts_ms"
                 local_recv_ts_ns_sql = "src.local_recv_ts_ns" if "local_recv_ts_ns" in present_cols else "NULL::BIGINT AS local_recv_ts_ns"
+                # v5 order_hash — missing in pre-v5 shards, populated by SubgraphTickFetcher.
+                order_hash_sql = "src.order_hash" if "order_hash" in present_cols else "NULL::VARCHAR AS order_hash"
 
                 result = con.execute(f"""
                     COPY (
@@ -1027,6 +1046,7 @@ def consolidate_ticks(
                                 {spot_price_usdt_sql},
                                 {spot_price_ts_ms_sql},
                                 {local_recv_ts_ns_sql},
+                                {order_hash_sql},
                                 ((f.file_order::BIGINT << 32) + src.file_row_number::BIGINT) AS sort_key
                             FROM read_parquet(
                                 [{files_sql}],
@@ -1038,10 +1058,15 @@ def consolidate_ticks(
                         )
                         -- Intentionally omit a final ORDER BY: the global sort is
                         -- another blocking operator and was the main OOM trigger.
+                        --
+                        -- Dedup key includes ``COALESCE(order_hash, '')`` so
+                        -- subgraph-sourced rows (populated order_hash, unique
+                        -- per-fill within a tx) don't collapse with legacy
+                        -- on-chain / WS rows that have NULL order_hash.
                         SELECT
                             {select_sql}
                         FROM ranked_rows
-                        GROUP BY {group_by_sql}
+                        GROUP BY {group_by_sql}, COALESCE(order_hash, '')
                     ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
                 """).fetchone()
                 nrows = result[0] if result else 0

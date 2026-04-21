@@ -888,10 +888,68 @@ def test_persist_culture_markets_roundtrip_new_fields(tmp_path):
     assert int(row["closed_ts"]) == 1744041605
 
 
-def test_schema_version_is_v4() -> None:
+def test_schema_version_is_v5() -> None:
     # Sentinel test: bumping the schema version is a deliberate act that
     # downstream consumers depend on, so fail loudly if it regresses.
-    assert STORAGE_SCHEMA_VERSION == 4
+    assert STORAGE_SCHEMA_VERSION == 5
+
+
+def test_ticks_schema_has_order_hash_v5() -> None:
+    from polymarket_pipeline.storage import TICKS_SCHEMA, _TICKS_EMPTY_COLS
+    assert "order_hash" in TICKS_SCHEMA.names
+    assert "order_hash" in _TICKS_EMPTY_COLS
+    # Nullable string, not a dict — subgraph fills populate it, WS/legacy
+    # rows leave it NULL.
+    field = TICKS_SCHEMA.field("order_hash")
+    assert pa.types.is_string(field.type)
+
+
+def test_consolidate_ticks_preserves_order_hash_and_dedups_by_it(tmp_path):
+    """v4 (no order_hash) + v5 (with order_hash) shards must coexist."""
+    from polymarket_pipeline.storage import consolidate_ticks
+    part = tmp_path / "crypto=BTC" / "timeframe=1-hour"
+    part.mkdir(parents=True)
+
+    # Legacy row: one fill in tx X at log_index 5, no order_hash.
+    legacy = pd.DataFrame({
+        "market_id": ["m1"], "timestamp_ms": [1700000000000], "token_id": ["0xA"],
+        "outcome": ["Up"], "side": ["BUY"], "price": [0.5], "size_usdc": [10.0],
+        "tx_hash": ["0xtx"], "block_number": [100], "log_index": [5],
+        "source": ["onchain"], "spot_price_usdt": [67000.0],
+        "spot_price_ts_ms": [1700000000000], "local_recv_ts_ns": [None],
+    })
+    _write_parquet_atomic(
+        pa.Table.from_pandas(legacy, preserve_index=False),
+        str(part / "backfill_legacy.parquet"),
+    )
+    # Two subgraph fills in SAME tx at SAME timestamp — would collide under
+    # the old dedup (tx_hash + log_index=0 identical), but have distinct
+    # order_hash values so the v5 key preserves them.
+    new = pd.DataFrame({
+        "market_id": ["m1", "m1"],
+        "timestamp_ms": [1700000100000, 1700000100000],
+        "token_id": ["0xA", "0xA"],
+        "outcome": ["Up", "Up"], "side": ["BUY", "SELL"],
+        "price": [0.5, 0.51], "size_usdc": [5.0, 5.0],
+        "tx_hash": ["0xtx2", "0xtx2"],
+        "block_number": [0, 0], "log_index": [0, 0],
+        "source": ["onchain", "onchain"],
+        "spot_price_usdt": [67000.0, 67000.0],
+        "spot_price_ts_ms": [1700000100000, 1700000100000],
+        "local_recv_ts_ns": [None, None],
+        "order_hash": ["0xorder_A", "0xorder_B"],
+    })
+    _write_parquet_atomic(
+        pa.Table.from_pandas(new, preserve_index=False),
+        str(part / "backfill_new.parquet"),
+    )
+
+    consolidate_ticks(ticks_dir=str(tmp_path))
+    out = pq.ParquetFile(str(part / "part-0.parquet")).read().to_pandas()
+    assert len(out) == 3, f"expected 3 rows (1 legacy + 2 subgraph), got {len(out)}"
+    # Legacy row NULL order_hash survives; subgraph rows carry their distinct hashes.
+    order_hashes = set(str(x) if x is not None else "NULL" for x in out["order_hash"])
+    assert order_hashes == {"NULL", "0xorder_A", "0xorder_B"}
 
 
 def test_heartbeats_append_and_consolidate_roundtrip(tmp_path):

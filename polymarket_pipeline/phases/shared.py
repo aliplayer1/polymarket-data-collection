@@ -125,6 +125,7 @@ def build_binary_tick_row(
     spot_price_usdt: float | None = None,
     spot_price_ts_ms: int | None = None,
     local_recv_ts_ns: int | None = None,
+    order_hash: str | None = None,
 ) -> dict[str, Any]:
     return {
         "timestamp_ms": timestamp_ms,
@@ -143,6 +144,9 @@ def build_binary_tick_row(
         "spot_price_usdt": spot_price_usdt,
         "spot_price_ts_ms": spot_price_ts_ms,
         "local_recv_ts_ns": local_recv_ts_ns,
+        # v5 addition — unique per fill within a transaction.  NULL for
+        # WS and pre-v5 on-chain rows; populated by SubgraphTickFetcher.
+        "order_hash": order_hash,
         "category": market.category,
     }
 
