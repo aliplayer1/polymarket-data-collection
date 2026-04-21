@@ -52,3 +52,5 @@ GEMINI*
 .gemini/
 .copilot/
 .github/
+repro_test/
+repro_test_seeded/

@@ -36,6 +36,14 @@ class PriceHistoryPhase:
         self.paths = paths
         self.existing_dfs: dict[str, pd.DataFrame] = {}
         self.pending_dfs: dict[str, list[pd.DataFrame]] = {tf: [] for tf in TIME_FRAMES}
+        # Markets-metadata accumulator.  persist_normalized reads the full
+        # markets.parquet before every write, so calling it per batch is
+        # O(N²) in the accumulated market count — a production server
+        # with months of history stalls at ~1 market/min.  Instead,
+        # accumulate per-batch DataFrames here and flush ONCE in
+        # flush_all() at the end of the scan phase.
+        self.pending_markets_dfs: list[pd.DataFrame] = []
+        self.pending_culture_markets_dfs: list[pd.DataFrame] = []
         self.processed_count = 0
 
     def update_paths(self, paths: PipelinePaths) -> None:
@@ -43,6 +51,8 @@ class PriceHistoryPhase:
 
     def reset_batch_state(self) -> None:
         self.pending_dfs = {tf: [] for tf in TIME_FRAMES}
+        self.pending_markets_dfs = []
+        self.pending_culture_markets_dfs = []
         self.processed_count = 0
 
     def load_existing_data(self) -> None:
@@ -274,16 +284,11 @@ class PriceHistoryPhase:
         if not crypto_df.empty:
             markets_df, prices_df = split_markets_prices(crypto_df)
             if update_cache:
-                # Write market metadata under a short lock (small file, fast).
                 # Prices go to lock-free shard files — no lock needed.
-                persist_normalized(
-                    markets_df,
-                    pd.DataFrame(),  # empty — prices written as shards below
-                    markets_path=str(self.paths.markets_path),
-                    prices_dir=str(self.paths.prices_dir),
-                    logger=self.logger,
-                    skip_markets=False,
-                )
+                # Markets metadata is ACCUMULATED and flushed ONCE in
+                # flush_all() — rewriting markets.parquet per batch is
+                # quadratic in the accumulated markets count.
+                self.pending_markets_dfs.append(markets_df)
                 append_ws_prices_staged(
                     prices_df,  # already has crypto/timeframe from split_markets_prices
                     prices_dir=str(self.paths.prices_dir),
@@ -296,14 +301,7 @@ class PriceHistoryPhase:
             data_culture_dir = self.paths.data_dir.parent / "data-culture"
             data_culture_dir.mkdir(parents=True, exist_ok=True)
             if update_cache:
-                persist_culture_normalized(
-                    culture_markets_df,
-                    pd.DataFrame(),  # empty — prices written as shards below
-                    markets_path=str(data_culture_dir / "markets.parquet"),
-                    prices_dir=str(data_culture_dir / "prices"),
-                    logger=self.logger,
-                    skip_markets=False,
-                )
+                self.pending_culture_markets_dfs.append(culture_markets_df)
                 append_ws_culture_prices_staged(
                     culture_prices_df,  # already has crypto/timeframe
                     prices_dir=str(data_culture_dir / "prices"),
@@ -457,3 +455,57 @@ class PriceHistoryPhase:
                 merged = self.persist_dataframe(timeframe, combined)
                 self.logger.info("Final flush for %s (%s total rows)", timeframe, len(merged))
                 self.pending_dfs[timeframe] = []
+        self._flush_markets_metadata()
+
+    def _flush_markets_metadata(self) -> None:
+        """Write all accumulated markets metadata to disk in ONE call.
+
+        Earlier in the scan phase ``persist_dataframe`` was re-writing
+        ``markets.parquet`` on every batch, making the historical phase
+        O(N²) in the accumulated market count.  On a production server
+        with months of history this throttled throughput to ~1 market /
+        minute.  Here we do a single read+merge+write at end of scan.
+        """
+        if self.pending_markets_dfs:
+            combined = pd.concat(self.pending_markets_dfs, ignore_index=True)
+            # Dedup within the batch — the scan may have yielded the same
+            # market multiple times across pages (rare but defensive).
+            combined = combined.drop_duplicates(subset=["market_id"], keep="last")
+            try:
+                persist_normalized(
+                    combined,
+                    pd.DataFrame(),
+                    markets_path=str(self.paths.markets_path),
+                    prices_dir=str(self.paths.prices_dir),
+                    logger=self.logger,
+                    skip_markets=False,
+                )
+                self.logger.info(
+                    "Flushed markets metadata: %d unique crypto markets",
+                    len(combined),
+                )
+            except Exception as exc:
+                self.logger.error("Markets metadata flush (crypto) failed: %s", exc)
+            self.pending_markets_dfs = []
+
+        if self.pending_culture_markets_dfs:
+            combined = pd.concat(self.pending_culture_markets_dfs, ignore_index=True)
+            combined = combined.drop_duplicates(subset=["market_id"], keep="last")
+            data_culture_dir = self.paths.data_dir.parent / "data-culture"
+            data_culture_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                persist_culture_normalized(
+                    combined,
+                    pd.DataFrame(),
+                    markets_path=str(data_culture_dir / "markets.parquet"),
+                    prices_dir=str(data_culture_dir / "prices"),
+                    logger=self.logger,
+                    skip_markets=False,
+                )
+                self.logger.info(
+                    "Flushed markets metadata: %d unique culture markets",
+                    len(combined),
+                )
+            except Exception as exc:
+                self.logger.error("Markets metadata flush (culture) failed: %s", exc)
+            self.pending_culture_markets_dfs = []
