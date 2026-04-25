@@ -21,6 +21,21 @@ from .parsing import parse_iso_timestamp
 from .retry import api_call_with_retry
 
 
+def _exc_status_code(exc: BaseException) -> int | None:
+    """Return the HTTP status code attached to a ``requests`` exception.
+
+    ``requests`` attaches the original :class:`requests.Response` to
+    HTTP-error exceptions; we use that rather than substring-matching
+    ``str(exc)`` for ``"422"`` (which fires false positives on any
+    error message that happens to contain that literal — e.g. a
+    market ID or HTML body that mentions the code elsewhere).
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    return getattr(response, "status_code", None)
+
+
 class PolymarketApi:
     def __init__(
         self,
@@ -81,7 +96,14 @@ class PolymarketApi:
             definitions=self.market_definitions,
         )
 
-    def fetch_markets(self, *, active: bool = False, closed: bool = False, end_ts_min: int | None = None) -> Iterator[MarketRecord]:
+    def fetch_markets(
+        self,
+        *,
+        active: bool = False,
+        closed: bool = False,
+        end_ts_min: int | None = None,
+        end_ts_max: int | None = None,
+    ) -> Iterator[MarketRecord]:
         # We must explicitly fetch high-frequency markets by their tag ID because 
         # Polymarket marks them as "restricted: true", which excludes them from
         # the default /markets endpoint results.
@@ -91,6 +113,14 @@ class PolymarketApi:
         # Track seen IDs to prevent yielding duplicates if a market appears 
         # in both standard and tag-based results.
         seen_market_ids: set[str] = set()
+
+        # Gamma accepts ISO-8601 `end_date_min` / `end_date_max` filters
+        # server-side.  Translating the caller's epoch-seconds bounds to
+        # these strings lets us bypass the 250K offset pagination cap
+        # when scanning a multi-month historical window.
+        def _iso(ts: int) -> str:
+            from datetime import datetime, timezone
+            return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         # --- PHASE 1: Standard Markets ---
         offset = 0
@@ -108,13 +138,17 @@ class PolymarketApi:
             elif closed:
                 params["closed"] = "true"
                 params["active"] = "false"
+            if end_ts_min is not None:
+                params["end_date_min"] = _iso(end_ts_min)
+            if end_ts_max is not None:
+                params["end_date_max"] = _iso(end_ts_max)
 
             self.logger.info("Fetching markets page (offset=%s, active=%s, closed=%s)...", offset, active, closed)
             
             try:
                 page = self._request_json(f"{GAMMA_API}/markets", params=params)
             except Exception as exc:
-                if "422" not in str(exc).lower():
+                if _exc_status_code(exc) != 422:
                     raise
                 fallback_params = dict(params)
                 fallback_params.pop("order", None)
@@ -166,6 +200,10 @@ class PolymarketApi:
             elif closed:
                 tag_params["closed"] = "true"
                 tag_params["active"] = "false"
+            if end_ts_min is not None:
+                tag_params["end_date_min"] = _iso(end_ts_min)
+            if end_ts_max is not None:
+                tag_params["end_date_max"] = _iso(end_ts_max)
 
             self.logger.info("Fetching restricted up/down markets (offset=%s)...", offset)
             try:
@@ -224,8 +262,7 @@ class PolymarketApi:
             try:
                 chunk = self._request_json(f"{CLOB_HOST}/prices-history", params=params)
             except Exception as exc:
-                error_text = str(exc).lower()
-                if "400" not in error_text:
+                if _exc_status_code(exc) != 400:
                     raise
                 fallback_params = dict(params)
                 fallback_params.pop("market", None)

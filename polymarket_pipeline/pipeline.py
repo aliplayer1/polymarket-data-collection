@@ -463,17 +463,23 @@ class PolymarketDataPipeline:
                 skipped_expired,
             )
 
-        # Best-effort fee rate fetch: one call for all crypto markets (same rate)
+        # Best-effort fee rate fetch: one call for all crypto markets (same rate).
+        # ``fetch_fee_rate_bps`` already swallows errors internally (returns
+        # None on failure), so the previous outer ``try/except: pass`` was
+        # redundant AND silently masked any unexpected failure.  Drop it
+        # and surface the missing-fee case as a warning instead.
         crypto_markets = [m for m in active_markets_for_ws if m.category == "crypto" and m.up_token_id]
         if crypto_markets:
-            try:
-                bps = self.api.fetch_fee_rate_bps(crypto_markets[0].up_token_id)
-                if bps is not None:
-                    for m in crypto_markets:
-                        m.fee_rate_bps = bps
-                    self.logger.info("Fee rate for crypto markets: %d bps", bps)
-            except Exception:
-                pass
+            bps = self.api.fetch_fee_rate_bps(crypto_markets[0].up_token_id)
+            if bps is not None:
+                for m in crypto_markets:
+                    m.fee_rate_bps = bps
+                self.logger.info("Fee rate for crypto markets: %d bps", bps)
+            else:
+                self.logger.warning(
+                    "Could not fetch fee rate for crypto markets (CLOB /fee-rate "
+                    "returned None or failed); fee_rate_bps will remain unset."
+                )
 
         return active_markets_for_ws
 

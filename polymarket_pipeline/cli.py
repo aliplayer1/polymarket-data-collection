@@ -298,5 +298,14 @@ def main() -> None:
             settings=runtime_settings,
         )
         pipeline.run(run_options=run_options)
+    except SystemExit:
+        # Argparse / explicit sys.exit() — let the runtime status flow
+        # through unchanged.
+        raise
     except Exception as exc:
         logger.exception("Pipeline failed: %s", exc)
+        # Exit non-zero so systemd's ``Restart=on-failure`` actually
+        # restarts the unit, and so monitoring can distinguish a
+        # crashed run from a clean shutdown.  Returning normally here
+        # used to silently exit 0 even after a fatal error.
+        raise SystemExit(1) from exc
