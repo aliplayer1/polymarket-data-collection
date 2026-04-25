@@ -509,8 +509,15 @@ def _check_disk_space(path: str) -> None:
             )
     except OSError:
         raise
-    except Exception:
-        pass  # disk_usage not supported on this platform — skip check
+    except Exception as exc:
+        # ``shutil.disk_usage`` may fail on a few exotic platforms /
+        # filesystems (Linux container without /proc, etc.).  Skip the
+        # check rather than crash the writer, but log the cause so an
+        # operator can investigate why the safety net is disabled.
+        logging.getLogger("polymarket_pipeline").debug(
+            "_check_disk_space could not check %r (%s) — skipping",
+            check_path, exc,
+        )
 
 
 def _resolution_to_int8(val: Any) -> int:

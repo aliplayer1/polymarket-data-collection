@@ -259,17 +259,43 @@ class PolymarketDataPipeline:
         return str(self.paths.scan_checkpoint_path())
 
     def _load_scan_checkpoint(self) -> int | None:
+        path = self.paths.scan_checkpoint_path()
         try:
-            with self.paths.scan_checkpoint_path().open() as handle:
+            with path.open() as handle:
                 return int(handle.read().strip())
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            # Corrupt or unreadable checkpoint should not silently
+            # trigger a 6-hour full historical re-scan.  Warn loudly so
+            # operators see the cause when the next run takes longer
+            # than expected.
+            self.logger.warning(
+                "Scan checkpoint at %s is unreadable (%s) — falling back to full scan",
+                path, exc,
+            )
             return None
 
     def _save_scan_checkpoint(self, max_end_ts: int) -> None:
         checkpoint_path = self.paths.scan_checkpoint_path()
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        with checkpoint_path.open("w") as handle:
-            handle.write(str(max_end_ts))
+        # Atomic write: tmp file + os.replace.  A SIGKILL or power loss
+        # mid-write used to truncate ``.scan_checkpoint`` to zero
+        # length, which then made ``_load_scan_checkpoint`` silently
+        # return None and force a full re-scan on the next run.
+        import os as _os
+        tmp_path = checkpoint_path.with_suffix(f".{_os.getpid()}.tmp")
+        try:
+            with tmp_path.open("w") as handle:
+                handle.write(str(max_end_ts))
+            _os.replace(tmp_path, checkpoint_path)
+        except OSError:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            raise
 
     def _compute_scan_cutoff_ts(self, run_options: PipelineRunOptions) -> int | None:
         if run_options.is_test:

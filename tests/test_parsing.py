@@ -129,3 +129,16 @@ def test_parse_iso_timestamp_accepts_gamma_formats(value: str, expected: int) ->
 @pytest.mark.parametrize("value", [None, "", "  ", "not a date", "2026-13-45"])
 def test_parse_iso_timestamp_returns_none_for_invalid(value) -> None:
     assert parse_iso_timestamp(value) is None
+
+
+def test_parse_iso_timestamp_treats_naive_as_utc() -> None:
+    """A tz-naive timestamp must be treated as UTC, not system-local
+    time.  Otherwise ``datetime.fromisoformat(...).timestamp()`` would
+    silently shift the value by hours on any non-UTC host (developer
+    machines, mostly), polluting the markets table with off-by-tz
+    timestamps.
+    """
+    from datetime import datetime, timezone
+    expected = int(datetime(2026, 4, 25, 12, 0, 0, tzinfo=timezone.utc).timestamp())
+    # No "Z", no offset → naive
+    assert parse_iso_timestamp("2026-04-25T12:00:00") == expected

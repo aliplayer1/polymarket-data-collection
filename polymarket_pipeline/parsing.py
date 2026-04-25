@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Sequence
 
 from .markets import (
@@ -86,6 +86,14 @@ def parse_iso_timestamp(value: str | None) -> int | None:
     v = _BARE_OFFSET_RE.sub(r"\1\2:00", v)
     v = _FRACTIONAL_RE.sub(_normalise_fraction, v)
     try:
-        return int(datetime.fromisoformat(v).timestamp())
+        dt = datetime.fromisoformat(v)
     except (TypeError, ValueError):
         return None
+    # Gamma timestamps SHOULD always carry a timezone, but if a future
+    # field arrives as tz-naive, ``.timestamp()`` would interpret it in
+    # the system local timezone — silently shifting the value by hours
+    # on any non-UTC host (developer machines, mostly).  Coerce naive
+    # datetimes to UTC explicitly.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())

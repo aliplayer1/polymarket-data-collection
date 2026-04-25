@@ -21,6 +21,26 @@ def _parse_retry_after(exc: Exception) -> float | None:
         return 5.0
 
 
+def _is_non_retryable_client_error(exc: Exception) -> bool:
+    """Return True for 4xx HTTP statuses that won't succeed on retry.
+
+    408 (Request Timeout) and 429 (Too Many Requests) are explicitly
+    excluded — those usually do recover after a delay.  All other 4xx
+    codes (400/401/403/404/422/etc.) indicate a malformed or
+    rejected request; retrying just wastes attempts and adds latency
+    before any caller-level fallback can fire.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return False
+    status = getattr(response, "status_code", None)
+    if not isinstance(status, int):
+        return False
+    if 400 <= status < 500 and status not in (408, 429):
+        return True
+    return False
+
+
 def api_call_with_retry(
     func: Callable[..., Any],
     *args: Any,
@@ -53,6 +73,12 @@ def api_call_with_retry(
                 type(exc).__name__,
                 exc,
             )
+            # Skip retry for non-retryable 4xx client errors so callers'
+            # own fallback paths (e.g. api.py's 422 → no-order rerun)
+            # fire immediately instead of waiting for 3 attempts ×
+            # backoff to exhaust.
+            if _is_non_retryable_client_error(exc):
+                raise
             if is_last_attempt:
                 raise
 

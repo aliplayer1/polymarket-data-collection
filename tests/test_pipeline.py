@@ -291,3 +291,36 @@ def test_pipeline_historical_only_forwards_to_date_upper_bound(tmp_path, monkeyp
     # Client-side: only the market ending strictly before the cutoff
     # is collected; the one ending AT the cutoff is filtered out.
     assert [c[0] for c in tick_provider.calls] == [("in-range",)]
+
+
+def test_scan_checkpoint_save_is_atomic_and_load_is_resilient(tmp_path) -> None:
+    """``_save_scan_checkpoint`` writes via ``.tmp`` + ``os.replace`` so
+    a SIGKILL or power loss mid-write cannot truncate the file.
+    ``_load_scan_checkpoint`` warns and returns None on a corrupt file
+    rather than silently triggering a full re-scan.
+    """
+    api = FakeApi()
+    pipeline = _pipeline(api=api, settings=RuntimeSettings(data_dir=tmp_path / "data"))
+    cp_path = pipeline.paths.scan_checkpoint_path()
+
+    # Atomic write: save → tmp file is gone, real file has the value.
+    pipeline._save_scan_checkpoint(1_700_000_000)
+    assert cp_path.read_text().strip() == "1700000000"
+    parent = cp_path.parent
+    assert not any(p.name.endswith(".tmp") for p in parent.iterdir())
+
+    # Re-save overwrites cleanly.
+    pipeline._save_scan_checkpoint(1_700_000_500)
+    assert pipeline._load_scan_checkpoint() == 1_700_000_500
+
+    # Corrupted checkpoint: load returns None (and warns).
+    cp_path.write_text("not a number")
+    assert pipeline._load_scan_checkpoint() is None
+
+    # Truncated checkpoint (zero bytes): same.
+    cp_path.write_text("")
+    assert pipeline._load_scan_checkpoint() is None
+
+    # After the corruption is repaired (next save), normal flow resumes.
+    pipeline._save_scan_checkpoint(1_700_001_000)
+    assert pipeline._load_scan_checkpoint() == 1_700_001_000

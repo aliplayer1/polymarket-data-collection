@@ -62,6 +62,7 @@ class PipelineRunOptions:
     upload: bool = False
     upload_only: bool = False
     from_date: str | None = None
+    to_date: str | None = None
 
     @classmethod
     def from_args(cls, args: Any) -> "PipelineRunOptions":
@@ -75,6 +76,7 @@ class PipelineRunOptions:
             upload=bool(getattr(args, "upload", False)),
             upload_only=bool(getattr(args, "upload_only", False)),
             from_date=getattr(args, "from_date", None),
+            to_date=getattr(args, "to_date", None),
         )
 
     @classmethod
@@ -90,9 +92,23 @@ class PipelineRunOptions:
         upload: bool = False,
         upload_only: bool = False,
         from_date: str | None = None,
+        to_date: str | None = None,
     ) -> "PipelineRunOptions":
         normalized_test_limit = test_limit if test_limit is not None and test_limit > 0 else None
         normalized_from_date = from_date.strip() if isinstance(from_date, str) and from_date.strip() else None
+        normalized_to_date = to_date.strip() if isinstance(to_date, str) and to_date.strip() else None
+        # Warn at construction time if --upload is paired with --test:
+        # test mode never uploads, so the previous post-run warning meant
+        # users waited through a full test run before learning the flag
+        # was ignored.  Strip it here so the run options are honest.
+        if normalized_test_limit is not None and upload:
+            import warnings
+            warnings.warn(
+                "--upload is ignored in --test mode; test data is never "
+                "pushed to Hugging Face.",
+                stacklevel=2,
+            )
+            upload = False
         return cls(
             historical_only=historical_only,
             websocket_only=websocket_only,
@@ -103,6 +119,7 @@ class PipelineRunOptions:
             upload=upload,
             upload_only=upload_only,
             from_date=normalized_from_date,
+            to_date=normalized_to_date,
         )
 
     @property
