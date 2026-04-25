@@ -1070,6 +1070,37 @@ def consolidate_ticks(
                                 file_row_number=true
                             ) AS src
                             JOIN source_files AS f ON src.filename = f.file_path
+                        ),
+                        -- Hybrid legacy↔subgraph dedup.  Legacy
+                        -- (Etherscan/RPC) rows have populated tx_hash and
+                        -- log_index but NULL order_hash.  Subgraph rows
+                        -- have the same tx_hash, log_index=0, and a real
+                        -- order_hash.  When BOTH exist for the same
+                        -- (market_id, ts_ms, token_id, tx_hash), the
+                        -- subgraph rows are canonical — drop the legacy
+                        -- ones so re-collecting silently overwrites the
+                        -- old data with the new schema.
+                        --
+                        -- WS rows have tx_hash='' (unaffected) and ride
+                        -- the order_hash + local_recv_ts_ns
+                        -- discriminators below.
+                        flagged AS (
+                            SELECT
+                                ranked_rows.*,
+                                MAX(CASE WHEN order_hash IS NOT NULL THEN 1 ELSE 0 END)
+                                    OVER (
+                                        PARTITION BY market_id, timestamp_ms,
+                                                     token_id, tx_hash
+                                    ) AS has_subgraph_for_tx
+                            FROM ranked_rows
+                        ),
+                        dedup_input AS (
+                            SELECT * FROM flagged
+                            WHERE NOT (
+                                tx_hash <> ''             -- never filter WS rows
+                                AND has_subgraph_for_tx = 1
+                                AND order_hash IS NULL    -- legacy
+                            )
                         )
                         -- Intentionally omit a final ORDER BY: the global sort is
                         -- another blocking operator and was the main OOM trigger.
@@ -1091,7 +1122,7 @@ def consolidate_ticks(
                         --     map to 0 and dedup as before.
                         SELECT
                             {select_sql}
-                        FROM ranked_rows
+                        FROM dedup_input AS ranked_rows
                         GROUP BY {group_by_sql},
                                  COALESCE(order_hash, ''),
                                  COALESCE(local_recv_ts_ns, 0)

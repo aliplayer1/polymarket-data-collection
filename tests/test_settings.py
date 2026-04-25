@@ -1,21 +1,15 @@
 import warnings
 from argparse import Namespace
 
-import pytest
-
 from polymarket_pipeline.settings import PipelineRunOptions, RuntimeSettings
 
 
 def test_runtime_settings_prefer_cli_values(monkeypatch, tmp_path) -> None:
-    monkeypatch.setenv("POLYGON_RPC_URL", "https://env-rpc")
-    monkeypatch.setenv("POLYGONSCAN_API_KEY", "env-key")
     monkeypatch.setenv("POLYMARKET_DATA_DIR", str(tmp_path / "env-data"))
     monkeypatch.setenv("POLYMARKET_LOG_FILE", str(tmp_path / "env.log"))
     monkeypatch.setenv("HF_REPO_ID", "env/repo")
 
     args = Namespace(
-        rpc_url="https://cli-rpc",
-        polygonscan_key="cli-key",
         data_dir=str(tmp_path / "cli-data"),
         log_file=str(tmp_path / "logs" / "pipeline.log"),
         hf_repo="cli/repo",
@@ -23,8 +17,6 @@ def test_runtime_settings_prefer_cli_values(monkeypatch, tmp_path) -> None:
 
     settings = RuntimeSettings.from_args(args)
 
-    assert settings.rpc_url == "https://cli-rpc"
-    assert settings.polygonscan_key == "cli-key"
     assert settings.data_dir == tmp_path / "cli-data"
     assert settings.log_file == tmp_path / "logs" / "pipeline.log"
     assert settings.hf_repo == "cli/repo"

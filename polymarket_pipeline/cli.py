@@ -213,35 +213,6 @@ def main() -> None:
             "Also reads from env var POLYMARKET_LOG_FILE."
         ),
     )
-    parser.add_argument(
-        "--rpc-url",
-        type=str,
-        default=None,
-        metavar="URL",
-        help=(
-            "Polygon JSON-RPC endpoint for fetching on-chain trade ticks. "
-            "Free options: Alchemy (https://polygon-mainnet.g.alchemy.com/v2/<key>), "
-            "QuickNode, or Infura. "
-            "Also reads from env var POLYGON_RPC_URL."
-        ),
-    )
-    parser.add_argument(
-        "--polygonscan-key",
-        type=str,
-        default=None,
-        metavar="KEY",
-        help=(
-            "Free Polygonscan API key for getLogs queries (https://polygonscan.com/myapikey). "
-            "Preferred over direct RPC for reliability. "
-            "Also reads from env var POLYGONSCAN_API_KEY."
-        ),
-    )
-    parser.add_argument(
-        "--prefer-rpc",
-        action="store_true",
-        default=None,
-        help="Use RPC provider preferentially over Polygonscan for historical logs (faster if using Alchemy).",
-    )
     args = parser.parse_args()
 
     runtime_settings = RuntimeSettings.from_args(args)

@@ -11,19 +11,12 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CHAIN_ID = 137
 
 # --- Polygon on-chain tick data ---
-# CTF Exchange: emits OrderFilled for every trade fill on Polymarket
+# CTF Exchange: emits OrderFilled for every trade fill on Polymarket.
+# Retained for documentation / cross-reference; the live tick backfill
+# path goes through the Polymarket orderbook subgraph
+# (see polymarket_pipeline.subgraph_client + phases/subgraph_ticks.py).
 CTF_EXCHANGE_ADDRESS = "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e"
-ORDER_FILLED_TOPIC = "0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"
-BLOCK_TIME_SECONDS = 2.19          # average Polygon PoS block time
-ETHERSCAN_V2_API = "https://api.etherscan.io/v2/api"  # Etherscan V2 with chainid=137 for Polygon PoS
-POLYGONSCAN_NATIVE_API = "https://api.polygonscan.com/api"  # Native Polygonscan endpoint (no chainid needed)
 POLYGON_CHAIN_ID = 137
-# Default RPC URL – override with --rpc-url or POLYGON_RPC_URL env var.
-# Free options that support eth_getLogs:
-#   Alchemy:    https://polygon-mainnet.g.alchemy.com/v2/<key>  (300M CU/mo free)
-#   QuickNode:  https://xxx.matic.quiknode.pro/<key>              (10M req/mo free)
-#   Infura:     https://polygon-mainnet.infura.io/v3/<key>        (100k req/day free)
-POLYGON_RPC_URL: str | None = None  # set at runtime via CLI or env
 
 REQUEST_TIMEOUT_SECONDS = 20
 PAGE_SIZE = 500

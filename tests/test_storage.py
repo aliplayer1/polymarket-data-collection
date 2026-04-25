@@ -1145,6 +1145,148 @@ def test_ticks_schema_has_local_recv_ts_ns():
     assert "local_recv_ts_ns" in TICKS_SCHEMA.names
 
 
+def test_consolidate_ticks_subgraph_overwrites_legacy_for_same_tx(tmp_path):
+    """When a (market_id, ts_ms, token_id, tx_hash) appears in BOTH a
+    legacy (Etherscan/RPC: populated log_index, NULL order_hash) shard
+    AND a subgraph (log_index=0, populated order_hash) shard,
+    consolidation must drop the legacy rows in favour of the subgraph
+    ones.  This is the path that lets ``--historical-only`` re-runs
+    silently overwrite legacy data with the new schema.
+
+    WS rows (``tx_hash=""``) MUST NOT be affected by the filter.
+    """
+    from polymarket_pipeline.storage import consolidate_ticks
+    part = tmp_path / "crypto=BTC" / "timeframe=5-minute"
+    part.mkdir(parents=True)
+
+    legacy = pd.DataFrame({
+        "market_id": ["m1", "m1"],
+        "timestamp_ms": [1700000000000, 1700000000000],
+        "token_id": ["0xA", "0xA"],
+        "outcome": ["Up", "Up"],
+        "side": ["BUY", "SELL"],
+        "price": [0.50, 0.51],
+        "size_usdc": [10.0, 11.0],
+        "tx_hash": ["0xtx", "0xtx"],
+        "block_number": [58000000, 58000000],
+        "log_index": [5, 6],
+        "source": ["onchain", "onchain"],
+        "spot_price_usdt": [None, None],
+        "spot_price_ts_ms": [None, None],
+        "local_recv_ts_ns": [None, None],
+        # NB: legacy schema didn't have order_hash; we pass it as NULL
+        # to match what union_by_name will see for legacy v3 shards.
+        "order_hash": [None, None],
+    })
+    _write_parquet_atomic(
+        pa.Table.from_pandas(legacy, preserve_index=False),
+        str(part / "backfill_legacy_etherscan.parquet"),
+    )
+
+    # Subgraph re-collection of the SAME tx — block_number=0 and
+    # log_index=0 (both unavailable from the subgraph), but two distinct
+    # order_hash values mark the two fills.
+    subgraph = pd.DataFrame({
+        "market_id": ["m1", "m1"],
+        "timestamp_ms": [1700000000000, 1700000000000],
+        "token_id": ["0xA", "0xA"],
+        "outcome": ["Up", "Up"],
+        "side": ["BUY", "SELL"],
+        "price": [0.50, 0.51],
+        "size_usdc": [10.0, 11.0],
+        "tx_hash": ["0xtx", "0xtx"],
+        "block_number": [0, 0],
+        "log_index": [0, 0],
+        "source": ["onchain", "onchain"],
+        "spot_price_usdt": [67000.0, 67000.0],
+        "spot_price_ts_ms": [1700000000000, 1700000000000],
+        "local_recv_ts_ns": [None, None],
+        "order_hash": ["0xorder_A", "0xorder_B"],
+    })
+    _write_parquet_atomic(
+        pa.Table.from_pandas(subgraph, preserve_index=False),
+        str(part / "backfill_subgraph_recollect.parquet"),
+    )
+
+    # A WS row in the same partition (different ts_ms; tx_hash="").
+    # MUST survive untouched — the hybrid filter only drops legacy
+    # rows when a subgraph row exists for the SAME (market, ts, token,
+    # tx).  WS rows have tx_hash="" so they're explicitly excluded
+    # from the filter.
+    ws = pd.DataFrame({
+        "market_id": ["m1"],
+        "timestamp_ms": [1700000999000],
+        "token_id": ["0xA"],
+        "outcome": ["Up"],
+        "side": ["BUY"],
+        "price": [0.52],
+        "size_usdc": [5.0],
+        "tx_hash": [""],
+        "block_number": [0],
+        "log_index": [0],
+        "source": ["websocket"],
+        "spot_price_usdt": [67050.0],
+        "spot_price_ts_ms": [1700000999000],
+        "local_recv_ts_ns": [1700000999_123_000_000],
+        "order_hash": [None],
+    })
+    _write_parquet_atomic(
+        pa.Table.from_pandas(ws, preserve_index=False),
+        str(part / "ws_ticks_test.parquet"),
+    )
+
+    consolidate_ticks(ticks_dir=str(tmp_path))
+    out = pq.ParquetFile(str(part / "part-0.parquet")).read().to_pandas()
+
+    # 2 subgraph + 1 WS = 3 rows.  Both legacy rows dropped.
+    assert len(out) == 3, f"expected 3 rows (2 subgraph + 1 WS), got {len(out)}"
+    # Subgraph rows kept their order_hash; WS row preserved with NULL.
+    onchain = out[out["source"] == "onchain"]
+    assert set(onchain["order_hash"].dropna()) == {"0xorder_A", "0xorder_B"}
+    # WS row untouched.
+    ws_rows = out[out["source"] == "websocket"]
+    assert len(ws_rows) == 1
+    assert ws_rows.iloc[0]["tx_hash"] == ""
+
+
+def test_consolidate_ticks_keeps_legacy_when_no_subgraph_overlap(tmp_path):
+    """If a legacy shard exists with no matching subgraph rows, the
+    legacy rows must be preserved.  Only direct (same-tx) overlap
+    triggers the override.
+    """
+    from polymarket_pipeline.storage import consolidate_ticks
+    part = tmp_path / "crypto=BTC" / "timeframe=5-minute"
+    part.mkdir(parents=True)
+
+    legacy = pd.DataFrame({
+        "market_id": ["m1"],
+        "timestamp_ms": [1700000000000],
+        "token_id": ["0xA"],
+        "outcome": ["Up"],
+        "side": ["BUY"],
+        "price": [0.50],
+        "size_usdc": [10.0],
+        "tx_hash": ["0xtx_legacy_only"],
+        "block_number": [58000000],
+        "log_index": [5],
+        "source": ["onchain"],
+        "spot_price_usdt": [None],
+        "spot_price_ts_ms": [None],
+        "local_recv_ts_ns": [None],
+        "order_hash": [None],
+    })
+    _write_parquet_atomic(
+        pa.Table.from_pandas(legacy, preserve_index=False),
+        str(part / "backfill_legacy.parquet"),
+    )
+
+    consolidate_ticks(ticks_dir=str(tmp_path))
+    out = pq.ParquetFile(str(part / "part-0.parquet")).read().to_pandas()
+    assert len(out) == 1
+    assert out.iloc[0]["tx_hash"] == "0xtx_legacy_only"
+    assert out.iloc[0]["log_index"] == 5  # legacy block info preserved
+
+
 def test_consolidate_ticks_preserves_sub_ms_ws_trades_via_local_recv_ts_ns(tmp_path):
     """Two WS trades with identical (market_id, ts_ms, token_id, tx_hash="",
     log_index=0, order_hash=NULL) but DIFFERENT ``local_recv_ts_ns`` must

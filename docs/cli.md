@@ -23,8 +23,6 @@ This document covers all pipeline execution arguments, `.env` configurations, an
 | `--hf-repo USER/REPO` | str | Hugging Face dataset repo ID (overrides `HF_REPO_ID` env var) |
 | `--data-dir PATH` | str | Root directory for Parquet output. Defaults to `data/`. Overrides `POLYMARKET_DATA_DIR` env var. |
 | `--log-file PATH` | str | Append log output to a file in addition to stdout. Overrides `POLYMARKET_LOG_FILE` env var. |
-| `--polygonscan-key KEY` | str | Polygonscan API key for on-chain tick backfill (overrides `POLYGONSCAN_API_KEY` env var) |
-| `--rpc-url URL` | str | Polygon JSON-RPC endpoint for high-speed tick backfill (overrides `POLYGON_RPC_URL` env var) |
 
 ### Environment Variables
 
@@ -38,8 +36,8 @@ All credentials and path overrides can be set in `.env` (loaded automatically vi
 | `PM_FLOCK_TIMEOUT` | Cross-process lock timeout in seconds. Defaults to **300** (5 minutes) to accommodate large data uploads. |
 | `PM_DUCKDB_MEMORY_LIMIT` | Override the DuckDB memory limit used during tick consolidation before uploads, e.g. `3GB`. |
 | `PM_DUCKDB_THREADS` | Override the DuckDB thread count used during tick consolidation. Defaults to **1**. |
-| `POLYGONSCAN_API_KEY` | Free API key from [polygonscan.com/myapikey](https://polygonscan.com/myapikey) |
-| `POLYGON_RPC_URL` | Polygon JSON-RPC endpoint for primary high-speed tick backfill. Highly recommended: an Alchemy Free Tier API URL (e.g. `https://polygon-mainnet.g.alchemy.com/v2/...`). |
+| `SUBGRAPH_API_KEY` | Optional Graph-Network API key. Set this to enable the fallback endpoint when the primary Goldsky subgraph is unreachable. Leave unset for normal operation. |
+| `PM_DISABLE_TICK_BACKFILL` | Set to `1` to skip on-chain tick backfill entirely (e.g. for prices-only runs or when iterating offline). |
 | `POLYMARKET_DATA_DIR` | Root directory for Parquet output (overridden per-run by `--data-dir`) |
 | `POLYMARKET_LOG_FILE` | Log file path (overridden per-run by `--log-file`) |
 

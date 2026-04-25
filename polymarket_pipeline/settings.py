@@ -129,27 +129,13 @@ class PipelineRunOptions:
 
 @dataclass(frozen=True)
 class RuntimeSettings:
-    rpc_urls: tuple[str, ...] = ()
-    polygonscan_key: str | None = None
     data_dir: Path | None = None
     log_file: Path | None = None
     hf_repo: str = HF_REPO_ID
-    prefer_rpc: bool = False
 
     @classmethod
     def from_args(cls, args: Any) -> "RuntimeSettings":
-        raw_rpc = _coalesce(
-            getattr(args, "rpc_url", None),
-            os.environ.get("POLYGON_RPC_URL"),
-        )
-        rpc_urls = _coerce_tuple(raw_rpc, transform=lambda item: item.strip())
-
         return cls(
-            rpc_urls=rpc_urls,
-            polygonscan_key=_coalesce(
-                getattr(args, "polygonscan_key", None),
-                os.environ.get("POLYGONSCAN_API_KEY"),
-            ),
             data_dir=_coerce_path(
                 _coalesce(
                     getattr(args, "data_dir", None),
@@ -169,12 +155,6 @@ class RuntimeSettings:
                     HF_REPO_ID,
                 )
             ),
-            prefer_rpc=bool(
-                _coalesce(
-                    getattr(args, "prefer_rpc", None),
-                    os.environ.get("PREFER_RPC", "").lower() == "true",
-                )
-            ),
         )
 
     def with_overrides(
@@ -184,12 +164,9 @@ class RuntimeSettings:
         hf_repo: str | None = None,
     ) -> "RuntimeSettings":
         return RuntimeSettings(
-            rpc_urls=self.rpc_urls,
-            polygonscan_key=self.polygonscan_key,
             data_dir=_coerce_path(data_dir) or self.data_dir,
             log_file=self.log_file,
             hf_repo=str(_coalesce(hf_repo, self.hf_repo)),
-            prefer_rpc=self.prefer_rpc,
         )
 
     def resolve_paths(self, run_options: PipelineRunOptions):
@@ -200,10 +177,6 @@ class RuntimeSettings:
         if self.data_dir is not None:
             return PipelinePaths.from_root(self.data_dir)
         return PipelinePaths.from_root(PARQUET_DATA_DIR)
-
-    @property
-    def rpc_url(self) -> str | None:
-        return self.rpc_urls[0] if self.rpc_urls else None
 
     @property
     def log_file_str(self) -> str | None:

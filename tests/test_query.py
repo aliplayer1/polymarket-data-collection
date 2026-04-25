@@ -1,8 +1,6 @@
 """Tests for the DuckDB query layer (``polymarket_pipeline.query``)."""
 from __future__ import annotations
 
-import os
-
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq

@@ -35,8 +35,9 @@ class TickBackfillPhase:
     def run(self, markets: list[MarketRecord]) -> int:
         if self.tick_provider is None:
             self.logger.warning(
-                "No Polygon RPC or Polygonscan key configured; skipping on-chain tick backfill. "
-                "Pass --rpc-url or --polygonscan-key to enable.",
+                "Tick provider unavailable; skipping on-chain tick backfill. "
+                "Set PM_DISABLE_TICK_BACKFILL=0 (or unset) and ensure "
+                "subgraph endpoints are reachable.",
             )
             return 0
 

@@ -22,7 +22,6 @@ from .providers import (
 )
 from .settings import PipelineRunOptions, RuntimeSettings
 from .storage import consolidate_culture_prices, consolidate_ticks, load_markets, load_prices_for_timeframe, upload_to_huggingface
-from .ticks import PolygonTickFetcher
 
 
 class PolymarketDataPipeline:
@@ -120,55 +119,33 @@ class PolymarketDataPipeline:
         )
 
     def _build_tick_provider(self):
-        """Construct the tick provider per ``PM_BACKFILL_MODE``.
+        """Construct the subgraph tick provider.
 
-        - ``subgraph`` (default): new Polymarket orderbook-subgraph path.
-          Fast, rate-limit-free, single query per window.  Uses
-          ``SUBGRAPH_API_KEY`` env var for optional fallback to The
-          Graph network when the primary (Goldsky) is unreachable.
-        - ``rpc`` (legacy fallback): the original Etherscan/RPC
-          ``eth_getLogs`` path.  Kept as a dormant rollback option for
-          ~2 weeks post-deploy.  Requires ``POLYGON_RPC_URL`` and/or
-          ``POLYGONSCAN_API_KEY``.
-        - any other value: tick backfill disabled (phase no-ops).
+        The legacy Etherscan/RPC ``eth_getLogs`` path was removed —
+        Polymarket's orderbook subgraph (Goldsky, with optional Graph-
+        network fallback via ``SUBGRAPH_API_KEY``) is the sole tick
+        source.  Set the ``PM_DISABLE_TICK_BACKFILL=1`` env var if you
+        need to run without tick backfill (e.g. in a unit-test
+        environment that has no live network access).
         """
-        mode = os.environ.get("PM_BACKFILL_MODE", "subgraph").strip().lower()
-        if mode == "subgraph":
-            from .config import SUBGRAPH_URL_FALLBACK, SUBGRAPH_URL_PRIMARY
-            from .phases.subgraph_ticks import SubgraphTickFetcher
-            from .subgraph_client import SubgraphClient
-            api_key = os.environ.get("SUBGRAPH_API_KEY")
-            client = SubgraphClient(
-                primary_url=SUBGRAPH_URL_PRIMARY,
-                fallback_url=SUBGRAPH_URL_FALLBACK,
-                api_key=api_key,
-                logger=self.logger,
-            )
-            self.logger.info(
-                "Tick backfill mode: SUBGRAPH (fallback=%s)",
-                "enabled" if api_key else "disabled",
-            )
-            return SubgraphTickFetcher(client, logger=self.logger)
-        if mode == "rpc":
-            if not (self.settings.rpc_urls or self.settings.polygonscan_key):
-                self.logger.warning(
-                    "PM_BACKFILL_MODE=rpc but no POLYGON_RPC_URL or "
-                    "POLYGONSCAN_API_KEY configured — tick backfill disabled.",
-                )
-                return None
-            self.logger.info("Tick backfill mode: RPC (legacy Etherscan + eth_getLogs)")
-            return PolygonTickFetcher(
-                rpc_url=self.settings.rpc_urls,
-                polygonscan_key=self.settings.polygonscan_key,
-                logger=self.logger,
-                prefer_rpc=self.settings.prefer_rpc,
-            )
-        self.logger.warning(
-            "Unknown PM_BACKFILL_MODE=%r — tick backfill disabled. "
-            "Valid values: 'subgraph' (default) or 'rpc'.",
-            mode,
+        if os.environ.get("PM_DISABLE_TICK_BACKFILL", "").strip() == "1":
+            self.logger.info("Tick backfill disabled via PM_DISABLE_TICK_BACKFILL=1")
+            return None
+        from .config import SUBGRAPH_URL_FALLBACK, SUBGRAPH_URL_PRIMARY
+        from .phases.subgraph_ticks import SubgraphTickFetcher
+        from .subgraph_client import SubgraphClient
+        api_key = os.environ.get("SUBGRAPH_API_KEY")
+        client = SubgraphClient(
+            primary_url=SUBGRAPH_URL_PRIMARY,
+            fallback_url=SUBGRAPH_URL_FALLBACK,
+            api_key=api_key,
+            logger=self.logger,
         )
-        return None
+        self.logger.info(
+            "Tick backfill mode: SUBGRAPH (fallback=%s)",
+            "enabled" if api_key else "disabled",
+        )
+        return SubgraphTickFetcher(client, logger=self.logger)
 
     def _set_paths(self, paths: PipelinePaths) -> None:
         self.paths = paths
