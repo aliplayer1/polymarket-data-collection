@@ -185,16 +185,24 @@ def is_valid_bbo(best_bid: float, best_ask: float,
                  best_bid_size: float, best_ask_size: float) -> bool:
     """Reject obviously-broken BBOs before they pollute storage / signals.
 
-    A valid BBO has both sides present, non-inverted, and finite sizes.
-    Empty books during the first ~170 s of a market's life routinely
-    produce ``best_bid = 0`` or ``best_bid >= best_ask`` — recording those
-    silently corrupts spread-based features downstream.
+    A valid BBO has both sides present, non-inverted, and strictly
+    positive sizes.  Empty books during the first ~170 s of a market's
+    life routinely produce ``best_bid = 0`` or ``best_bid >= best_ask``
+    — recording those silently corrupts spread-based features
+    downstream.
+
+    Zero-size sides are also rejected: ``parse_book_snapshot`` collapses
+    a missing bid or ask side to ``best_bid_size = 0.0`` (via
+    ``size or 0.0``); without this guard those one-sided snapshots
+    flowed into the orderbook table as if the BBO were valid.
     """
     if not (math.isfinite(best_bid) and math.isfinite(best_ask)):
         return False
     if not (math.isfinite(best_bid_size) and math.isfinite(best_ask_size)):
         return False
     if best_bid <= 0.0 or best_ask <= 0.0:
+        return False
+    if best_bid_size <= 0.0 or best_ask_size <= 0.0:
         return False
     if best_bid >= best_ask:
         return False

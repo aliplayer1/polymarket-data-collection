@@ -116,6 +116,14 @@ class WebSocketPhase:
     # Helpers
     # ------------------------------------------------------------------
 
+    # Maximum age of a cached RTDS spot price before we refuse to embed
+    # it into a tick row.  Aligned with WS_STALENESS_RTDS_BINANCE_S=30s so
+    # a stalled RTDS feed (which the watchdog will eventually catch and
+    # reconnect) does not leak stale prices into ticks for tens of
+    # minutes.  Pre-reconnect, ticks for that crypto record NULL spot
+    # price — better a missing value than a wrong one.
+    _SPOT_PRICE_MAX_AGE_MS: int = 30_000
+
     def _spot_price_kwargs(self, crypto: str) -> dict[str, float | int | None]:
         rtds_symbol = CRYPTO_TO_RTDS_SYMBOL.get(crypto)
         if rtds_symbol is None:
@@ -123,7 +131,15 @@ class WebSocketPhase:
         entry = self.spot_price_cache.get(rtds_symbol)
         if entry is None:
             return {"spot_price_usdt": None, "spot_price_ts_ms": None}
-        return {"spot_price_usdt": entry[0], "spot_price_ts_ms": entry[1]}
+        price, ts_ms = entry
+        # Freshness guard: if the RTDS feed has stalled, don't paint the
+        # last-known price onto fresh ticks.  Tick row's local_recv_ts_ns
+        # is wallclock-now, so a hours-old spot_price_usdt next to a
+        # current local_recv_ts_ns silently corrupts spread analysis.
+        age_ms = int(time.time() * 1000) - int(ts_ms)
+        if age_ms > self._SPOT_PRICE_MAX_AGE_MS:
+            return {"spot_price_usdt": None, "spot_price_ts_ms": None}
+        return {"spot_price_usdt": price, "spot_price_ts_ms": ts_ms}
 
     def _mark_first_data(self) -> None:
         if not self._first_data_seen:
@@ -912,10 +928,13 @@ class WebSocketPhase:
                 # Re-queue at the TAIL (not head) — DropOldestBuffer is
                 # FIFO and we can't prepend without risking unbounded
                 # growth.  Downstream dedup covers the reordering.
-                ws_buffer.extend(ws_rows)
-                tick_buffer.extend(tick_rows)
-                orderbook_buffer.extend(orderbook_rows)
-                self.spot_price_buffer.extend(spot_snapshot)
+                # ``requeue`` (vs ``extend``) does NOT count overflow
+                # eviction as producer drops, preventing phantom drop
+                # alerts during sustained flush backpressure.
+                ws_buffer.requeue(ws_rows)
+                tick_buffer.requeue(tick_rows)
+                orderbook_buffer.requeue(orderbook_rows)
+                self.spot_price_buffer.requeue(spot_snapshot)
                 # Heartbeat rows are derived state, not buffered — they
                 # will be rebuilt on the next flush cycle.  Force the next
                 # heartbeat emission to fire immediately by rolling

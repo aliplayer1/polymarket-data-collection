@@ -135,6 +135,17 @@ def test_is_valid_bbo_rejects_above_one() -> None:
     assert not is_valid_bbo(0.49, 1.01, 100, 200)
 
 
+def test_is_valid_bbo_rejects_zero_sizes() -> None:
+    """``parse_book_snapshot`` collapses missing-side entries to
+    ``best_bid_size = 0.0``; without a guard those one-sided snapshots
+    flowed into the orderbook table as if the BBO were valid.  Reject
+    any zero or negative size.
+    """
+    assert not is_valid_bbo(0.49, 0.51, 0.0, 200.0)
+    assert not is_valid_bbo(0.49, 0.51, 100.0, 0.0)
+    assert not is_valid_bbo(0.49, 0.51, -1.0, 200.0)
+
+
 # --- parse_rtds_update -----------------------------------------------------
 
 

@@ -62,10 +62,24 @@ class DataHeartbeat:
     grace_period_s: float = 30.0
     _last_seen: dict[str, float] = field(default_factory=dict)
     _installed_at: float = field(default_factory=time.monotonic)
+    _grace_extended: bool = False
 
     def mark(self, key: str) -> None:
-        """Record that ``key`` just delivered data."""
-        self._last_seen[key] = time.monotonic()
+        """Record that ``key`` just delivered data.
+
+        On the very first ``mark`` after a ``reset`` (or construction)
+        we re-anchor the grace period to *now*.  This rolls the
+        watchdog forward past any subscription-confirmation delay that
+        consumed part of the original grace window, so the first valid
+        message — not the connection moment — defines when keys must
+        start delivering data.  Subsequent ``mark`` calls leave the
+        grace anchor alone so the staleness check works normally.
+        """
+        now = time.monotonic()
+        if not self._grace_extended:
+            self._grace_extended = True
+            self._installed_at = now
+        self._last_seen[key] = now
 
     def age(self, key: str) -> float | None:
         """Return seconds since ``key`` was last seen, or None if never."""
@@ -113,6 +127,7 @@ class DataHeartbeat:
         """Forget all last-seen entries and restart the grace period."""
         self._last_seen.clear()
         self._installed_at = time.monotonic()
+        self._grace_extended = False
 
 
 # --- Reconnect helpers (shared by CLOB + RTDS) ---------------------------
@@ -256,6 +271,23 @@ class DropOldestBuffer:
     def extend(self, items: Iterable[Any]) -> None:
         for it in items:
             self.append(it)
+
+    def requeue(self, items: Iterable[Any]) -> None:
+        """Re-insert items previously drained by the flush loop.
+
+        Identical to ``extend`` but does NOT update ``dropped_count`` on
+        overflow.  These bytes were ours to begin with — counting them
+        as producer drops produced phantom alerts when a flush failure
+        re-queued more rows than the buffer could hold (sustained
+        backpressure during transient disk errors).  Producer-side
+        ``append`` still increments the counter normally.
+        """
+        for it in items:
+            if len(self._buf) == self._maxlen:
+                # Drop the oldest silently — same FIFO eviction as
+                # ``append``, but the count stays as-is.
+                pass
+            self._buf.append(it)
 
     def __len__(self) -> int:
         return len(self._buf)

@@ -166,3 +166,43 @@ def test_drop_oldest_buffer_clear_resets_contents_not_drop_count() -> None:
     assert len(b) == 0
     # drop count is cumulative across clears (observability aid)
     assert b.dropped_count == 1
+
+
+def test_drop_oldest_buffer_requeue_does_not_count_drops() -> None:
+    """``requeue`` is the flush failure re-insert path; overflow during
+    re-queue is OUR own data being lost, not a producer drop, so the
+    drop counter must not advance.  Counting these as producer drops
+    inflates ``dropped_count`` and triggers phantom drop alerts during
+    sustained flush backpressure (e.g. transient disk errors).
+    """
+    b = DropOldestBuffer(maxlen=2)
+    b.append(1)
+    b.append(2)
+    assert b.dropped_count == 0
+    # Re-queue more rows than the buffer can hold — older items get
+    # evicted (FIFO) but the drop counter stays at 0.
+    b.requeue([3, 4, 5])
+    assert list(b) == [4, 5]
+    assert b.dropped_count == 0
+    # Subsequent producer-side appends still count drops.
+    b.append(6)
+    assert b.dropped_count == 1
+
+
+def test_heartbeat_first_mark_re_extends_grace_period() -> None:
+    """If the subscribe-confirm + first-data delay would otherwise eat
+    most of the grace window, the FIRST ``mark`` must roll the grace
+    anchor forward to *now*, so the watchdog does not false-positive
+    on a healthy connection that simply took a moment to start.
+    """
+    hb = DataHeartbeat({"k": 1.0}, grace_period_s=0.05)
+    # Wait past the original grace window so it's about to expire.
+    time.sleep(0.04)
+    # First mark resets the grace anchor.
+    hb.mark("k")
+    # Without mark's re-extension, this sleep would push us past the
+    # original grace + threshold. With it, the grace anchor is "now".
+    time.sleep(0.04)
+    # Key has been seen recently (age < threshold); grace doesn't
+    # matter for already-marked keys.
+    assert hb.stale_keys() == []

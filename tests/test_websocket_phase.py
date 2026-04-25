@@ -64,6 +64,32 @@ def test_bucket_by_timeframe_groups_rows():
     assert len(out["1-hour"]) == 2
 
 
+def test_spot_price_kwargs_drops_stale_entries(tmp_path):
+    """If the RTDS feed is stalled, ``_spot_price_kwargs`` must not
+    embed the last-known price into fresh ticks.  A stale spot price
+    next to a current ``local_recv_ts_ns`` silently corrupts spread
+    analysis downstream — better a NULL value than a wrong one.
+    """
+    import time
+    phase = _make_phase(tmp_path)
+
+    fresh_ts = int(time.time() * 1000) - 500  # 0.5 s old
+    stale_ts = int(time.time() * 1000) - 60_000  # 60 s old (> 30 s cap)
+
+    phase.spot_price_cache["btcusdt"] = (67000.5, fresh_ts)
+    fresh = phase._spot_price_kwargs("BTC")
+    assert fresh["spot_price_usdt"] == 67000.5
+    assert fresh["spot_price_ts_ms"] == fresh_ts
+
+    phase.spot_price_cache["btcusdt"] = (67000.5, stale_ts)
+    stale = phase._spot_price_kwargs("BTC")
+    assert stale == {"spot_price_usdt": None, "spot_price_ts_ms": None}
+
+    # Unknown crypto (no RTDS mapping) — also returns None.
+    unknown = phase._spot_price_kwargs("DOGECOIN")
+    assert unknown == {"spot_price_usdt": None, "spot_price_ts_ms": None}
+
+
 def test_book_snapshot_records_orderbook_row(tmp_path):
     phase = _make_phase(tmp_path)
     market = _make_market()
