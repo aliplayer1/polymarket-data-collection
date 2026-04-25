@@ -896,7 +896,19 @@ class WebSocketPhase:
                 tick_buffer.extend(tick_rows)
                 orderbook_buffer.extend(orderbook_rows)
                 self.spot_price_buffer.extend(spot_snapshot)
-                # Heartbeat rows aren't critical; drop on failure.
+                # Heartbeat rows are derived state, not buffered — they
+                # will be rebuilt on the next flush cycle.  Force the next
+                # heartbeat emission to fire immediately by rolling
+                # ``last_heartbeat_time`` back, and log the loss
+                # explicitly so gap-scan tooling can distinguish a
+                # flush failure from a real data outage.
+                if hb_snapshot:
+                    self.logger.warning(
+                        "Dropping %d heartbeat rows due to flush failure; "
+                        "next cycle will re-emit",
+                        len(hb_snapshot),
+                    )
+                    last_heartbeat_time = 0.0
                 continue
 
             # After a successful flush, check whether any buffer dropped

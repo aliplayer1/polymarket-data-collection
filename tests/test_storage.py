@@ -630,7 +630,60 @@ def test_orderbook_shard_write_then_consolidate(tmp_path):
     assert remaining == ["part-0.parquet"]
     result = pq.read_table(os.path.join(part_dir, "part-0.parquet")).to_pandas()
     assert len(result) == 5
-    assert list(result["ts_ms"]) == [1000, 2000, 3000, 4000, 5000]
+    assert sorted(result["ts_ms"].tolist()) == [1000, 2000, 3000, 4000, 5000]
+
+
+def test_consolidate_orderbook_deduplicates_overlapping_rows(tmp_path):
+    """Overlapping (ts_ms, market_id, token_id, outcome) rows from two shards
+    must collapse to a single row, with the newer ``local_recv_ts_ns`` winning.
+
+    Regression test for the missing-dedup bug: a process restart that re-emits
+    buffered events, or two shards that wrote overlapping ``ts_ms`` rows, was
+    leaving duplicates in part-0.parquet permanently.
+    """
+    ob_dir = tmp_path / "orderbook"
+    shard_dir = ob_dir / "crypto=BTC" / "timeframe=5-minute"
+    shard_dir.mkdir(parents=True)
+
+    # Shard 1: older snapshot
+    df_old = pd.DataFrame({
+        "ts_ms": [1000, 2000],
+        "market_id": ["m1", "m1"],
+        "token_id": ["t1", "t1"],
+        "outcome": ["Up", "Up"],
+        "best_bid": [0.40, 0.41],
+        "best_ask": [0.60, 0.59],
+        "best_bid_size": [100.0, 110.0],
+        "best_ask_size": [100.0, 90.0],
+        "local_recv_ts_ns": [1_000_000_000, 2_000_000_000],
+    })
+    # Shard 2: NEWER snapshot, same key tuples ⇒ dedup must keep these values
+    df_new = pd.DataFrame({
+        "ts_ms": [1000, 2000],
+        "market_id": ["m1", "m1"],
+        "token_id": ["t1", "t1"],
+        "outcome": ["Up", "Up"],
+        "best_bid": [0.45, 0.46],
+        "best_ask": [0.55, 0.54],
+        "best_bid_size": [200.0, 210.0],
+        "best_ask_size": [200.0, 190.0],
+        "local_recv_ts_ns": [1_500_000_000, 2_500_000_000],
+    })
+    pq.write_table(pa.Table.from_pandas(df_old, preserve_index=False), shard_dir / "ws_ob_1.parquet")
+    pq.write_table(pa.Table.from_pandas(df_new, preserve_index=False), shard_dir / "ws_ob_2.parquet")
+
+    consolidate_orderbook(orderbook_dir=str(ob_dir))
+    assert os.listdir(shard_dir) == ["part-0.parquet"]
+
+    result = pq.read_table(shard_dir / "part-0.parquet").to_pandas()
+    assert len(result) == 2  # two distinct ts_ms, no duplicates
+
+    by_ts = {row["ts_ms"]: row for _, row in result.iterrows()}
+    # Newer values (from df_new) must win because their local_recv_ts_ns is larger
+    assert by_ts[1000]["best_bid"] == pytest.approx(0.45)
+    assert by_ts[1000]["best_ask"] == pytest.approx(0.55)
+    assert by_ts[1000]["best_bid_size"] == pytest.approx(200.0)
+    assert by_ts[2000]["best_bid"] == pytest.approx(0.46)
 
 
 # ---------------------------------------------------------------------------

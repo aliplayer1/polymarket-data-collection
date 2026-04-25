@@ -1071,8 +1071,16 @@ def consolidate_ticks(
                 """).fetchone()
                 nrows = result[0] if result else 0
 
+                # Replace consolidated file FIRST so a crash between the
+                # two steps leaves orphan shards (idempotent — the next
+                # consolidation run merges them again via dedup) rather
+                # than an empty partition that the HF upload's
+                # delete_patterns would propagate to the Hub.
+                os.replace(tmp_path, consolidated_path)
                 remove_errors: list[str] = []
                 for fname in parquet_files:
+                    if fname == "part-0.parquet":
+                        continue  # already replaced atomically above
                     try:
                         os.remove(os.path.join(dirpath, fname))
                     except OSError as exc:
@@ -1085,7 +1093,6 @@ def consolidate_ticks(
                         rel,
                         "; ".join(remove_errors),
                     )
-                os.replace(tmp_path, consolidated_path)
             except Exception:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
@@ -1566,12 +1573,17 @@ def consolidate_spot_prices(
             _check_disk_space(spot_prices_dir)
             table = _stamp_schema_version(table)
             pq.write_table(table, tmp_path, compression="zstd")
+            # Replace consolidated file FIRST; orphaned shards on crash
+            # are idempotent (next run merges them).  Reverse order risks
+            # an empty partition that delete_patterns would propagate.
+            os.replace(tmp_path, consolidated_path)
             for fname in parquet_files:
+                if fname == "part-0.parquet":
+                    continue  # already replaced atomically above
                 try:
                     os.remove(os.path.join(spot_prices_dir, fname))
                 except OSError:
                     pass
-            os.replace(tmp_path, consolidated_path)
         except Exception:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -1630,8 +1642,13 @@ def consolidate_heartbeats(
             _check_disk_space(heartbeats_dir)
             stamped = _stamp_schema_version(table)
             pq.write_table(stamped, tmp_path, compression="zstd")
+            # Replace consolidated file FIRST; orphan shards on crash
+            # are idempotent (next run merges them).
+            os.replace(tmp_path, consolidated_path)
             remove_errors: list[str] = []
             for fname in parquet_files:
+                if fname == "part-0.parquet":
+                    continue  # already replaced atomically above
                 try:
                     os.remove(os.path.join(heartbeats_dir, fname))
                 except OSError as exc:
@@ -1641,7 +1658,6 @@ def consolidate_heartbeats(
                     "  -> could not remove %d old heartbeat shard file(s): %s",
                     len(remove_errors), "; ".join(remove_errors),
                 )
-            os.replace(tmp_path, consolidated_path)
         except Exception:
             if os.path.exists(tmp_path):
                 try:
@@ -1710,23 +1726,47 @@ def consolidate_orderbook(
                 # always carries the v4 schema shape.
                 desc_res = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{files_sql}], union_by_name=true)").fetchall()
                 present_cols = {row[0] for row in desc_res}
-                local_recv_sql = "local_recv_ts_ns" if "local_recv_ts_ns" in present_cols else "NULL::BIGINT AS local_recv_ts_ns"
+                local_recv_present = "local_recv_ts_ns" in present_cols
+                # Recency tiebreaker for arg_max: prefer local_recv_ts_ns
+                # when present (per-row capture wallclock), else fall back
+                # to ts_ms scaled into ns so cross-shard ties still resolve.
+                recency_sql = (
+                    "COALESCE(local_recv_ts_ns, ts_ms * 1000000)"
+                    if local_recv_present
+                    else "ts_ms * 1000000"
+                )
+                local_recv_select = (
+                    "max(local_recv_ts_ns) AS local_recv_ts_ns"
+                    if local_recv_present
+                    else "NULL::BIGINT AS local_recv_ts_ns"
+                )
                 result = con.execute(f"""
                     COPY (
                         SELECT
                             ts_ms, market_id, token_id, outcome,
-                            best_bid, best_ask, best_bid_size, best_ask_size,
-                            {local_recv_sql}
+                            arg_max(best_bid,       {recency_sql}) AS best_bid,
+                            arg_max(best_ask,       {recency_sql}) AS best_ask,
+                            arg_max(best_bid_size,  {recency_sql}) AS best_bid_size,
+                            arg_max(best_ask_size,  {recency_sql}) AS best_ask_size,
+                            {local_recv_select}
                         FROM read_parquet(
                             [{files_sql}],
                             union_by_name=true
                         )
+                        GROUP BY ts_ms, market_id, token_id, outcome
                     ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
                 """).fetchone()
                 nrows = result[0] if result else 0
 
+                # Replace consolidated file FIRST so a crash between the two
+                # steps leaves orphan shards (idempotent — next run merges
+                # again) rather than an empty partition + delete-pattern
+                # propagating the gap to HF Hub.
+                os.replace(tmp_path, consolidated_path)
                 remove_errors: list[str] = []
                 for fname in parquet_files:
+                    if fname == "part-0.parquet":
+                        continue  # already replaced atomically above
                     try:
                         os.remove(os.path.join(dirpath, fname))
                     except OSError as exc:
@@ -1736,7 +1776,6 @@ def consolidate_orderbook(
                         "  -> could not remove %d old shard file(s) in %s: %s",
                         len(remove_errors), rel, "; ".join(remove_errors),
                     )
-                os.replace(tmp_path, consolidated_path)
             except Exception:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
@@ -2179,7 +2218,28 @@ def upload_to_huggingface(
         ".hf_sync_checkpoint",
         "**/.duckdb_tmp",
     ]
-    _delete = ["*.parquet"]
+    # Restrict deletes to consolidated partition files (``part-*.parquet``).
+    # Earlier this was ``*.parquet`` which would also wipe ``markets.parquet``
+    # if it was momentarily missing locally — losing the only copy of all
+    # market metadata.  Limiting the pattern keeps orphan-cleanup intent
+    # while protecting the top-level metadata file.
+    #
+    # Additionally, abort the delete pass when local consolidation produced
+    # no part-* files at all.  That signals consolidation failed (or hasn't
+    # run yet) and applying delete_patterns would propagate the local hole
+    # to the Hub.
+    _delete: list[str] = ["**/part-*.parquet"]
+    _local_partfile_count = 0
+    for _root, _dirs, _files in os.walk(data_root):
+        for _f in _files:
+            if _f.startswith("part-") and _f.endswith(".parquet"):
+                _local_partfile_count += 1
+    if _local_partfile_count == 0:
+        log.warning(
+            "Local data root has zero part-*.parquet files — skipping "
+            "delete_patterns to avoid wiping the remote dataset."
+        )
+        _delete = []
 
     if os.path.isdir(data_root):
         # Retry on transient file-not-found errors caused by concurrent
