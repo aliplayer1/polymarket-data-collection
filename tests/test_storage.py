@@ -1045,6 +1045,108 @@ def test_ticks_schema_has_local_recv_ts_ns():
     assert "local_recv_ts_ns" in TICKS_SCHEMA.names
 
 
+def test_consolidate_ticks_preserves_sub_ms_ws_trades_via_local_recv_ts_ns(tmp_path):
+    """Two WS trades with identical (market_id, ts_ms, token_id, tx_hash="",
+    log_index=0, order_hash=NULL) but DIFFERENT ``local_recv_ts_ns`` must
+    survive consolidation as two distinct rows.
+
+    Regression: previously the dedup key folded order_hash via COALESCE
+    but had no discriminator for WS rows where order_hash is always NULL,
+    tx_hash="" and log_index=0 — sub-millisecond fills on hot tokens
+    silently collapsed into a single row.
+    """
+    from polymarket_pipeline.storage import consolidate_ticks
+    part = tmp_path / "crypto=BTC" / "timeframe=5-minute"
+    part.mkdir(parents=True)
+
+    ws_rows = pd.DataFrame({
+        "market_id": ["m1", "m1"],
+        "timestamp_ms": [1700000000000, 1700000000000],  # same ms
+        "token_id": ["0xA", "0xA"],
+        "outcome": ["Up", "Up"],
+        "side": ["BUY", "SELL"],
+        "price": [0.50, 0.51],
+        "size_usdc": [10.0, 12.0],
+        "tx_hash": ["", ""],
+        "block_number": [0, 0],
+        "log_index": [0, 0],
+        "source": ["websocket", "websocket"],
+        "spot_price_usdt": [67000.0, 67000.0],
+        "spot_price_ts_ms": [1700000000000, 1700000000000],
+        # Distinct nanosecond receive times — the new dedup discriminator.
+        "local_recv_ts_ns": [1700000000_123_456_000, 1700000000_456_789_000],
+        "order_hash": [None, None],
+    })
+    _write_parquet_atomic(
+        pa.Table.from_pandas(ws_rows, preserve_index=False),
+        str(part / "ws_ticks_test.parquet"),
+    )
+
+    consolidate_ticks(ticks_dir=str(tmp_path))
+    out = pq.ParquetFile(str(part / "part-0.parquet")).read().to_pandas()
+    assert len(out) == 2, (
+        f"expected both sub-ms WS rows to survive, got {len(out)} row(s)"
+    )
+    assert set(out["price"].round(2).tolist()) == {0.50, 0.51}
+
+
+def test_persist_ticks_dedup_matches_consolidate_ticks(tmp_path):
+    """``persist_ticks`` and ``consolidate_ticks`` must agree on dedup.
+
+    The audit found ``persist_ticks`` (pandas drop_duplicates with weaker
+    key) and ``consolidate_ticks`` (DuckDB GROUP BY with order_hash and
+    local_recv_ts_ns) diverging — same input produced different row
+    counts.  After the refactor, ``persist_ticks`` delegates to the
+    streaming path so they cannot disagree.
+    """
+    from polymarket_pipeline.storage import (
+        consolidate_ticks, persist_ticks, append_ticks_only,
+    )
+    # Mixed WS + subgraph batch with overlapping ms timestamps.
+    rows = pd.DataFrame({
+        "market_id": ["m1"] * 4,
+        "timestamp_ms": [1700000000000] * 4,
+        "token_id": ["0xA"] * 4,
+        "outcome": ["Up"] * 4,
+        "side": ["BUY", "SELL", "BUY", "SELL"],
+        "price": [0.50, 0.51, 0.52, 0.53],
+        "size_usdc": [10.0, 11.0, 12.0, 13.0],
+        # Two WS rows (tx_hash=""), two subgraph rows (tx_hash populated).
+        "tx_hash": ["", "", "0xtx1", "0xtx1"],
+        "block_number": [0] * 4,
+        "log_index": [0] * 4,
+        "source": ["websocket", "websocket", "onchain", "onchain"],
+        "spot_price_usdt": [67000.0] * 4,
+        "spot_price_ts_ms": [1700000000000] * 4,
+        # WS rows have distinct local_recv_ts_ns; subgraph rows have NULL.
+        "local_recv_ts_ns": [
+            1700000000_001_000_000, 1700000000_002_000_000, None, None,
+        ],
+        "order_hash": [None, None, "0xa", "0xb"],
+        "crypto": ["BTC"] * 4,
+        "timeframe": ["5-minute"] * 4,
+    })
+
+    # Path A: persist_ticks (now delegates to append+consolidate)
+    dir_a = tmp_path / "a"
+    persist_ticks(rows.copy(), ticks_dir=str(dir_a))
+    out_a = pq.read_table(
+        str(dir_a / "crypto=BTC" / "timeframe=5-minute" / "part-0.parquet")
+    ).to_pandas()
+
+    # Path B: explicit append_ticks_only + consolidate_ticks
+    dir_b = tmp_path / "b"
+    append_ticks_only(rows.copy(), ticks_dir=str(dir_b))
+    consolidate_ticks(ticks_dir=str(dir_b))
+    out_b = pq.read_table(
+        str(dir_b / "crypto=BTC" / "timeframe=5-minute" / "part-0.parquet")
+    ).to_pandas()
+
+    assert len(out_a) == 4
+    assert len(out_b) == len(out_a), "persist_ticks and consolidate_ticks must agree"
+    assert sorted(out_a["price"].tolist()) == sorted(out_b["price"].tolist())
+
+
 def test_orderbook_schema_has_local_recv_ts_ns():
     from polymarket_pipeline.storage import ORDERBOOK_SCHEMA
     assert "local_recv_ts_ns" in ORDERBOOK_SCHEMA.names

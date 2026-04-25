@@ -833,12 +833,26 @@ def persist_ticks(
 ) -> None:
     """Merge new tick rows with existing ticks on disk and write Parquet.
 
-    Deduplicates on (market_id, timestamp_ms, token_id, tx_hash, log_index).
+    Deduplicates on (market_id, timestamp_ms, token_id, tx_hash, log_index)
+    plus ``order_hash`` and ``local_recv_ts_ns`` discriminators.
     Partitioned by crypto / timeframe.
 
-    The entire read → merge → write cycle is protected by an exclusive write
-    lock (threading + fcntl) so concurrent callers — whether from
-    ``run_in_executor`` threads or a separate OS process — cannot interleave.
+    Implementation delegates to ``append_ticks_only`` + ``consolidate_ticks``
+    so the dedup logic is shared with the WebSocket / backfill streaming
+    path.  Two benefits:
+
+    1. Memory: the previous implementation read the entire (crypto, timeframe)
+       partition into pandas, then concat + drop_duplicates + sort — peak
+       memory ~3× partition size, which OOMs the 8 GB CAX21 production
+       host once partitions exceed a few GB.  Streaming via DuckDB caps
+       memory regardless of partition size.
+
+    2. Correctness: the previous pandas ``drop_duplicates`` used a
+       weaker key that excluded ``order_hash`` and ``local_recv_ts_ns``,
+       so it collapsed sub-millisecond WS trades AND multi-fill subgraph
+       transactions that ``consolidate_ticks`` (with the stronger key)
+       preserves.  Going through the same code path eliminates the
+       divergence.
     """
     if ticks_df.empty:
         return
@@ -846,47 +860,8 @@ def persist_ticks(
     log = logger or logging.getLogger("polymarket_pipeline")
     t_dir = ticks_dir or PARQUET_TICKS_DIR
 
-    # Ensure required columns are present with defaults
-    for col in _TICKS_EMPTY_COLS:
-        if col not in ticks_df.columns:
-            ticks_df = ticks_df.copy()
-            if col in ("tx_hash",):
-                ticks_df[col] = ""
-            elif col in ("block_number", "log_index"):
-                ticks_df[col] = 0
-            else:
-                ticks_df[col] = None
-
-    # Load only the (crypto, timeframe) partitions present in the new data.
-    for col in ("outcome", "side", "source", "crypto", "timeframe"):
-        if col in ticks_df.columns and hasattr(ticks_df[col], "cat"):
-            ticks_df = ticks_df.copy()
-            ticks_df[col] = ticks_df[col].astype(str)
-
-    data_root = os.path.dirname(os.path.abspath(t_dir))
-    with _write_lock(data_root):
-        if "crypto" in ticks_df.columns and "timeframe" in ticks_df.columns:
-            partition_pairs = list(ticks_df.groupby(["crypto", "timeframe"], sort=False).groups.keys())
-            partition_filters = [[("crypto", "=", str(c)), ("timeframe", "=", str(t))] for c, t in partition_pairs]
-            existing = load_ticks(t_dir, filters=partition_filters)
-        else:
-            existing = load_ticks(t_dir)
-
-        # Flatten category columns before concat
-        for col in ("outcome", "side", "source", "crypto", "timeframe"):
-            if col in existing.columns and hasattr(existing[col], "cat"):
-                existing[col] = existing[col].astype(str)
-
-        merged = (
-            pd.concat([existing, ticks_df], ignore_index=True)
-            .drop_duplicates(subset=_TICKS_DEDUP_COLS, keep="last")
-            .sort_values(["market_id", "timestamp_ms"])
-            .reset_index(drop=True)
-        )
-        merged = optimise_ticks_df(merged)
-        table = pa.Table.from_pandas(merged, preserve_index=False)
-        _write_partitioned_atomic(table, t_dir, partition_cols=["crypto", "timeframe"])
-        log.info("Ticks table written: %s/ (%s rows)", t_dir, len(merged))
+    append_ticks_only(ticks_df, ticks_dir=t_dir, logger=log)
+    consolidate_ticks(ticks_dir=t_dir, logger=log)
 
 
 def append_ticks_only(
@@ -1059,14 +1034,27 @@ def consolidate_ticks(
                         -- Intentionally omit a final ORDER BY: the global sort is
                         -- another blocking operator and was the main OOM trigger.
                         --
-                        -- Dedup key includes ``COALESCE(order_hash, '')`` so
-                        -- subgraph-sourced rows (populated order_hash, unique
-                        -- per-fill within a tx) don't collapse with legacy
-                        -- on-chain / WS rows that have NULL order_hash.
+                        -- Dedup key includes:
+                        --   * COALESCE(order_hash, '') so subgraph-sourced
+                        --     rows (populated order_hash, unique per-fill
+                        --     within a tx) don't collapse with legacy
+                        --     on-chain / WS rows that have NULL order_hash.
+                        --   * COALESCE(local_recv_ts_ns, 0) so multiple WS
+                        --     trades on the same (market_id, ts_ms,
+                        --     token_id) — where tx_hash="", log_index=0,
+                        --     order_hash IS NULL — but with distinct
+                        --     nanosecond receive times survive
+                        --     consolidation.  Sub-millisecond fills can
+                        --     and do happen on hot tokens; without this
+                        --     discriminator they used to collapse to one
+                        --     row.  Old shards without local_recv_ts_ns
+                        --     map to 0 and dedup as before.
                         SELECT
                             {select_sql}
                         FROM ranked_rows
-                        GROUP BY {group_by_sql}, COALESCE(order_hash, '')
+                        GROUP BY {group_by_sql},
+                                 COALESCE(order_hash, ''),
+                                 COALESCE(local_recv_ts_ns, 0)
                     ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
                 """).fetchone()
                 nrows = result[0] if result else 0
