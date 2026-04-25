@@ -112,3 +112,60 @@ def test_no_heartbeats_no_findings_exits_zero(monkeypatch, tmp_path):
         "--fail-on-bursts",
     ])
     assert rc == 0
+
+
+def test_fail_window_hours_excludes_historical_gap(monkeypatch, tmp_path):
+    """A gap that closed before the fail-window must not promote to a
+    non-zero exit.  This is the path that prevents a one-time outage
+    from re-tripping OnFailure on every subsequent daily run.
+    """
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    # Historical gap: closed ~5 days ago, much larger than the
+    # fail-on-gap-ms threshold.  With a 48 h fail-window the gap is
+    # filtered out → exit 0.
+    historical_start = now_ms - 6 * 86400 * 1000
+    historical_end = now_ms - 5 * 86400 * 1000
+    _write_heartbeats(tmp_path, gap_pairs=[(historical_start, historical_end)])
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    # Without the recency filter, a 30s threshold catches the giant gap.
+    rc_strict = _run(monkeypatch, [
+        "--data-dir", str(tmp_path),
+        "--log-dir", str(log_dir),
+        "--fail-on-gap-ms", "30000",
+    ])
+    assert rc_strict == 1, "without --fail-window-hours, historical gap fails"
+
+    # With a 48 h recency window, the historical gap is excluded.
+    rc_with_window = _run(monkeypatch, [
+        "--data-dir", str(tmp_path),
+        "--log-dir", str(log_dir),
+        "--fail-on-gap-ms", "30000",
+        "--fail-window-hours", "48",
+    ])
+    assert rc_with_window == 0, "48 h window must exclude a 5-day-old gap"
+
+
+def test_fail_window_hours_includes_recent_gap(monkeypatch, tmp_path):
+    """A gap that closed within the fail-window still trips the fail
+    check.  This protects against silently ignoring a real recent
+    outage just because the recency filter is in play.
+    """
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    # Recent gap that ended 1 hour ago, exceeds threshold.
+    recent_start = now_ms - 2 * 3600 * 1000
+    recent_end = now_ms - 1 * 3600 * 1000
+    _write_heartbeats(tmp_path, gap_pairs=[(recent_start, recent_end)])
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    rc = _run(monkeypatch, [
+        "--data-dir", str(tmp_path),
+        "--log-dir", str(log_dir),
+        "--fail-on-gap-ms", "30000",
+        "--fail-window-hours", "48",
+    ])
+    assert rc == 1, "recent gap inside the window must still fail the check"

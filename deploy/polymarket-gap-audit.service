@@ -20,14 +20,18 @@ EnvironmentFile=/opt/polymarket/.env
 # - ``--fail-on-gap-ms 21600000`` (6 hours) and ``--fail-on-bursts``
 #   promote ONLY exceptional findings to a non-zero exit, so systemd's
 #   ``OnFailure=`` fires for major outages and reconnect storms but
-#   stays quiet on routine restart-induced gaps (which used to spam
-#   ``polymarket-gap-audit.service: Failed`` on every run).
+#   stays quiet on routine restart-induced gaps.
+# - ``--fail-window-hours 48`` confines the fail check to gaps that
+#   closed (or are ongoing) within the last 48 h.  Without this, a
+#   historical outage that ended days ago would re-trip OnFailure on
+#   every subsequent run because the heartbeat data still records it.
 ExecStart=/opt/polymarket/.venv/bin/python /opt/polymarket/scripts/audit_ws_gaps.py \
     --data-dir /opt/polymarket/data \
     --log-dir /var/log/polymarket \
     --alert \
     --fail-on-gap-ms 21600000 \
-    --fail-on-bursts
+    --fail-on-bursts \
+    --fail-window-hours 48
 
 [Install]
 WantedBy=multi-user.target

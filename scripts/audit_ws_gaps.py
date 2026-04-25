@@ -240,6 +240,21 @@ def main() -> int:
             "burst-window).  Default off."
         ),
     )
+    parser.add_argument(
+        "--fail-window-hours",
+        type=float,
+        default=0.0,
+        metavar="HOURS",
+        help=(
+            "Restrict the fail-on-* check to gaps/bursts that closed "
+            "(or are currently ongoing) within the last N hours.  "
+            "Default 0 = consider all findings.  Recommended: 48 for "
+            "a daily audit — a once-real outage stops re-tripping "
+            "OnFailure forever after the heartbeat data accumulates "
+            "post-incident.  All findings still go in the manifest "
+            "regardless of this flag."
+        ),
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir).expanduser().resolve()
@@ -295,12 +310,39 @@ def main() -> int:
     # to a non-zero exit ONLY when the operator explicitly asked us to
     # via ``--fail-on-bursts`` / ``--fail-on-gap-ms``, so systemd's
     # ``OnFailure=`` only fires on truly exceptional conditions.
+    #
+    # ``--fail-window-hours`` further narrows the fail check to recent
+    # findings, so a historical outage doesn't re-trip OnFailure on
+    # every subsequent run forever.
+    fail_gaps = gaps
+    fail_bursts = bursts
+    if args.fail_window_hours > 0:
+        cutoff_ms = int((time.time() - args.fail_window_hours * 3600.0) * 1000.0)
+        fail_gaps = [g for g in gaps if int(g.get("end_ms", 0)) >= cutoff_ms]
+        # Burst records carry ``window_start_ts`` / ``window_end_ts``
+        # in seconds (monotonic-flavoured ts).  Use ``window_end_ts``
+        # if present; otherwise the burst is undated and we keep it.
+        cutoff_s = time.time() - args.fail_window_hours * 3600.0
+        fail_bursts = [
+            b for b in bursts
+            if "window_end_ts" not in b
+            or float(b["window_end_ts"]) >= cutoff_s
+        ]
+        skipped_gaps = len(gaps) - len(fail_gaps)
+        skipped_bursts = len(bursts) - len(fail_bursts)
+        if skipped_gaps or skipped_bursts:
+            print(
+                f"Recency filter (--fail-window-hours {args.fail_window_hours}): "
+                f"ignoring {skipped_gaps} historical gap(s) and "
+                f"{skipped_bursts} historical burst(s) for the fail check"
+            )
+
     fail = False
-    if args.fail_on_bursts and bursts:
-        print(f"FAIL: {len(bursts)} reconnect burst(s) present (--fail-on-bursts)")
+    if args.fail_on_bursts and fail_bursts:
+        print(f"FAIL: {len(fail_bursts)} reconnect burst(s) present (--fail-on-bursts)")
         fail = True
     if args.fail_on_gap_ms > 0:
-        large = [g for g in gaps if int(g.get("gap_ms", 0)) > args.fail_on_gap_ms]
+        large = [g for g in fail_gaps if int(g.get("gap_ms", 0)) > args.fail_on_gap_ms]
         if large:
             print(
                 f"FAIL: {len(large)} gap(s) exceed {args.fail_on_gap_ms} ms "
