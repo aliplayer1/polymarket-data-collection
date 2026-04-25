@@ -15,6 +15,7 @@ class MarketProvider(Protocol):
         active: bool = False,
         closed: bool = False,
         end_ts_min: int | None = None,
+        end_ts_max: int | None = None,
     ) -> Iterator[MarketRecord]: ...
 
 

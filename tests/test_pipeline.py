@@ -41,8 +41,9 @@ class FakeApi:
     ) -> None:
         self.closed_markets = closed_markets or []
         self.active_markets = active_markets or []
-        self.closed_calls: list[int | None] = []
-        self.active_calls: list[int | None] = []
+        # Track both bounds so tests can assert end_ts_max forwarding.
+        self.closed_calls: list[tuple[int | None, int | None]] = []
+        self.active_calls: list[tuple[int | None, int | None]] = []
 
     def fetch_markets(
         self,
@@ -50,12 +51,13 @@ class FakeApi:
         active: bool = False,
         closed: bool = False,
         end_ts_min: int | None = None,
+        end_ts_max: int | None = None,
     ):
         if closed:
-            self.closed_calls.append(end_ts_min)
+            self.closed_calls.append((end_ts_min, end_ts_max))
             markets = self.closed_markets
         elif active:
-            self.active_calls.append(end_ts_min)
+            self.active_calls.append((end_ts_min, end_ts_max))
             markets = self.active_markets
         else:
             markets = []
@@ -169,7 +171,7 @@ def test_pipeline_test_mode_uses_test_output_and_skips_websocket(tmp_path, monke
     pipeline.run(run_options=PipelineRunOptions.from_values(test_limit=1))
 
     assert pipeline.paths.data_dir == Path(test_output_dir)
-    assert api.closed_calls == [None]
+    assert api.closed_calls == [(None, None)]
     assert api.active_calls == []
     assert websocket_calls == []
     assert report_calls == ["printed"]
@@ -198,7 +200,7 @@ def test_pipeline_websocket_only_fetches_active_markets_and_runs_stream(tmp_path
     pipeline.run(run_options=PipelineRunOptions.from_values(websocket_only=True))
 
     assert api.closed_calls == []
-    assert api.active_calls == [None]
+    assert api.active_calls == [(None, None)]
     assert load_calls == []
     assert websocket_calls == [["active-1"]]
     assert summary_calls == ["printed"]
@@ -228,9 +230,64 @@ def test_pipeline_historical_only_runs_tick_backfill_without_websocket(tmp_path,
 
     pipeline.run(run_options=PipelineRunOptions.from_values(historical_only=True))
 
-    assert api.closed_calls == [None]
+    assert api.closed_calls == [(None, None)]
     assert api.active_calls == []
     assert tick_provider.calls == [(("closed-1",), 1000000, 1000300)]
     assert consolidate_calls == [str(tmp_path / "data" / "ticks")]
     assert websocket_calls == []
     assert summary_calls == ["printed"]
+
+
+def test_pipeline_historical_only_forwards_to_date_upper_bound(tmp_path, monkeypatch) -> None:
+    """``--to-date 2026-04-25`` must forward an ``end_ts_max`` to the API
+    that corresponds to the END of the named day (midnight UTC of the
+    next day), so markets closing on the named day are INCLUDED.
+
+    Also verifies that markets whose ``end_ts`` falls on or after the
+    upper bound are filtered out client-side, matching the semantics
+    of Gamma's server-side ``end_date_max`` filter.
+    """
+    from datetime import datetime, timezone
+    expected_upper = int(
+        datetime(2026, 4, 26, 0, 0, 0, tzinfo=timezone.utc).timestamp()
+    )
+
+    # Two markets: one ending well before the cutoff (kept) and one
+    # ending exactly AT the cutoff (filtered out by client-side check).
+    in_range = _market(
+        "in-range", is_active=False,
+        start_ts=expected_upper - 3600, end_ts=expected_upper - 1,
+    )
+    boundary = _market(
+        "boundary", is_active=False,
+        start_ts=expected_upper - 3600, end_ts=expected_upper,
+    )
+    api = FakeApi(closed_markets=[in_range, boundary])
+    tick_provider = FakeTickProvider()
+    pipeline = _pipeline(
+        api=api,
+        settings=RuntimeSettings(data_dir=tmp_path / "data"),
+        tick_provider=tick_provider,
+    )
+
+    monkeypatch.setattr(
+        "polymarket_pipeline.pipeline.consolidate_ticks",
+        lambda *, ticks_dir, logger: None,
+    )
+
+    async def _record_websocket(markets, run_options=None):
+        return None
+
+    pipeline.run_websocket = _record_websocket
+    pipeline.print_summary = lambda: None
+
+    pipeline.run(run_options=PipelineRunOptions.from_values(
+        historical_only=True, to_date="2026-04-25",
+    ))
+
+    # Server-side: the upper-bound is the END of 2026-04-25 (i.e.
+    # midnight 2026-04-26 UTC), forwarded to the API.
+    assert api.closed_calls == [(None, expected_upper)]
+    # Client-side: only the market ending strictly before the cutoff
+    # is collected; the one ending AT the cutoff is filtered out.
+    assert [c[0] for c in tick_provider.calls] == [("in-range",)]

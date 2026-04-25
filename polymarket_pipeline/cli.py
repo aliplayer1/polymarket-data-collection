@@ -168,6 +168,19 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--to-date",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=(
+            "Only scan markets that closed on or before this date "
+            "(inclusive — the named day is included).  Pairs with "
+            "--from-date to scan a bounded historical window; server-side "
+            "filtering bypasses Gamma's ~250K-offset pagination cap.  Useful "
+            "when restoring multi-month gaps in chunks."
+        ),
+    )
+    parser.add_argument(
         "--upload-only",
         action="store_true",
         help=(

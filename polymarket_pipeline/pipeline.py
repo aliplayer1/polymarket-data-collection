@@ -5,7 +5,7 @@ import gc
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from py_clob_client.client import ClobClient
 
@@ -344,9 +344,35 @@ class PolymarketDataPipeline:
         relevant_batch: list[MarketRecord] = []
         closed_markets_for_ticks: list[MarketRecord] = []
 
+        # Optional upper bound from --to-date.  Paired with --from-date
+        # this enables scanning a bounded historical window via Gamma's
+        # server-side ``end_date_max`` filter, bypassing the 250K-offset
+        # pagination cap.  Useful when restoring multi-month gaps.
+        #
+        # Treat ``--to-date 2026-04-25`` as midnight 2026-04-26 UTC
+        # (i.e. *end* of the named day) so a market closing on the
+        # named day is INCLUDED in the scan.  The earlier
+        # ``midnight-of-the-day`` semantics excluded markets closing
+        # exactly on the named day, which most operators do not expect.
+        scan_cutoff_ts_max: int | None = None
+        if run_options.to_date and not run_options.is_test:
+            try:
+                _to_date_dt = (
+                    datetime.strptime(run_options.to_date, "%Y-%m-%d")
+                    .replace(tzinfo=timezone.utc)
+                    + timedelta(days=1)
+                )
+                scan_cutoff_ts_max = int(_to_date_dt.timestamp())
+            except ValueError:
+                self.logger.warning(
+                    "Invalid --to-date value '%s'; ignoring upper bound",
+                    run_options.to_date,
+                )
+
         for market in self.api.fetch_markets(
             closed=True,
             end_ts_min=scan_cutoff_ts if not run_options.is_test else None,
+            end_ts_max=scan_cutoff_ts_max,
         ):
             if run_options.is_test and run_options.test_limit is not None and test_collected >= run_options.test_limit:
                 self.logger.info(
@@ -373,6 +399,14 @@ class PolymarketDataPipeline:
                 self._save_scan_checkpoint(max_closed_ts_seen)
 
             if self._is_market_relevant(market, run_options, scan_cutoff_ts):
+                # Respect --to-date upper bound client-side as well, in
+                # case Gamma's ``end_date_max`` filter honours a slightly
+                # different date field.  Compare against ``end_ts`` —
+                # the same field Gamma's ``end_date_max`` filters on —
+                # rather than ``closed_ts`` (which can drift for
+                # early-resolved markets).
+                if scan_cutoff_ts_max is not None and market.end_ts >= scan_cutoff_ts_max:
+                    continue
                 relevant_batch.append(market)
                 test_collected += 1
                 closed_markets_for_ticks.append(market)
