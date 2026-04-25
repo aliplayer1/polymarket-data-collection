@@ -315,9 +315,21 @@ class WebSocketPhase:
 
         async def _recv_loop() -> None:
             nonlocal data_received
+            # Yield to the event loop every N messages so co-tasks
+            # (notably the watchdog) actually get scheduled even when
+            # ``ws.recv()`` always has a buffered message ready under
+            # high-volume shards (~90% price_change traffic).  Without
+            # this yield, hot shards starve the watchdog and false-
+            # negative staleness becomes possible.
+            _yield_every = 100
+            _msg_count = 0
             while True:
                 message = await ws.recv()
                 local_recv_ts_ns = time.time_ns()
+                _msg_count += 1
+                if _msg_count >= _yield_every:
+                    _msg_count = 0
+                    await asyncio.sleep(0)
                 try:
                     payload = json.loads(message)
                 except (ValueError, TypeError):
@@ -680,12 +692,20 @@ class WebSocketPhase:
                     shard_key, "watchdog_stale", str(exc),
                     fd=fd, session_duration=session_duration,
                 )
-                # Stale data implies the prior session WAS receiving data —
-                # reset backoff for fast MTTR.  Still record for the burst
-                # monitor so we detect repeated staleness.
-                reconnect_attempts = 0
+                # Stale data USUALLY implies the prior session WAS
+                # receiving data — reset backoff for fast MTTR.  But if
+                # the watchdog fires WITHOUT any prior data flowing
+                # (e.g. silent subscription rejection on a dead token),
+                # keep growing backoff so we don't tight-loop reconnect.
+                prior_data = hb.has_seen_any()
+                if prior_data:
+                    reconnect_attempts = 0
+                    delay = jittered_backoff(0)
+                else:
+                    delay = jittered_backoff(reconnect_attempts)
+                    reconnect_attempts += 1
                 self._record_reconnect_burst(shard_key)
-                await asyncio.sleep(jittered_backoff(0))
+                await asyncio.sleep(delay)
             except websockets.exceptions.ConnectionClosed as exc:
                 session_duration = time.monotonic() - session_started
                 disconnect_time = time.time()

@@ -74,12 +74,24 @@ class DataHeartbeat:
             return None
         return time.monotonic() - ts
 
+    def has_seen_any(self) -> bool:
+        """Return True iff any registered key has been marked at least once.
+
+        Useful as a "prior_data" signal for the outer reconnect loop —
+        distinguishes "session was healthy then went stale" (reset
+        backoff) from "session never delivered anything" (keep growing
+        backoff to avoid hammering a misconfigured subscription).
+        """
+        return bool(self._last_seen)
+
     def stale_keys(self) -> list[tuple[str, float]]:
         """Return ``[(key, age_seconds)]`` for every key past its threshold.
 
         Returns ``[]`` during the grace period.  Keys that have never been
         seen are flagged only after ``max(threshold, grace_period_s)`` has
-        elapsed since construction / reset.
+        elapsed since construction / reset; their reported "age" is
+        ``inf`` so log consumers can distinguish "stale" (real staleness)
+        from "never seen" (session uptime, often misleadingly large).
         """
         now = time.monotonic()
         elapsed = now - self._installed_at
@@ -90,7 +102,7 @@ class DataHeartbeat:
             last = self._last_seen.get(key)
             if last is None:
                 if elapsed > max(threshold, self.grace_period_s):
-                    stale.append((key, elapsed))
+                    stale.append((key, float("inf")))
             else:
                 age = now - last
                 if age > threshold:

@@ -32,7 +32,21 @@ def test_heartbeat_flags_never_seen_past_threshold() -> None:
     assert stale
     key, age = stale[0]
     assert key == "k"
-    assert age > 0.0
+    # Never-seen keys report age=inf so log consumers can distinguish
+    # "key was never marked" from "key went stale after being seen".
+    # Using session-uptime as the "age" for never-seen keys was
+    # misleading and produced inflated outage durations in operator
+    # logs.
+    assert age == float("inf")
+
+
+def test_heartbeat_has_seen_any() -> None:
+    hb = DataHeartbeat({"a": 1.0, "b": 1.0})
+    assert hb.has_seen_any() is False
+    hb.mark("a")
+    assert hb.has_seen_any() is True
+    hb.reset()
+    assert hb.has_seen_any() is False
 
 
 def test_heartbeat_mark_clears_staleness() -> None:

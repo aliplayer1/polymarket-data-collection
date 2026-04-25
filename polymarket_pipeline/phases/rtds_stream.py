@@ -164,8 +164,20 @@ class RTDSStreamPhase:
                             await asyncio.sleep(_PING_INTERVAL_SECONDS)
                             try:
                                 await ws.send("PING")
-                            except Exception:
+                            except websockets.exceptions.ConnectionClosed:
+                                # Connection is gone — recv will surface it.
                                 return
+                            except Exception as exc:
+                                # Don't silently exit the keepalive loop on
+                                # transient errors — RTDS sets
+                                # ping_interval=None so this is the ONLY
+                                # keepalive.  Logging at debug because we
+                                # want to keep retrying; recv will detect
+                                # a dead connection on its own.
+                                self.logger.debug(
+                                    "RTDS[%s] ping failed (will retry): %s",
+                                    feed_name, exc,
+                                )
 
                     async def _recv_loop() -> None:
                         nonlocal prior_data
@@ -204,8 +216,13 @@ class RTDSStreamPhase:
                     recv_task = asyncio.create_task(_recv_loop())
                     watch_task = asyncio.create_task(_watchdog_loop())
                     try:
+                        # Include ping_task so its early termination is
+                        # visible — previously it was created but not
+                        # waited on, and it silently swallowed all
+                        # exceptions, producing zombie connections that
+                        # were only caught by the 30s watchdog.
                         done, _ = await asyncio.wait(
-                            {recv_task, watch_task},
+                            {ping_task, recv_task, watch_task},
                             return_when=asyncio.FIRST_EXCEPTION,
                         )
                     finally:
@@ -249,12 +266,21 @@ class RTDSStreamPhase:
                 return
             except _WatchdogStale as exc:
                 # Stale data means the prior session WAS healthy up to
-                # ``stale_after`` seconds ago → reset backoff.
-                reconnect_attempts = 0
-                delay = jittered_backoff(0)
+                # ``stale_after`` seconds ago → reset backoff.  But if
+                # the watchdog fires WITHOUT any prior data (e.g. silent
+                # subscription rejection) we keep growing backoff — a
+                # tight reconnect loop on a misconfigured topic would
+                # otherwise hammer the server until somebody notices.
+                if prior_data:
+                    reconnect_attempts = 0
+                    delay = jittered_backoff(0)
+                else:
+                    delay = jittered_backoff(reconnect_attempts)
+                    reconnect_attempts += 1
                 self.logger.warning(
-                    "RTDS[%s]: watchdog stale (%s). Reconnecting in %.1fs",
-                    feed_name, exc, delay,
+                    "RTDS[%s]: watchdog stale (%s, prior_data=%s). "
+                    "Reconnecting in %.1fs",
+                    feed_name, exc, prior_data, delay,
                 )
                 await asyncio.sleep(delay)
             except Exception as exc:
