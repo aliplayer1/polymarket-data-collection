@@ -168,6 +168,47 @@ def test_decoder_rejects_non_numeric_amounts():
     assert fetcher._decode_fill(event, token_to_market) is None
 
 
+def test_decoder_accepts_exact_one_price_via_integer_guard():
+    """A fill where USDC equals shares represents price = 1.0 exactly
+    (e.g. a settled-Yes par sweep).  FP rounding can yield
+    1.0000000000000002, which the previous check
+    ``not (0.0 <= price <= 1.0)`` rejected.  The integer-guard +
+    clamp accepts these.
+    """
+    m = _market(up_id="0xUP")
+    fetcher = SubgraphTickFetcher(_stub_client([]))
+    token_to_market = {"0xUP": m}
+    event = {
+        "id": "x", "transactionHash": "0x", "timestamp": "1",
+        "orderHash": "0x",
+        "makerAssetId": "0xUP", "takerAssetId": "0",
+        "makerAmountFilled": "999999",  # tiny share count to amplify FP
+        "takerAmountFilled": "999999",  # equal → conceptual price = 1.0
+    }
+    result = fetcher._decode_fill(event, token_to_market)
+    assert result is not None
+    _mid, row = result
+    assert row["price"] == 1.0  # clamped to bound exactly
+
+
+def test_decoder_rejects_price_above_one_via_integer_guard():
+    """An above-1.0 price should still be rejected (USDC > shares is
+    economically impossible for a binary market) even after the
+    floating-point guard is replaced with an integer comparison.
+    """
+    m = _market(up_id="0xUP")
+    fetcher = SubgraphTickFetcher(_stub_client([]))
+    token_to_market = {"0xUP": m}
+    event = {
+        "id": "x", "transactionHash": "0x", "timestamp": "1",
+        "orderHash": "0x",
+        "makerAssetId": "0xUP", "takerAssetId": "0",
+        "makerAmountFilled": "1000000",
+        "takerAmountFilled": "1000001",  # 1 atto-USDC over → reject
+    }
+    assert fetcher._decode_fill(event, token_to_market) is None
+
+
 # --- Pagination ----------------------------------------------------------
 
 
@@ -195,10 +236,94 @@ def test_paginate_stops_when_page_shorter_than_page_size():
     fetcher = SubgraphTickFetcher(client, page_size=3)
     result = fetcher.get_ticks_for_markets_batch([m], start_ts=1, end_ts=9999999999)
     assert len(result[m.market_id]) == 4
-    # Two queries per window (maker-filter + taker-filter).  Maker runs
-    # twice (page1 full → continue, page2 shorter → stop); taker runs
-    # once (empty → stop).  Total = 3.
+    # Two queries per window (maker-filter + taker-filter).  Maker
+    # consumes 2 pages (page1 full → continue, page2 shorter → stop);
+    # taker runs once (empty → stop).  Total = 3 calls.
     assert len(client.call_log) == 3
+
+
+def test_paginate_aborts_when_cursor_does_not_advance():
+    """If the subgraph returns a non-advancing cursor (a backend bug
+    or corruption), pagination must abort rather than spin forever.
+    """
+    m = _market(up_id="0xUP")
+    # Each page returns the same last id — cursor never advances.
+    repeating_page = [
+        {"id": "a1", "transactionHash": "x", "timestamp": "1700000100",
+         "orderHash": "o1", "makerAssetId": "0xUP", "takerAssetId": "0",
+         "makerAmountFilled": "1000000", "takerAmountFilled": "500000"},
+        {"id": "a2", "transactionHash": "x", "timestamp": "1700000100",
+         "orderHash": "o2", "makerAssetId": "0xUP", "takerAssetId": "0",
+         "makerAmountFilled": "1000000", "takerAmountFilled": "500000"},
+    ]
+    # Always serve the same page (cursor will repeat at "a2").
+    client = SubgraphClient(
+        primary_url="https://primary.example",
+        fallback_url=None,
+        request_interval_s=0.0,
+        max_retries=1,
+    )
+    call_log: list[dict] = []
+
+    def fake_query(query: str, variables: dict | None = None) -> dict:
+        call_log.append(dict(variables or {}))
+        return {"orderFilledEvents": list(repeating_page)}
+
+    client.query = fake_query  # type: ignore[assignment]
+    client.call_log = call_log  # type: ignore[attr-defined]
+
+    fetcher = SubgraphTickFetcher(client, page_size=2)
+    fetcher.get_ticks_for_markets_batch([m], start_ts=1, end_ts=2)
+
+    # Maker query: page 1 (lastId="") returns a2; page 2 (lastId="a2")
+    # returns a2 again → non-advancing cursor → abort.
+    # Then taker query runs once (also returns a2,a2 → page 1 then
+    # page 2 non-advancing → abort).  Total queries: 4 (not unbounded).
+    assert 2 <= len(call_log) <= 6, f"unexpected call count: {len(call_log)}"
+
+
+def test_paginate_max_page_guard_caps_runaway_loops():
+    """A non-broken-but-pathological feed (every page is exactly
+    page_size, cursor advances) must not loop forever — the
+    ``_MAX_PAGES_PER_QUERY`` guard caps the total pages per query.
+    """
+    m = _market(up_id="0xUP")
+
+    client = SubgraphClient(
+        primary_url="https://primary.example",
+        fallback_url=None,
+        request_interval_s=0.0,
+        max_retries=1,
+    )
+    call_log: list[dict] = []
+    counter = {"n": 0}
+
+    def fake_query(query: str, variables: dict | None = None) -> dict:
+        call_log.append(dict(variables or {}))
+        # Always return a full page with strictly-increasing ids.
+        n = counter["n"]
+        counter["n"] += 1
+        return {
+            "orderFilledEvents": [
+                {"id": f"a_{n:08d}_1", "transactionHash": "x", "timestamp": "1700000100",
+                 "orderHash": f"o_{n}_1", "makerAssetId": "0xUP", "takerAssetId": "0",
+                 "makerAmountFilled": "1000000", "takerAmountFilled": "500000"},
+                {"id": f"a_{n:08d}_2", "transactionHash": "x", "timestamp": "1700000100",
+                 "orderHash": f"o_{n}_2", "makerAssetId": "0xUP", "takerAssetId": "0",
+                 "makerAmountFilled": "1000000", "takerAmountFilled": "500000"},
+            ]
+        }
+
+    client.query = fake_query  # type: ignore[assignment]
+    client.call_log = call_log  # type: ignore[attr-defined]
+
+    # Tiny override of the cap so the test is fast.
+    fetcher = SubgraphTickFetcher(client, page_size=2)
+    fetcher._MAX_PAGES_PER_QUERY = 5
+    fetcher.get_ticks_for_markets_batch([m], start_ts=1, end_ts=2)
+
+    # Maker burns 5 pages, taker burns 5 pages → 10 calls total.
+    assert len(call_log) == 10
 
 
 def test_paginate_cursor_advances_on_last_id():

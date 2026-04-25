@@ -150,12 +150,21 @@ class PythPricePhase:
             try:
                 df = self.fetch_for_market(m)
                 if not df.empty:
-                    table = pa.Table.from_pandas(df)
-                    pq.write_to_dataset(
-                        table,
-                        root_path=str(self.spot_prices_dir),
-                        partition_cols=["symbol"],
-                        compression="zstd",
-                    )
+                    # Write per-symbol shard files atomically (.tmp +
+                    # os.replace) so a crash mid-write doesn't leave a
+                    # partial Parquet that subsequent reads choke on.
+                    # ``pq.write_to_dataset`` does not provide atomic
+                    # semantics — it streams directly to the dataset
+                    # path.
+                    shard_id = f"pyth_{m.market_id}_{os.getpid()}_{int(time.time() * 1000)}"
+                    for symbol, group in df.groupby("symbol", sort=False, observed=True):
+                        sym_dir = self.spot_prices_dir / f"symbol={symbol}"
+                        sym_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = sym_dir / f"{shard_id}.parquet"
+                        tmp_path = sym_dir / f"{shard_id}.parquet.tmp"
+                        rows = group.drop(columns=["symbol"]).reset_index(drop=True)
+                        table = pa.Table.from_pandas(rows, preserve_index=False)
+                        pq.write_table(table, str(tmp_path), compression="zstd")
+                        os.replace(str(tmp_path), str(out_path))
             except Exception as e:
                 self.logger.error("Error fetching Pyth prices for market %s: %s", m.market_id, e)

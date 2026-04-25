@@ -509,6 +509,20 @@ class PolygonTickFetcher:
                     break
                 page += 1
                 if page * self.POLYGONSCAN_LOG_LIMIT > 10_000:
+                    # Etherscan caps results at 10K per query.  Hitting
+                    # this bound for a single block-range chunk means
+                    # the chunk is denser than ~10K events; the rest is
+                    # silently lost.  Log loudly so operators can react
+                    # (typically by halving the chunk size or switching
+                    # to RPC).  This path is unlikely once the subgraph
+                    # backfill is in place but the warning is essential
+                    # for any fallback runs.
+                    self.logger.warning(
+                        "Etherscan 10K result cap hit for blocks [%d, %d] "
+                        "(page %d); some logs in this range may be missing. "
+                        "Consider reducing CHUNK_BLOCKS or running the RPC fallback.",
+                        cur, chunk_end, page,
+                    )
                     break
             cur = chunk_end + 1
         return True

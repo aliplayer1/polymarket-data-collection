@@ -14,9 +14,9 @@ Binance REST API (no key required for klines):
     GET https://api.binance.com/api/v3/klines
     ?symbol=BTCUSDT&interval=1m&startTime={ms}&endTime={ms}&limit=1000
 
-Rate limit: 2400 request weight/min.  1-minute klines for a 5-minute market
-need only 1 request (5 candles).  With range merging, thousands of markets
-produce only hundreds of requests.
+Rate limit: 6000 request weight/min (each /klines with limit>500 costs 2).
+1-minute klines for a 5-minute market need only 1 request (5 candles).
+With range merging, thousands of markets produce only hundreds of requests.
 """
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ _BINANCE_TO_CHAINLINK_SYMBOL: dict[str, str] = {
 
 _BINANCE_KLINE_URL = "https://api.binance.com/api/v3/klines"
 _KLINE_LIMIT = 1000  # max candles per request
-_MIN_REQUEST_INTERVAL = 0.05  # 50ms → 20 req/s, well within 2400/min
+_MIN_REQUEST_INTERVAL = 0.035  # 35ms → ~28 req/s ≈ 3360 weight/min (56% of 6000 cap)
 
 
 class SpotPriceLookup:
@@ -179,6 +179,18 @@ class BinanceHistoryPhase:
                     )
                     time.sleep(retry_after)
                     continue
+                if resp.status_code == 418:
+                    # HTTP 418 = IP-banned for repeatedly violating
+                    # request-weight rate limits.  Treat like 429 but
+                    # with a longer cool-off (Binance bans escalate
+                    # from minutes up to days) and obey Retry-After
+                    # if the response provided one.
+                    retry_after = float(resp.headers.get("Retry-After", "300"))
+                    self.logger.error(
+                        "Binance HTTP 418 IP ban, sleeping %.0fs", retry_after,
+                    )
+                    time.sleep(retry_after)
+                    continue
                 resp.raise_for_status()
                 klines = resp.json()
             except Exception as exc:
@@ -282,7 +294,14 @@ class BinanceHistoryPhase:
                 df["price"] = df["price"].astype("float64")
                 df["source"] = df["source"].astype("string")
                 os.makedirs(spot_prices_dir, exist_ok=True)
-                shard_name = f"binance_history_{crypto}_{os.getpid()}.parquet"
+                # Include a monotonic millisecond timestamp in the
+                # shard name so a same-process re-invocation (e.g. two
+                # historical phases in one CLI run) does not overwrite
+                # the prior shard via ``os.replace``.  PID alone was
+                # insufficient.
+                shard_name = (
+                    f"binance_history_{crypto}_{os.getpid()}_{int(time.time() * 1000)}.parquet"
+                )
                 shard_path = os.path.join(spot_prices_dir, shard_name)
                 tmp_path = f"{shard_path}.tmp"
                 table = pa.Table.from_pandas(df, preserve_index=False)

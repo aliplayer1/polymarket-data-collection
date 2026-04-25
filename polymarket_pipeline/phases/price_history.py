@@ -348,23 +348,26 @@ class PriceHistoryPhase:
 
         metadata_only_markets: list[MarketRecord] = []
 
-        with ThreadPoolExecutor(max_workers=min(3, len(batch))) as executor:
-            # Fetch fee rates in parallel (crypto only, best-effort)
-            fee_futures = [
-                executor.submit(self._fetch_fee_rate, market)
-                for market in batch if market.category == "crypto"
-            ]
+        # Fetch fee rates FIRST in their own pool so every fee write
+        # happens-before any price-history worker reads
+        # ``market.fee_rate_bps``.  Previously fee fetches and price
+        # fetches shared a 3-worker pool — a price worker could read
+        # ``fee_rate_bps`` before the corresponding fee future
+        # completed, persisting -1 instead of the real rate.
+        crypto_markets = [m for m in batch if m.category == "crypto"]
+        if crypto_markets:
+            with ThreadPoolExecutor(max_workers=min(3, len(crypto_markets))) as fee_pool:
+                fee_futures = [fee_pool.submit(self._fetch_fee_rate, m) for m in crypto_markets]
+                for f in fee_futures:
+                    try:
+                        f.result()
+                    except Exception:
+                        pass  # best-effort; missing fee → -1, already logged inside
 
+        with ThreadPoolExecutor(max_workers=min(3, len(batch))) as executor:
             future_to_market = {
                 executor.submit(self.build_market_dataframe, market): market for market in batch
             }
-
-            # Wait for fee futures (fast, single API call each)
-            for f in fee_futures:
-                try:
-                    f.result()
-                except Exception:
-                    pass
 
             for future in as_completed(future_to_market):
                 market = future_to_market[future]

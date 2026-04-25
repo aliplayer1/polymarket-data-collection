@@ -111,3 +111,52 @@ def test_merge_ranges_empty():
 
 def test_merge_ranges_single():
     assert _merge_ranges([(100, 200)]) == [(100, 200)]
+
+
+# ---------------------------------------------------------------------------
+# HTTP 418 (IP ban) handling
+# ---------------------------------------------------------------------------
+
+def test_fetch_klines_handles_http_418_ip_ban(monkeypatch):
+    """A 418 response (Binance IP ban) must trigger a long retry-after
+    sleep instead of falling through to the broad ``except`` and
+    silently breaking pagination for the requested range.  Retry must
+    eventually succeed when the ban lifts.
+    """
+    import logging
+    from polymarket_pipeline.phases.binance_history import BinanceHistoryPhase
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "polymarket_pipeline.phases.binance_history.time.sleep",
+        lambda s: sleeps.append(s),
+    )
+
+    class FakeResp:
+        def __init__(self, status: int, body: object, headers: dict | None = None):
+            self.status_code = status
+            self._body = body
+            self.headers = headers or {}
+
+        def json(self):
+            return self._body
+
+        def raise_for_status(self) -> None:
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+    responses = [
+        FakeResp(418, {}, headers={"Retry-After": "30"}),  # first call → ban
+        FakeResp(200, []),  # second call (after ban "lifts") → empty kline page → break
+    ]
+
+    class FakeSession:
+        def get(self, url, params=None, timeout=None):
+            return responses.pop(0)
+
+    phase = BinanceHistoryPhase(logger=logging.getLogger("test_b418"))
+    phase._session = FakeSession()
+    out = phase._fetch_klines("BTCUSDT", 0, 1_000_000)
+    assert out == []
+    # The 418 path must call time.sleep with the Retry-After value.
+    assert 30.0 in sleeps

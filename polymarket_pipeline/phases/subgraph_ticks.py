@@ -45,11 +45,10 @@ from .binance_history import SpotPriceLookup
 from .shared import build_binary_tick_row
 
 
-# Server-side filter by `makerAssetId_in` OR `takerAssetId_in` — we fire
-# this query twice per window (once for each side) and union the results.
-# Client-side filtering on an unbounded window pulled 100k+ irrelevant
-# fills per 6-hour chunk; server-side scoping drops that to dozens-to-
-# hundreds per query.
+# Two separate queries per window (maker-side and taker-side) unioned
+# client-side.  We tried consolidating via the subgraph's `or:` operator
+# but Goldsky's Postgres backend timed out on the compound query plan
+# it produces (statement_timeout) — two simple filters run reliably.
 _FILLS_QUERY_MAKER = """
 query Fills($first: Int!, $startTs: BigInt!, $endTs: BigInt!, $lastId: ID!, $tokens: [String!]!) {
   orderFilledEvents(
@@ -139,10 +138,10 @@ class SubgraphTickFetcher:
             return result
         token_ids = list(token_to_market.keys())
 
-        # Union of fills on either maker or taker side.  Deduplicate by
-        # event id — a fill only appears twice if both assets happen to
-        # be in our set (which is nearly impossible on binary markets
-        # where the non-outcome side is always USDC "0").
+        # Two queries per window (maker-side + taker-side), unioned by
+        # event id client-side.  A fill only appears twice if both assets
+        # happen to be in our set — nearly impossible on binary markets
+        # where the non-outcome side is always USDC "0".
         seen_ids: set[str] = set()
         events: list[dict[str, Any]] = []
         for query in (_FILLS_QUERY_MAKER, _FILLS_QUERY_TAKER):
@@ -179,6 +178,13 @@ class SubgraphTickFetcher:
     # Pagination
     # ------------------------------------------------------------------
 
+    # Hard cap on pagination loops per query — guards against the
+    # subgraph returning a non-advancing or repeating cursor (bug or
+    # corruption) that would otherwise spin indefinitely.  At
+    # page_size=1000 this allows up to 1M fills per window, which is
+    # vastly more than realistic for a 6-hour CTF chunk.
+    _MAX_PAGES_PER_QUERY: int = 1000
+
     def _paginate_fills(
         self,
         query: str,
@@ -195,7 +201,7 @@ class SubgraphTickFetcher:
             "endTs": str(int(end_ts)),
             "tokens": token_ids,
         }
-        while True:
+        for page_num in range(self._MAX_PAGES_PER_QUERY):
             variables["lastId"] = last_id
             try:
                 data = self.client.query(query, variables=dict(variables))
@@ -209,9 +215,22 @@ class SubgraphTickFetcher:
                 break
             fills.extend(page)
             # Ordered by id asc, so the last element carries the next cursor.
-            last_id = page[-1]["id"]
+            new_last_id = page[-1]["id"]
+            if last_id and new_last_id <= last_id:
+                self.logger.error(
+                    "Subgraph cursor not advancing (last=%s, new=%s); aborting",
+                    last_id, new_last_id,
+                )
+                break
+            last_id = new_last_id
             if len(page) < self.page_size:
                 break
+        else:
+            self.logger.error(
+                "Subgraph pagination exceeded %d pages for window [%s, %s]; "
+                "truncating result (some fills may be missing)",
+                self._MAX_PAGES_PER_QUERY, start_ts, end_ts,
+            )
         return fills
 
     # ------------------------------------------------------------------
@@ -265,9 +284,15 @@ class SubgraphTickFetcher:
         usdc_size = usdc_amt_int / self._AMOUNT_DECIMALS
         if outcome_size <= 0 or usdc_size <= 0:
             return None
-        price = usdc_size / outcome_size
-        if not (0.0 <= price <= 1.0):
+        # Reject impossible prices (USDC paid > outcome shares, which
+        # implies > 1.0) using INTEGER comparison so we don't reject a
+        # legitimate 1.0 fill due to FP rounding.  Then clamp the
+        # resulting price to [0.0, 1.0] to absorb any sub-ULP rounding
+        # that survives the integer guard (e.g. 1.0000000000000002).
+        if usdc_amt_int > outcome_amt_int:
             return None
+        price = usdc_size / outcome_size
+        price = max(0.0, min(1.0, price))
 
         try:
             tick_ts_ms = int(event["timestamp"]) * 1000
