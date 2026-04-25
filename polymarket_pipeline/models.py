@@ -77,12 +77,23 @@ class MarketRecord:
         raise ValueError(f"Unknown market side/outcome: {side}")
 
     def side_for_token_id(self, token_id: str) -> str | None:
+        """Return the outcome label for ``token_id``, or ``None`` if unknown.
+
+        Callers MUST handle the ``None`` return — a token id that
+        doesn't match either side indicates either a stale subscription
+        (the market has rolled over but the WS hasn't been refreshed),
+        a tokens-mapping bug, or a server-side leak from another shard.
+        Silently coercing ``None`` to a default (``"up"`` / first
+        outcome / etc.) produces silently mis-labelled rows, which is
+        far worse than dropping the message; downstream code should
+        skip the message instead.
+        """
         if self.category == "crypto":
             if token_id == self.up_token_id:
                 return "up"
             if token_id == self.down_token_id:
                 return "down"
-                
+
         for outcome, t_id in self.tokens.items():
             if t_id == token_id:
                 return outcome

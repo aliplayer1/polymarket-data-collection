@@ -91,3 +91,90 @@ def test_tick_backfill_phase_chunks_large_windows(tmp_path, monkeypatch) -> None
     # Verify first and last chunk
     assert provider.calls[0] == (("m-large",), 0, 21600)
     assert provider.calls[-1] == (("m-large",), 324000, 345600)
+
+
+# ---------------------------------------------------------------------------
+# Error-path coverage: provider failures, edge-case timestamps
+# ---------------------------------------------------------------------------
+
+
+class _RaisingProvider:
+    """Provider that raises on the first call, then succeeds."""
+
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def get_ticks_for_markets_batch(self, markets, start_ts, end_ts):
+        self.call_count += 1
+        if self.call_count == 1:
+            raise RuntimeError("simulated subgraph timeout")
+        return {m.market_id: [] for m in markets}
+
+
+def test_tick_backfill_phase_continues_after_provider_exception(tmp_path, caplog) -> None:
+    """A single window/provider failure must not crash the entire run.
+    The phase should log the error and continue with the next window.
+    """
+    provider = _RaisingProvider()
+    phase = TickBackfillPhase(
+        provider,
+        logger=logging.getLogger("test"),
+        paths=PipelinePaths.from_root(tmp_path / "data"),
+    )
+    # Two markets so the run has multiple windows.
+    m1 = _market("m1", start_ts=0, end_ts=300)
+    m2 = _market("m2", start_ts=400, end_ts=700)
+
+    with caplog.at_level(logging.ERROR, logger="test"):
+        phase.run([m1, m2])
+
+    # The provider was called more than once: the first failure didn't
+    # abort the loop.
+    assert provider.call_count >= 2
+
+
+def test_tick_backfill_phase_handles_empty_market_list(tmp_path) -> None:
+    """An empty market list must complete cleanly (no provider calls,
+    no exceptions).
+    """
+    provider = DummyTickProvider()
+    phase = TickBackfillPhase(
+        provider,
+        logger=logging.getLogger("test"),
+        paths=PipelinePaths.from_root(tmp_path / "data"),
+    )
+    phase.run([])
+    assert provider.calls == []
+
+
+def test_tick_backfill_phase_handles_zero_duration_market(tmp_path) -> None:
+    """A market with ``start_ts == end_ts`` must terminate (not loop)
+    and either skip or emit a single trivially-bounded window.
+    """
+    provider = DummyTickProvider()
+    phase = TickBackfillPhase(
+        provider,
+        logger=logging.getLogger("test"),
+        paths=PipelinePaths.from_root(tmp_path / "data"),
+    )
+    m = _market("m-zero", start_ts=1000, end_ts=1000)
+    phase.run([m])
+    # The phase must either skip the market entirely (0 calls) or emit
+    # exactly one window — not loop forever.  Either is acceptable
+    # behaviour; what matters is termination + bounded call count.
+    assert len(provider.calls) <= 1
+
+
+def test_tick_backfill_phase_handles_inverted_market_window(tmp_path) -> None:
+    """A market with ``start_ts > end_ts`` (corrupt input) must not
+    crash; the phase should skip it gracefully.
+    """
+    provider = DummyTickProvider()
+    phase = TickBackfillPhase(
+        provider,
+        logger=logging.getLogger("test"),
+        paths=PipelinePaths.from_root(tmp_path / "data"),
+    )
+    m = _market("m-bad", start_ts=2000, end_ts=1000)  # inverted!
+    # Phase must terminate (not loop forever) and not crash.
+    phase.run([m])

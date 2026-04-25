@@ -290,6 +290,58 @@ def test_normalize_gamma_market_resolution_unresolved_while_open() -> None:
     assert m.resolution is None
 
 
+def test_normalize_gamma_market_resolution_below_099_threshold_is_unresolved() -> None:
+    """A closed market just below the 0.99 threshold is unresolved (-1).
+    The price-based detector requires ``>= 0.99`` for a winner.
+    """
+    raw_market = {
+        "id": "elon-8",
+        "slug": "elon-musk-of-tweets-march-31-april-7-100-119",
+        "question": "Will Elon Musk post 100-119 tweets from March 31 to April 7, 2026?",
+        "startDate": "2026-03-24T12:00:00Z",
+        "endDate": "2026-04-07T16:00:00Z",
+        "closed": True,
+        "closedTime": "2026-04-07T16:00:05Z",
+        "groupItemThreshold": "5",
+        "groupItemTitle": "100-119",
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0.989", "0.011"]',  # one tick below 0.99
+        "tokens": [
+            {"outcome": "Yes", "tokenId": "tok-yes"},
+            {"outcome": "No", "tokenId": "tok-no"},
+        ],
+    }
+    m = normalize_gamma_market(raw_market, is_active=False, logger=logging.getLogger("test"))
+    assert m is not None
+    # MarketRecord uses None for unresolved at the model layer; the
+    # ``-1`` storage sentinel is applied later in optimise_markets_df.
+    assert m.resolution is None, "0.989 must NOT be treated as resolved (< 0.99 threshold)"
+
+
+def test_normalize_gamma_market_resolution_at_099_threshold_is_resolved() -> None:
+    """Exactly 0.99 is the boundary — the detector treats this as a winner."""
+    raw_market = {
+        "id": "elon-9",
+        "slug": "elon-musk-of-tweets-march-31-april-7-260-279",
+        "question": "Will Elon Musk post 260-279 tweets from March 31 to April 7, 2026?",
+        "startDate": "2026-03-24T12:00:00Z",
+        "endDate": "2026-04-07T16:00:00Z",
+        "closed": True,
+        "closedTime": "2026-04-07T16:00:05Z",
+        "groupItemThreshold": "13",
+        "groupItemTitle": "260-279",
+        "outcomes": '["Yes", "No"]',
+        "outcomePrices": '["0.99", "0.01"]',  # exactly at threshold
+        "tokens": [
+            {"outcome": "Yes", "tokenId": "tok-yes"},
+            {"outcome": "No", "tokenId": "tok-no"},
+        ],
+    }
+    m = normalize_gamma_market(raw_market, is_active=False, logger=logging.getLogger("test"))
+    assert m is not None
+    assert m.resolution == 1, "0.99 must be treated as resolved (>= 0.99 threshold)"
+
+
 def test_normalize_gamma_market_binary_resolution_from_prices() -> None:
     """Binary (crypto) market: price-based fallback works without per-token winner flag."""
     raw_market = {
