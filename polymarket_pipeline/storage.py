@@ -109,7 +109,8 @@ def _acquire_flock(fd: Any, lock_path: str, *, timeout: float | None = None) -> 
     """
     effective_timeout = timeout if timeout is not None else _FLOCK_TIMEOUT_SECONDS
     deadline = time.monotonic() + effective_timeout
-    stale_cleared = False
+    last_pid_check = 0.0
+    pid_check_interval_s = 1.0  # rate-limit PID liveness checks to once/second
 
     while True:
         try:
@@ -120,6 +121,13 @@ def _acquire_flock(fd: Any, lock_path: str, *, timeout: float | None = None) -> 
                 fd.truncate()
                 fd.write(str(os.getpid()))
                 fd.flush()
+                # fsync the PID stamp so it survives a power loss between
+                # write and crash — otherwise waiters can't determine
+                # staleness and only the timeout fires.
+                try:
+                    os.fsync(fd.fileno())
+                except OSError:
+                    pass
             except OSError:
                 pass  # best-effort PID stamp — the lock itself is already held
             return
@@ -127,8 +135,14 @@ def _acquire_flock(fd: Any, lock_path: str, *, timeout: float | None = None) -> 
             if exc.errno not in (_errno.EACCES, _errno.EAGAIN):
                 raise  # unexpected OS error — propagate immediately
 
-        # Lock is held by another descriptor.  Check if holder is still alive.
-        if not stale_cleared:
+        # Lock is held by another descriptor.  Re-check holder
+        # liveness periodically (not just once) — a holder that
+        # was alive on the first iteration may die later, and we
+        # want to detect that quickly rather than waiting for the
+        # full timeout to expire.
+        now = time.monotonic()
+        if now - last_pid_check >= pid_check_interval_s:
+            last_pid_check = now
             try:
                 fd.seek(0)
                 content = fd.read().strip()
@@ -146,7 +160,6 @@ def _acquire_flock(fd: Any, lock_path: str, *, timeout: float | None = None) -> 
                             fd.flush()
                         except OSError:
                             pass
-                        stale_cleared = True
                         continue  # retry flock acquisition without sleeping
             except (OSError, ValueError):
                 pass  # can't read PID — just wait with normal backoff
@@ -583,27 +596,47 @@ def split_markets_prices(flat_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
 # ---------------------------------------------------------------------------
 
 def optimise_markets_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Downcast dtypes on the markets DataFrame before writing."""
+    """Downcast dtypes on the markets DataFrame before writing.
+
+    Inject defaults for any columns missing from the input rather than
+    raising ``KeyError`` — this keeps the writer tolerant of legacy
+    DataFrames or test fixtures that omit optional fields.
+    ``MARKETS_SCHEMA`` is the authoritative list of expected columns.
+    """
     df = df.copy()
+
+    if "crypto" not in df.columns:
+        df["crypto"] = ""
+    if "timeframe" not in df.columns:
+        df["timeframe"] = ""
     df["crypto"] = df["crypto"].astype("category")
     df["timeframe"] = df["timeframe"].astype("category")
-    df["volume"] = df["volume"].astype("float32")
+
+    if "volume" not in df.columns:
+        df["volume"] = 0.0
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).astype("float32")
+
+    if "resolution" not in df.columns:
+        df["resolution"] = -1
     df["resolution"] = df["resolution"].apply(_resolution_to_int8).astype("int8")
 
-    # New columns
-    if "start_ts" in df.columns:
-        df["start_ts"] = pd.to_numeric(df["start_ts"], errors="coerce").fillna(0).astype("int64")
-    if "end_ts" in df.columns:
-        df["end_ts"] = pd.to_numeric(df["end_ts"], errors="coerce").fillna(0).astype("int64")
+    # Time fields — inject 0 if absent so the schema requirement is met.
+    if "start_ts" not in df.columns:
+        df["start_ts"] = 0
+    df["start_ts"] = pd.to_numeric(df["start_ts"], errors="coerce").fillna(0).astype("int64")
+    if "end_ts" not in df.columns:
+        df["end_ts"] = 0
+    df["end_ts"] = pd.to_numeric(df["end_ts"], errors="coerce").fillna(0).astype("int64")
     if "closed_ts" not in df.columns:
         df["closed_ts"] = 0
     df["closed_ts"] = pd.to_numeric(df["closed_ts"], errors="coerce").fillna(0).astype("int64")
-    if "condition_id" in df.columns:
-        df["condition_id"] = df["condition_id"].astype("string")
-    if "up_token_id" in df.columns:
-        df["up_token_id"] = df["up_token_id"].astype("string")
-    if "down_token_id" in df.columns:
-        df["down_token_id"] = df["down_token_id"].astype("string")
+
+    # String identifiers — fillna so NaN doesn't leak through to PyArrow.
+    for col in ("condition_id", "up_token_id", "down_token_id"):
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype("string")
+
     if "slug" not in df.columns:
         df["slug"] = ""
     df["slug"] = df["slug"].fillna("").astype("string")
@@ -1072,6 +1105,7 @@ def consolidate_ticks(
                 # than an empty partition that the HF upload's
                 # delete_patterns would propagate to the Hub.
                 os.replace(tmp_path, consolidated_path)
+                _fsync_dir(dirpath)
                 remove_errors: list[str] = []
                 for fname in parquet_files:
                     if fname == "part-0.parquet":
@@ -1569,6 +1603,7 @@ def _consolidate_partitioned_prices(
                 # empty partition that the HF upload's delete_patterns
                 # would propagate to the Hub.
                 os.replace(tmp_path, consolidated_path)
+                _fsync_dir(dirpath)
                 for fname in parquet_files:
                     if fname == "part-0.parquet":
                         continue  # already replaced atomically above
@@ -1649,6 +1684,7 @@ def consolidate_spot_prices(
             # are idempotent (next run merges them).  Reverse order risks
             # an empty partition that delete_patterns would propagate.
             os.replace(tmp_path, consolidated_path)
+            _fsync_dir(spot_prices_dir)
             for fname in parquet_files:
                 if fname == "part-0.parquet":
                     continue  # already replaced atomically above
@@ -1717,6 +1753,7 @@ def consolidate_heartbeats(
             # Replace consolidated file FIRST; orphan shards on crash
             # are idempotent (next run merges them).
             os.replace(tmp_path, consolidated_path)
+            _fsync_dir(heartbeats_dir)
             remove_errors: list[str] = []
             for fname in parquet_files:
                 if fname == "part-0.parquet":
@@ -1835,6 +1872,7 @@ def consolidate_orderbook(
                 # again) rather than an empty partition + delete-pattern
                 # propagating the gap to HF Hub.
                 os.replace(tmp_path, consolidated_path)
+                _fsync_dir(dirpath)
                 remove_errors: list[str] = []
                 for fname in parquet_files:
                     if fname == "part-0.parquet":
@@ -1866,6 +1904,44 @@ def consolidate_orderbook(
 # Write helpers  (atomic: write to per-PID .tmp dir then rename)
 # ---------------------------------------------------------------------------
 
+def _fsync_dir(path: str) -> None:
+    """Best-effort fsync of a directory so a recent ``os.replace`` is durable.
+
+    POSIX guarantees that ``os.replace`` is atomic, but NOT durable —
+    on power loss between rename and dirent flush, the new file may be
+    missing despite the call returning success.  fsync of the
+    containing directory makes the rename survive a crash.
+
+    Failures are swallowed: not all filesystems support directory
+    fsync (notably Windows; some FUSE mounts), and we'd rather lose
+    durability than crash the writer over an unsupported syscall.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# All shard-file prefixes written by the lock-free WS / backfill paths.
+# ``_write_partitioned_atomic`` uses this allowlist to avoid deleting
+# in-flight shards during its post-replace cleanup.  Any new shard
+# writer MUST add its prefix here (a regression test enforces parity).
+_KNOWN_SHARD_PREFIXES: tuple[str, ...] = (
+    "ws_ticks_", "ws_prices_", "ws_culture_prices_",
+    "ws_spot_", "ws_ob_", "ws_hb_", "ws_staging",
+    "backfill_", "binance_history_",
+)
+
+
 def _write_parquet_atomic(table: pa.Table, path: str) -> None:
     """Atomically write a single Parquet file using a per-PID temp path."""
     dest_dir = os.path.dirname(os.path.abspath(path)) or "."
@@ -1877,6 +1953,7 @@ def _write_parquet_atomic(table: pa.Table, path: str) -> None:
     try:
         pq.write_table(table, tmp_path, compression="zstd")
         os.replace(tmp_path, path)
+        _fsync_dir(dest_dir)
     except Exception:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -1929,17 +2006,19 @@ def _write_partitioned_atomic(table: pa.Table, root_dir: str, partition_cols: li
                 src = os.path.join(dirpath, fname)
                 dst = os.path.join(target_dir, fname)
                 os.replace(src, dst)
+            # Durability: fsync the target directory so the renames
+            # survive a power loss between syscall return and dirent flush.
+            _fsync_dir(target_dir)
             # Remove stale Parquet files that aren't part of the new write.
             # Skip lock-free shard files written by concurrent processes
             # (WS service, tick backfill) — those are merged by their own
-            # consolidation functions and must not be deleted here.
+            # consolidation functions and must not be deleted here.  The
+            # prefix list is a module-level constant (``_KNOWN_SHARD_PREFIXES``)
+            # so adding a new shard writer also requires updating the
+            # allowlist; a regression test enforces parity.
             for old_f in os.listdir(target_dir):
                 if old_f.endswith(".parquet") and old_f not in new_files:
-                    if old_f.startswith((
-                        "ws_ticks_", "ws_prices_", "ws_culture_prices_",
-                        "ws_spot_", "ws_ob_", "ws_hb_", "ws_staging",
-                        "backfill_", "binance_history_",
-                    )):
+                    if old_f.startswith(_KNOWN_SHARD_PREFIXES):
                         continue
                     try:
                         os.remove(os.path.join(target_dir, old_f))

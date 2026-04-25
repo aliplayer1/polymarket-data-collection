@@ -108,7 +108,15 @@ def _scan_reconnect_bursts(
     A burst is emitted once per shard per ongoing run above threshold —
     the window is coalesced so a sustained storm produces one record, not N.
     """
-    paths = sorted(log_dir.glob("ws_reconnects.jsonl*"))
+    # Sort rotated logs by modification time so older files are read first.
+    # Lexicographic order misorders ``RotatingFileHandler`` outputs once
+    # the rotation index reaches double digits (``.10`` sorts before
+    # ``.2``).  Per-line timestamps make this purely cosmetic for the
+    # gap-scan output, but mtime sort is the correct contract.
+    paths = sorted(
+        log_dir.glob("ws_reconnects.jsonl*"),
+        key=lambda p: p.stat().st_mtime,
+    )
     if not paths:
         return []
     per_shard: dict[str, list[float]] = defaultdict(list)

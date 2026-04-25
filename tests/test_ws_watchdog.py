@@ -107,7 +107,7 @@ def test_burst_monitor_fires_once_per_burst() -> None:
     assert m.reserve_alert("s0")          # first observation
     assert not m.reserve_alert("s0")      # suppressed during same burst
     # Age out the events and record a fresh burst
-    m._events["s0"] = []
+    m._events["s0"].clear()
     assert not m.reserve_alert("s0")
     for _ in range(3):
         m.record("s0")

@@ -633,6 +633,62 @@ def test_orderbook_shard_write_then_consolidate(tmp_path):
     assert sorted(result["ts_ms"].tolist()) == [1000, 2000, 3000, 4000, 5000]
 
 
+def test_known_shard_prefixes_match_actual_writers():
+    """The allowlist used by ``_write_partitioned_atomic`` to skip
+    in-flight shard files MUST cover every prefix written by the
+    lock-free shard-writer functions.  Adding a new ``append_ws_*_staged``
+    function without updating the allowlist would silently delete that
+    function's shards on the next ``persist_normalized`` write.
+    """
+    from polymarket_pipeline.storage import _KNOWN_SHARD_PREFIXES
+    # Inferred from the shard-naming patterns used in storage.py.
+    expected = {
+        "ws_ticks_",        # append_ws_ticks_staged
+        "ws_prices_",       # append_ws_prices_staged
+        "ws_culture_prices_",  # append_ws_culture_prices_staged
+        "ws_spot_",         # append_ws_spot_prices_staged
+        "ws_ob_",           # append_ws_orderbook_staged
+        "ws_hb_",           # append_ws_heartbeats_staged
+        "ws_staging",       # legacy ws_staging.parquet (still tolerated)
+        "backfill_",        # append_ticks_only
+        "binance_history_", # BinanceHistoryPhase
+    }
+    assert expected.issubset(set(_KNOWN_SHARD_PREFIXES)), (
+        f"missing shard prefixes from allowlist: "
+        f"{expected - set(_KNOWN_SHARD_PREFIXES)}"
+    )
+
+
+def test_optimise_markets_df_tolerates_missing_columns():
+    """``optimise_markets_df`` must inject defaults for missing columns
+    rather than raising KeyError.  ``MARKETS_SCHEMA`` requires
+    ``start_ts`` / ``end_ts`` / ``volume`` etc., and the previous code
+    only fixed-up these fields when they were already present —
+    so legacy DataFrames or test fixtures lacking them crashed
+    ``pa.Table.from_pandas(..., schema=MARKETS_SCHEMA)``.
+    """
+    from polymarket_pipeline.storage import optimise_markets_df
+
+    df = pd.DataFrame({
+        "market_id": ["m1"],
+        "question": ["q"],
+        # All other schema columns intentionally missing.
+    })
+    out = optimise_markets_df(df)
+    # Required columns present with sensible defaults.
+    assert int(out.iloc[0]["start_ts"]) == 0
+    assert int(out.iloc[0]["end_ts"]) == 0
+    assert int(out.iloc[0]["closed_ts"]) == 0
+    assert float(out.iloc[0]["volume"]) == 0.0
+    assert int(out.iloc[0]["resolution"]) == -1
+    assert out.iloc[0]["slug"] == ""
+    assert int(out.iloc[0]["fee_rate_bps"]) == -1
+    # Subsequent ``pa.Table.from_pandas(..., schema=MARKETS_SCHEMA)``
+    # must NOT raise.
+    from polymarket_pipeline.storage import MARKETS_SCHEMA
+    pa.Table.from_pandas(out, schema=MARKETS_SCHEMA, preserve_index=False)
+
+
 def test_consolidate_prices_streams_through_duckdb_with_overlap(tmp_path):
     """The price-consolidation path now uses DuckDB streaming instead of
     loading every shard into pandas, so a backed-up shard backlog cannot

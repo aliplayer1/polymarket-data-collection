@@ -200,19 +200,24 @@ class ReconnectRateMonitor:
     :meth:`reserve_alert` to get a one-shot alert per burst — the same
     burst will not re-fire until the shard's rate drops below the
     threshold and then exceeds it again.
+
+    Backed by ``collections.deque`` rather than ``list`` so ``_prune``
+    is O(1) per evicted element (``popleft``) instead of O(n)
+    (``list.pop(0)``).  Sustained high-frequency reconnects on many
+    shards used to spend non-trivial CPU in pure-Python pop loops.
     """
 
     threshold: int
     window_s: float
-    _events: dict[str, list[float]] = field(default_factory=dict)
+    _events: dict[str, collections.deque] = field(default_factory=dict)
     _alert_active: dict[str, bool] = field(default_factory=dict)
 
-    def _prune(self, shard_key: str) -> list[float]:
+    def _prune(self, shard_key: str) -> collections.deque:
         now = time.monotonic()
         cutoff = now - self.window_s
-        events = self._events.setdefault(shard_key, [])
+        events = self._events.setdefault(shard_key, collections.deque())
         while events and events[0] < cutoff:
-            events.pop(0)
+            events.popleft()
         return events
 
     def record(self, shard_key: str) -> int:
