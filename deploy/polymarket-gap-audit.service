@@ -14,13 +14,20 @@ WorkingDirectory=/opt/polymarket
 
 EnvironmentFile=/opt/polymarket/.env
 
-# Scan heartbeats + reconnect log, emit .gap_manifest.json.  Alert on
-# findings (non-zero exit) so operators see sustained degradation even
-# if the individual webhooks (buffer_drop, reconnect_burst) were missed.
+# Scan heartbeats + reconnect log, emit .gap_manifest.json.
+# - ``--alert`` is the primary webhook on ANY findings (gaps or bursts);
+#   that's how operators see sustained degradation.
+# - ``--fail-on-gap-ms 21600000`` (6 hours) and ``--fail-on-bursts``
+#   promote ONLY exceptional findings to a non-zero exit, so systemd's
+#   ``OnFailure=`` fires for major outages and reconnect storms but
+#   stays quiet on routine restart-induced gaps (which used to spam
+#   ``polymarket-gap-audit.service: Failed`` on every run).
 ExecStart=/opt/polymarket/.venv/bin/python /opt/polymarket/scripts/audit_ws_gaps.py \
     --data-dir /opt/polymarket/data \
     --log-dir /var/log/polymarket \
-    --alert
+    --alert \
+    --fail-on-gap-ms 21600000 \
+    --fail-on-bursts
 
 [Install]
 WantedBy=multi-user.target

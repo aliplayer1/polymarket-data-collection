@@ -212,6 +212,34 @@ def main() -> int:
                         help="Burst window in seconds (default: 60)")
     parser.add_argument("--alert", action="store_true",
                         help="POST the manifest to POLYMARKET_ALERT_WEBHOOK when findings exist")
+    # Exit-code policy.  By default the script exits 0 whenever the audit
+    # itself runs to completion — finding gaps or bursts is the EXPECTED
+    # output of a daily audit, not a script failure.  Two opt-in
+    # thresholds let operators promote specific findings to a non-zero
+    # exit so systemd's ``OnFailure=`` can fire on truly exceptional
+    # conditions without firing on every benign restart-induced gap.
+    parser.add_argument(
+        "--fail-on-gap-ms",
+        type=int,
+        default=0,
+        metavar="MS",
+        help=(
+            "Exit non-zero when ANY heartbeat gap exceeds this many ms. "
+            "Default 0 = never fail on gaps.  Recommended: ~6 hours "
+            "(21_600_000 ms) to flag major outages while ignoring "
+            "routine reconnects."
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-bursts",
+        action="store_true",
+        default=False,
+        help=(
+            "Exit non-zero when any reconnect-burst events are present "
+            "in the manifest (sustained >threshold reconnects per "
+            "burst-window).  Default off."
+        ),
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir).expanduser().resolve()
@@ -262,9 +290,24 @@ def main() -> int:
     if args.alert and (gaps or bursts):
         _send_alert(manifest)
 
-    # Exit non-zero when findings exist so systemd can trigger OnFailure
-    # if desired.
-    return 1 if (gaps or bursts) else 0
+    # Exit-code policy: a successful audit always exits 0 (the manifest
+    # was written and any findings were logged + webhooked).  Promote
+    # to a non-zero exit ONLY when the operator explicitly asked us to
+    # via ``--fail-on-bursts`` / ``--fail-on-gap-ms``, so systemd's
+    # ``OnFailure=`` only fires on truly exceptional conditions.
+    fail = False
+    if args.fail_on_bursts and bursts:
+        print(f"FAIL: {len(bursts)} reconnect burst(s) present (--fail-on-bursts)")
+        fail = True
+    if args.fail_on_gap_ms > 0:
+        large = [g for g in gaps if int(g.get("gap_ms", 0)) > args.fail_on_gap_ms]
+        if large:
+            print(
+                f"FAIL: {len(large)} gap(s) exceed {args.fail_on_gap_ms} ms "
+                f"(--fail-on-gap-ms)"
+            )
+            fail = True
+    return 1 if fail else 0
 
 
 if __name__ == "__main__":
