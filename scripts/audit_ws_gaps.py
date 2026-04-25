@@ -255,6 +255,22 @@ def main() -> int:
             "regardless of this flag."
         ),
     )
+    parser.add_argument(
+        "--diff-mode",
+        action="store_true",
+        default=False,
+        help=(
+            "Only alert (--alert) and promote to fail-exit on findings "
+            "that are NEW since the previous manifest.  Identity is the "
+            "tuple (source, shard_key, event_type, start_ms, end_ms) for "
+            "gaps and (shard_key, window_start_ts) for bursts.  This is "
+            "the recommended mode for a recurring systemd-timer audit: "
+            "the FIRST run records the current findings as the baseline "
+            "and (at most) alerts once; subsequent runs only fire on "
+            "drift.  Combine with --fail-window-hours to also bound "
+            "the recency of new findings worth alerting on."
+        ),
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir).expanduser().resolve()
@@ -288,6 +304,29 @@ def main() -> int:
 
     manifest_path = data_dir / ".gap_manifest.json"
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    # Diff-mode preamble: load the previous manifest's findings BEFORE
+    # we overwrite it so we can compute "new since last run".
+    prev_gap_keys: set[tuple] = set()
+    prev_burst_keys: set[tuple] = set()
+    if args.diff_mode and manifest_path.exists():
+        try:
+            with manifest_path.open() as fh:
+                prev = json.load(fh)
+            for g in prev.get("gaps", []) or []:
+                prev_gap_keys.add((
+                    g.get("source"), g.get("shard_key"), g.get("event_type"),
+                    int(g.get("start_ms", 0)), int(g.get("end_ms", 0)),
+                ))
+            for b in prev.get("reconnect_bursts", []) or []:
+                prev_burst_keys.add((
+                    b.get("shard_key"),
+                    float(b.get("window_start_ts", 0.0)),
+                ))
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"WARN: could not read previous manifest at {manifest_path}: {exc}",
+                  file=sys.stderr)
+
     with manifest_path.open("w") as fh:
         json.dump(manifest, fh, indent=2)
 
@@ -302,40 +341,72 @@ def main() -> int:
         print(f"  {b['shard_key']}: {b['count']} reconnects around ts={b['window_start_ts']:.0f}")
     print(f"Manifest written to {manifest_path}")
 
-    if args.alert and (gaps or bursts):
-        _send_alert(manifest)
-
-    # Exit-code policy: a successful audit always exits 0 (the manifest
-    # was written and any findings were logged + webhooked).  Promote
-    # to a non-zero exit ONLY when the operator explicitly asked us to
-    # via ``--fail-on-bursts`` / ``--fail-on-gap-ms``, so systemd's
-    # ``OnFailure=`` only fires on truly exceptional conditions.
+    # Filter findings used by --alert and the fail check.  Two layers:
     #
-    # ``--fail-window-hours`` further narrows the fail check to recent
-    # findings, so a historical outage doesn't re-trip OnFailure on
-    # every subsequent run forever.
+    # (1) ``--diff-mode``: only consider findings NEW since the previous
+    #     manifest.  Identity = (source, shard_key, event_type,
+    #     start_ms, end_ms) for gaps and (shard_key, window_start_ts)
+    #     for bursts.  A gap that previously had end_ms=A but now has
+    #     end_ms=B (an extending outage that closed) is treated as new
+    #     because its identity tuple changed.
+    #
+    # (2) ``--fail-window-hours``: cap the recency of findings worth
+    #     alerting on (seconds back from now).
+    #
+    # Both filters apply to the fail check.  The ``--alert`` webhook
+    # also honours ``--diff-mode`` so it doesn't keep re-firing on the
+    # same gap forever.
     fail_gaps = gaps
     fail_bursts = bursts
+    if args.diff_mode:
+        def _gap_key(g: dict) -> tuple:
+            return (
+                g.get("source"), g.get("shard_key"), g.get("event_type"),
+                int(g.get("start_ms", 0)), int(g.get("end_ms", 0)),
+            )
+
+        def _burst_key(b: dict) -> tuple:
+            return (b.get("shard_key"), float(b.get("window_start_ts", 0.0)))
+
+        new_gaps = [g for g in fail_gaps if _gap_key(g) not in prev_gap_keys]
+        new_bursts = [b for b in fail_bursts if _burst_key(b) not in prev_burst_keys]
+        suppressed_gaps = len(fail_gaps) - len(new_gaps)
+        suppressed_bursts = len(fail_bursts) - len(new_bursts)
+        if suppressed_gaps or suppressed_bursts:
+            print(
+                f"Diff filter (--diff-mode): suppressing {suppressed_gaps} gap(s) "
+                f"and {suppressed_bursts} burst(s) seen in the previous run"
+            )
+        fail_gaps = new_gaps
+        fail_bursts = new_bursts
+
     if args.fail_window_hours > 0:
         cutoff_ms = int((time.time() - args.fail_window_hours * 3600.0) * 1000.0)
-        fail_gaps = [g for g in gaps if int(g.get("end_ms", 0)) >= cutoff_ms]
-        # Burst records carry ``window_start_ts`` / ``window_end_ts``
-        # in seconds (monotonic-flavoured ts).  Use ``window_end_ts``
-        # if present; otherwise the burst is undated and we keep it.
         cutoff_s = time.time() - args.fail_window_hours * 3600.0
+        prefilter_gaps_count = len(fail_gaps)
+        prefilter_bursts_count = len(fail_bursts)
+        fail_gaps = [g for g in fail_gaps if int(g.get("end_ms", 0)) >= cutoff_ms]
         fail_bursts = [
-            b for b in bursts
+            b for b in fail_bursts
             if "window_end_ts" not in b
             or float(b["window_end_ts"]) >= cutoff_s
         ]
-        skipped_gaps = len(gaps) - len(fail_gaps)
-        skipped_bursts = len(bursts) - len(fail_bursts)
+        skipped_gaps = prefilter_gaps_count - len(fail_gaps)
+        skipped_bursts = prefilter_bursts_count - len(fail_bursts)
         if skipped_gaps or skipped_bursts:
             print(
                 f"Recency filter (--fail-window-hours {args.fail_window_hours}): "
                 f"ignoring {skipped_gaps} historical gap(s) and "
                 f"{skipped_bursts} historical burst(s) for the fail check"
             )
+
+    if args.alert and (fail_gaps or fail_bursts):
+        # Alert payload reflects the (filtered) findings actually worth
+        # paging on, not every historical artefact in the manifest.
+        diff_manifest = dict(manifest)
+        diff_manifest["gaps"] = fail_gaps
+        diff_manifest["reconnect_bursts"] = fail_bursts
+        _send_alert(diff_manifest)
 
     fail = False
     if args.fail_on_bursts and fail_bursts:

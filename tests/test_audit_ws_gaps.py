@@ -169,3 +169,70 @@ def test_fail_window_hours_includes_recent_gap(monkeypatch, tmp_path):
         "--fail-window-hours", "48",
     ])
     assert rc == 1, "recent gap inside the window must still fail the check"
+
+
+def test_diff_mode_alerts_once_then_quiets(monkeypatch, tmp_path):
+    """With ``--diff-mode``, the FIRST run records the baseline and
+    fires (one-shot) on findings.  The SECOND run sees the same
+    findings → suppressed.  This is the path that prevents a
+    historical outage from re-tripping OnFailure forever.
+    """
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+    # A gap that exceeds threshold, ended 1 h ago (within window).
+    _write_heartbeats(tmp_path, gap_pairs=[
+        (now_ms - 2 * 3600 * 1000, now_ms - 1 * 3600 * 1000),
+    ])
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    args = [
+        "--data-dir", str(tmp_path),
+        "--log-dir", str(log_dir),
+        "--fail-on-gap-ms", "30000",
+        "--fail-window-hours", "48",
+        "--diff-mode",
+    ]
+    rc1 = _run(monkeypatch, args)
+    assert rc1 == 1, "first run must fire on the new gap"
+
+    rc2 = _run(monkeypatch, args)
+    assert rc2 == 0, "second run with no new gaps must exit clean"
+
+
+def test_diff_mode_fires_on_genuinely_new_finding(monkeypatch, tmp_path):
+    """Diff-mode is permissive — once a NEW gap shows up that wasn't
+    in the previous run, the fail check fires on it.
+    """
+    import time as _t
+    now_ms = int(_t.time() * 1000)
+
+    # First run: one historical gap (ends well within the window).
+    _write_heartbeats(tmp_path, gap_pairs=[
+        (now_ms - 4 * 3600 * 1000, now_ms - 3 * 3600 * 1000),
+    ])
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+
+    args = [
+        "--data-dir", str(tmp_path),
+        "--log-dir", str(log_dir),
+        "--fail-on-gap-ms", "30000",
+        "--fail-window-hours", "48",
+        "--diff-mode",
+    ]
+    rc1 = _run(monkeypatch, args)
+    assert rc1 == 1
+
+    # Second run: the original gap PLUS a new one with a different
+    # start_ms / end_ms.  The new one alone must trip the fail check.
+    hb_dir = tmp_path / "heartbeats"
+    for f in hb_dir.iterdir():
+        f.unlink()
+    _write_heartbeats(tmp_path, gap_pairs=[
+        (now_ms - 4 * 3600 * 1000, now_ms - 3 * 3600 * 1000),  # same as run 1
+        (now_ms - 90 * 60 * 1000, now_ms - 30 * 60 * 1000),    # new
+    ])
+
+    rc2 = _run(monkeypatch, args)
+    assert rc2 == 1, "diff-mode must still fail on a genuinely new finding"

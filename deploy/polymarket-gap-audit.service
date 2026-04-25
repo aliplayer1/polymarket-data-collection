@@ -15,20 +15,22 @@ WorkingDirectory=/opt/polymarket
 EnvironmentFile=/opt/polymarket/.env
 
 # Scan heartbeats + reconnect log, emit .gap_manifest.json.
-# - ``--alert`` is the primary webhook on ANY findings (gaps or bursts);
-#   that's how operators see sustained degradation.
+# - ``--alert`` is the primary webhook channel for findings worth paging on.
+# - ``--diff-mode`` makes alerts and OnFailure fire only when the audit
+#   sees something NEW relative to its previous run.  The first run
+#   after deploy alerts once (or stays silent if findings predate the
+#   recency cap) and records the current state; subsequent runs only
+#   fire on drift — which is what an operator actually wants to see.
 # - ``--fail-on-gap-ms 21600000`` (6 hours) and ``--fail-on-bursts``
-#   promote ONLY exceptional findings to a non-zero exit, so systemd's
-#   ``OnFailure=`` fires for major outages and reconnect storms but
-#   stays quiet on routine restart-induced gaps.
-# - ``--fail-window-hours 48`` confines the fail check to gaps that
-#   closed (or are ongoing) within the last 48 h.  Without this, a
-#   historical outage that ended days ago would re-trip OnFailure on
-#   every subsequent run because the heartbeat data still records it.
+#   promote NEW findings of exceptional size to a non-zero exit.
+# - ``--fail-window-hours 48`` caps the recency of findings worth
+#   alerting on so the audit doesn't keep firing on a multi-day-old
+#   outage that just got recorded post-restart.
 ExecStart=/opt/polymarket/.venv/bin/python /opt/polymarket/scripts/audit_ws_gaps.py \
     --data-dir /opt/polymarket/data \
     --log-dir /var/log/polymarket \
     --alert \
+    --diff-mode \
     --fail-on-gap-ms 21600000 \
     --fail-on-bursts \
     --fail-window-hours 48
