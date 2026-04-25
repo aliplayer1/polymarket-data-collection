@@ -1425,7 +1425,17 @@ def _consolidate_partitioned_prices(
     label: str,
     logger: logging.Logger | None = None,
 ) -> None:
-    """Shared implementation for partition-level price shard consolidation."""
+    """Shared implementation for partition-level price shard consolidation.
+
+    Streams through DuckDB rather than concatenating all shards into pandas:
+    a backed-up shard backlog (e.g. after a multi-day HF upload outage) used
+    to materialise as multi-GB pandas DataFrames inside the 8 GB CAX21 and
+    OOM the process.  DuckDB's ``arg_max`` aggregation, plus a configurable
+    memory cap with disk spilling (``_configure_duckdb_for_consolidation``),
+    keeps peak memory bounded regardless of input volume.
+    """
+    import duckdb
+
     log = logger or logging.getLogger("polymarket_pipeline")
     if not os.path.exists(root_dir):
         return
@@ -1433,10 +1443,11 @@ def _consolidate_partitioned_prices(
     data_root = os.path.dirname(os.path.abspath(root_dir))
 
     for dirpath, _dirs, _fnames in os.walk(root_dir):
-        # Only process leaf partition directories that contain shard files
-        parquet_files = [f for f in os.listdir(dirpath) if f.endswith(".parquet")]
-        has_shards = any(f.startswith(shard_prefix) for f in parquet_files)
-        if not has_shards:
+        # Cheap pre-check OUTSIDE the lock to avoid acquiring it for every
+        # leaf directory in the tree (each acquisition costs ~1 ms in fcntl).
+        parquet_files_pre = [f for f in os.listdir(dirpath) if f.endswith(".parquet")]
+        has_shards_pre = any(f.startswith(shard_prefix) for f in parquet_files_pre)
+        if not has_shards_pre:
             continue
 
         with _write_lock(data_root):
@@ -1449,65 +1460,131 @@ def _consolidate_partitioned_prices(
             rel = os.path.relpath(dirpath, root_dir)
             log.info("Consolidating %s partition %s (%d files)...", label, rel, len(parquet_files))
 
-            # Deterministic read order so that the newer data wins
-            # drop_duplicates(keep="last"). Sort by (mtime, filename):
-            # oldest file first, ties broken lexicographically. This
-            # matches consolidate_orderbook's pattern and removes the
-            # dependence on os.listdir() order, which is filesystem-
-            # and OS-specific (passes on ext4/Python 3.10 locally but
-            # fails on the ARM64 server with Python 3.12).
+            # Deterministic read order: oldest file first, ties broken
+            # lexicographically.  Each row is tagged with its file_order so
+            # arg_max(keep latest by file_order) reproduces the
+            # ``drop_duplicates(keep="last")`` semantics of the legacy path.
             parquet_files.sort(
                 key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
             )
-
-            frames = []
-            for fname in parquet_files:
-                fpath = os.path.join(dirpath, fname)
-                try:
-                    df = pq.ParquetFile(fpath).read().to_pandas()
-                    frames.append(df)
-                except Exception:
-                    continue
-
-            if not frames:
-                continue
-
-            merged = pd.concat(frames, ignore_index=True)
-            # Flatten category columns before dedup/sort
-            for col in dedup_cols:
-                if col in merged.columns and hasattr(merged[col], "cat"):
-                    merged[col] = merged[col].astype(str)
-            merged = (
-                merged.drop_duplicates(subset=dedup_cols, keep="last")
-                .sort_values(sort_cols)
-                .reset_index(drop=True)
+            file_paths = [os.path.join(dirpath, f) for f in parquet_files]
+            files_sql = ", ".join(f"'{_duckdb_escape(p)}'" for p in file_paths)
+            files_with_order_sql = ", ".join(
+                f"('{_duckdb_escape(path)}', {idx})" for idx, path in enumerate(file_paths)
             )
-
             consolidated_path = os.path.join(dirpath, "part-0.parquet")
             tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
+
+            temp_dir = os.path.join(dirpath, ".duckdb_tmp")
+            con = None
             try:
                 _check_disk_space(dirpath)
-                table = pa.Table.from_pandas(merged, preserve_index=False)
-                table = _stamp_schema_version(table)
-                pq.write_table(table, tmp_path, compression="zstd")
-                # Place consolidated file first, then remove old shards.
-                # If the process crashes between these steps, orphan shards
-                # remain but no data is lost — the next consolidation run
-                # will merge them again (dedup handles it).
+                con = duckdb.connect()
+                os.makedirs(temp_dir, exist_ok=True)
+                _configure_duckdb_for_consolidation(con, temp_dir=temp_dir)
+
+                # Discover the union schema once so we can build the
+                # SELECT list dynamically (legacy shards may be missing
+                # newer columns; ``union_by_name=true`` fills them with NULL).
+                desc = con.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet([{files_sql}], union_by_name=true)"
+                ).fetchall()
+                present_cols = [row[0] for row in desc]
+
+                # Project dedup_cols verbatim, all other columns through
+                # ``arg_max`` keyed on (file_order, file_row_number) so the
+                # newest shard's value wins on a tie — same semantics as
+                # ``drop_duplicates(keep="last")``.
+                #
+                # Skip Hive partition columns (``crypto``, ``timeframe``):
+                # they're encoded in the directory path and writing them
+                # into the file body produces a dict-vs-string schema
+                # mismatch when ``pq.ParquetDataset`` re-reads the
+                # partitioned tree (the directory yields a dictionary
+                # encoding while DuckDB's COPY emits plain strings).
+                _PARTITION_COLS = {"crypto", "timeframe"}
+                non_dedup = [
+                    c for c in present_cols
+                    if c not in dedup_cols and c not in _PARTITION_COLS
+                ]
+                non_dedup_sql = ",\n                            ".join(
+                    f"arg_max(src.{c}, sort_key) AS {c}" for c in non_dedup
+                )
+                dedup_select_sql = ", ".join(f"src.{c}" for c in dedup_cols)
+                group_by_sql = ", ".join(f"src.{c}" for c in dedup_cols)
+
+                # Build the final projection.  ``non_dedup_sql`` may be
+                # empty when every column is either a dedup key or a
+                # partition column (e.g. extremely narrow schemas in
+                # tests); guard the trailing comma.
+                projection_sql = dedup_select_sql
+                if non_dedup_sql:
+                    projection_sql = f"{dedup_select_sql},\n                            {non_dedup_sql}"
+
+                con.execute(f"""
+                    COPY (
+                        WITH source_files(file_path, file_order) AS (
+                            VALUES {files_with_order_sql}
+                        ),
+                        ranked AS (
+                            SELECT
+                                src.*,
+                                ((f.file_order::BIGINT << 32)
+                                  + src.file_row_number::BIGINT) AS sort_key
+                            FROM read_parquet(
+                                [{files_sql}],
+                                union_by_name=true,
+                                filename=true,
+                                file_row_number=true
+                            ) AS src
+                            JOIN source_files AS f ON src.filename = f.file_path
+                        )
+                        SELECT
+                            {projection_sql}
+                        FROM ranked AS src
+                        GROUP BY {group_by_sql}
+                    ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                """)
+
+                # Stamp schema version on the output (DuckDB doesn't
+                # carry our Arrow metadata through COPY).  Use
+                # ``ParquetFile.read()`` rather than ``pq.read_table()``
+                # so ParquetDataset's Hive-partition auto-discovery
+                # doesn't trip over sibling partitions with mismatched
+                # categorical encodings.
+                table = pq.ParquetFile(tmp_path).read()
+                stamped = _stamp_schema_version(table)
+                pq.write_table(stamped, tmp_path, compression="zstd")
+
+                # Replace consolidated file FIRST so a crash between the
+                # two steps leaves orphan shards (idempotent — the next
+                # consolidation run merges them again) rather than an
+                # empty partition that the HF upload's delete_patterns
+                # would propagate to the Hub.
                 os.replace(tmp_path, consolidated_path)
                 for fname in parquet_files:
                     if fname == "part-0.parquet":
-                        continue  # already replaced above
+                        continue  # already replaced atomically above
                     try:
                         os.remove(os.path.join(dirpath, fname))
                     except OSError:
                         pass
+
+                nrows = pq.read_metadata(consolidated_path).num_rows
+                log.info("  -> %s consolidated: %d rows", rel, nrows)
             except Exception:
                 if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
                 raise
-
-            log.info("  -> %s consolidated: %d rows", rel, len(merged))
+            finally:
+                try:
+                    if con is not None:
+                        con.close()
+                finally:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def consolidate_spot_prices(

@@ -633,6 +633,50 @@ def test_orderbook_shard_write_then_consolidate(tmp_path):
     assert sorted(result["ts_ms"].tolist()) == [1000, 2000, 3000, 4000, 5000]
 
 
+def test_consolidate_prices_streams_through_duckdb_with_overlap(tmp_path):
+    """The price-consolidation path now uses DuckDB streaming instead of
+    loading every shard into pandas, so a backed-up shard backlog cannot
+    OOM the host.  Verify dedup correctness across many shards with
+    overlapping keys, and that the consolidated file omits the Hive
+    partition columns from its body (they live in the directory path).
+    """
+    from polymarket_pipeline.storage import (
+        append_ws_prices_staged, consolidate_prices,
+    )
+    prices_dir = str(tmp_path / "prices")
+
+    # 5 shards with overlapping market/timestamp pairs; later shards
+    # should win on dedup.
+    for shard_idx in range(5):
+        df = pd.DataFrame({
+            "market_id": ["m1", "m1", "m2"],
+            "crypto": ["BTC", "BTC", "BTC"],
+            "timeframe": ["1-hour", "1-hour", "1-hour"],
+            "timestamp": [100, 200, 300],
+            "up_price": [0.50 + 0.01 * shard_idx, 0.55, 0.60],
+            "down_price": [0.50 - 0.01 * shard_idx, 0.45, 0.40],
+        })
+        append_ws_prices_staged(df, prices_dir=prices_dir)
+        # Bump mtime so sort order is deterministic
+        time.sleep(0.01)
+
+    consolidate_prices(prices_dir=prices_dir)
+    part_dir = os.path.join(prices_dir, "crypto=BTC", "timeframe=1-hour")
+    assert os.listdir(part_dir) == ["part-0.parquet"]
+
+    result = pq.ParquetFile(os.path.join(part_dir, "part-0.parquet")).read().to_pandas()
+    assert len(result) == 3  # 3 unique (market_id, timestamp)
+
+    # Latest shard's value should win for the duplicated row.
+    m1_100 = result[(result["market_id"] == "m1") & (result["timestamp"] == 100)].iloc[0]
+    assert m1_100["up_price"] == pytest.approx(0.54, abs=1e-6)
+
+    # Hive partition columns are encoded in the directory, NOT the file body
+    # (so ParquetDataset's auto-discovery doesn't trip on dict-vs-string).
+    assert "crypto" not in result.columns
+    assert "timeframe" not in result.columns
+
+
 def test_consolidate_orderbook_deduplicates_overlapping_rows(tmp_path):
     """Overlapping (ts_ms, market_id, token_id, outcome) rows from two shards
     must collapse to a single row, with the newer ``local_recv_ts_ns`` winning.
