@@ -21,10 +21,14 @@ data-culture/
 test_output/
 test_output_parquet/
 test_data_15m/
+# Targeted monthly collections produced by scripts/collect_targeted.py
+collections/
 # Local runtime-test dirs produced when running the pipeline against live APIs
 # for validation (not part of the repo).
 runtime_test/
 runtime_test_hist/
+repro_test/
+repro_test_seeded/
 
 # -- Logs ----------------------------------------------------------------------
 *.log
@@ -52,5 +56,3 @@ GEMINI*
 .gemini/
 .copilot/
 .github/
-repro_test/
-repro_test_seeded/
