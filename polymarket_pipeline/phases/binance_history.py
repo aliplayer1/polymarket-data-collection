@@ -263,12 +263,18 @@ class BinanceHistoryPhase:
                 chainlink_symbol = _BINANCE_TO_CHAINLINK_SYMBOL.get(rtds_symbol)
                 for kline in klines:
                     # kline format: [open_time, open, high, low, close, volume, close_time, ...]
-                    open_time = int(kline[0])
+                    # close_price is the last trade in [open_time, close_time]; it is
+                    # only observable AT close_time. Keying it on open_time would
+                    # leak up-to-60s of future BTC into any consumer that joins on
+                    # ts_ms (e.g. subgraph_to_csv interpolation, hf_to_csv spot
+                    # lookup), corrupting Optuna training fold by point-in-time
+                    # violation.
+                    close_time = int(kline[6])
                     close_price = float(kline[4])
 
-                    lookup.add(crypto, open_time, close_price)
+                    lookup.add(crypto, close_time, close_price)
                     spot_rows.append({
-                        "ts_ms": open_time,
+                        "ts_ms": close_time,
                         "symbol": rtds_symbol,
                         "price": close_price,
                         "source": "binance",
@@ -278,7 +284,7 @@ class BinanceHistoryPhase:
                     # where live RTDS Chainlink is unavailable.
                     if chainlink_symbol:
                         spot_rows.append({
-                            "ts_ms": open_time,
+                            "ts_ms": close_time,
                             "symbol": chainlink_symbol,
                             "price": close_price,
                             "source": "chainlink_proxy",

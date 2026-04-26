@@ -117,6 +117,85 @@ def test_merge_ranges_single():
 # HTTP 418 (IP ban) handling
 # ---------------------------------------------------------------------------
 
+def test_run_persists_close_price_keyed_at_close_time(monkeypatch, tmp_path):
+    """PiT correctness: a 1-minute kline's close price is observable only at
+    its close_time, never at its open_time.  Keying close_price on open_time
+    leaks up to 60 s of future BTC into any consumer (subgraph_to_csv,
+    hf_to_csv spot lookup), corrupting Optuna training data.
+
+    This test asserts that ``BinanceHistoryPhase.run`` produces lookup
+    entries and spot_prices rows whose ts_ms is the kline's close_time.
+    """
+    import logging
+
+    from polymarket_pipeline.models import MarketRecord
+    from polymarket_pipeline.phases.binance_history import BinanceHistoryPhase
+
+    monkeypatch.setattr(
+        "polymarket_pipeline.phases.binance_history.time.sleep",
+        lambda s: None,
+    )
+
+    # Two consecutive 1-minute klines: opens at T and T+60s, closes 59999ms
+    # later. Use deliberately different open and close prices so a wrong
+    # implementation that keyed close_price on open_time can be detected
+    # by inspecting either the lookup value or the spot_rows price column.
+    open_t1, close_t1 = 1_700_000_000_000, 1_700_000_059_999
+    open_t2, close_t2 = 1_700_000_060_000, 1_700_000_119_999
+    klines = [
+        [open_t1, "67000.0", "67100.0", "66900.0", "67050.0",
+         "1.0", close_t1, 0, 0, 0, 0, 0],
+        [open_t2, "67050.0", "67200.0", "67000.0", "67150.0",
+         "2.0", close_t2, 0, 0, 0, 0, 0],
+    ]
+
+    class FakeResp:
+        def __init__(self, body): self._body = body; self.status_code = 200; self.headers = {}
+        def json(self): return self._body
+        def raise_for_status(self): pass
+
+    pages = [FakeResp(klines), FakeResp([])]
+
+    class FakeSession:
+        def get(self, url, params=None, timeout=None):
+            return pages.pop(0)
+
+    phase = BinanceHistoryPhase(logger=logging.getLogger("test_pit"))
+    phase._session = FakeSession()
+
+    market = MarketRecord(
+        market_id="m1", market_type="binary", question="?",
+        timeframe="5-minute", crypto="BTC", condition_id="0x",
+        start_ts=open_t1 // 1000, end_ts=(close_t2 // 1000) + 60,
+        volume=0.0, resolution=-1, is_active=False, closed_ts=0,
+        up_token_id="1", down_token_id="2",
+        slug="s", fee_rate_bps=2500,
+    )
+    spot_dir = tmp_path / "spot_prices"
+    lookup = phase.run([market], spot_prices_dir=str(spot_dir))
+
+    # Lookup must be keyed on close_time, not open_time.
+    hit_close_t1 = lookup.get("BTC", close_t1)
+    assert hit_close_t1 is not None
+    assert hit_close_t1 == (67050.0, close_t1)
+    hit_close_t2 = lookup.get("BTC", close_t2)
+    assert hit_close_t2 is not None
+    assert hit_close_t2 == (67150.0, close_t2)
+
+    # Stored spot_prices parquet ts_ms must equal close_time, not open_time.
+    import pandas as pd
+    shards = list(spot_dir.glob("*.parquet"))
+    assert shards, "expected at least one binance_history shard"
+    df = pd.concat(pd.read_parquet(p) for p in shards)
+    df = df.sort_values("ts_ms").reset_index(drop=True)
+    binance_rows = df[df["source"] == "binance"]
+    assert sorted(binance_rows["ts_ms"].tolist()) == [close_t1, close_t2], \
+        "binance source rows must be keyed at close_time"
+    chainlink_rows = df[df["source"] == "chainlink_proxy"]
+    assert sorted(chainlink_rows["ts_ms"].tolist()) == [close_t1, close_t2], \
+        "chainlink_proxy source rows must be keyed at close_time"
+
+
 def test_fetch_klines_handles_http_418_ip_ban(monkeypatch):
     """A 418 response (Binance IP ban) must trigger a long retry-after
     sleep instead of falling through to the broad ``except`` and
