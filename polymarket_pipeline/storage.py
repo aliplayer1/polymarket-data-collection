@@ -1094,14 +1094,39 @@ def _run_tick_consolidation_pass(
             return f"COALESCE(src.{name}, {default}) AS {name}"
         return f"{default} AS {name}"
 
-    tx_hash_sql = _col_sql("tx_hash", "''")
+    tx_hash_sql = (
+        f"CAST(COALESCE(src.tx_hash, '') AS VARCHAR) AS tx_hash"
+        if "tx_hash" in present_cols
+        else "CAST('' AS VARCHAR) AS tx_hash"
+    )
     block_number_sql = _col_sql("block_number", "0")
     log_index_sql = _col_sql("log_index", "0")
-    spot_price_usdt_sql = "src.spot_price_usdt" if "spot_price_usdt" in present_cols else "NULL::FLOAT AS spot_price_usdt"
-    spot_price_ts_ms_sql = "src.spot_price_ts_ms" if "spot_price_ts_ms" in present_cols else "NULL::BIGINT AS spot_price_ts_ms"
-    local_recv_ts_ns_sql = "src.local_recv_ts_ns" if "local_recv_ts_ns" in present_cols else "NULL::BIGINT AS local_recv_ts_ns"
-    # v5 order_hash — missing in pre-v5 shards, populated by SubgraphTickFetcher.
-    order_hash_sql = "src.order_hash" if "order_hash" in present_cols else "NULL::VARCHAR AS order_hash"
+    spot_price_usdt_sql = (
+        "CAST(src.spot_price_usdt AS FLOAT) AS spot_price_usdt"
+        if "spot_price_usdt" in present_cols
+        else "NULL::FLOAT AS spot_price_usdt"
+    )
+    spot_price_ts_ms_sql = (
+        "CAST(src.spot_price_ts_ms AS BIGINT) AS spot_price_ts_ms"
+        if "spot_price_ts_ms" in present_cols
+        else "NULL::BIGINT AS spot_price_ts_ms"
+    )
+    local_recv_ts_ns_sql = (
+        "CAST(src.local_recv_ts_ns AS BIGINT) AS local_recv_ts_ns"
+        if "local_recv_ts_ns" in present_cols
+        else "NULL::BIGINT AS local_recv_ts_ns"
+    )
+    # v5 order_hash — missing in pre-v5 shards, populated by
+    # SubgraphTickFetcher.  Explicit VARCHAR cast: in production we
+    # observed pandas writing all-None order_hash columns that
+    # pyarrow stored with a non-string Arrow type, which then poisoned
+    # the ``union_by_name`` schema and broke ``COALESCE(order_hash, '')``
+    # downstream with a "Could not convert string '' to INT32" error.
+    order_hash_sql = (
+        "CAST(src.order_hash AS VARCHAR) AS order_hash"
+        if "order_hash" in present_cols
+        else "NULL::VARCHAR AS order_hash"
+    )
 
     try:
         result = con.execute(f"""
@@ -1466,23 +1491,39 @@ def _run_ws_appendonly_pass(
             return f"COALESCE(src.{name}, {default}) AS {name}"
         return f"{default} AS {name}"
 
-    tx_hash_sql = _col_sql("tx_hash", "''")
+    # Explicit CASTs on every pre-existing-but-recently-added column.
+    # Pandas-written shards with all-NULL columns leave pyarrow free
+    # to pick a non-canonical Arrow type (e.g. INT32 for an all-NULL
+    # ``order_hash``), which then poisons DuckDB's ``union_by_name``
+    # schema and breaks ``COALESCE(order_hash, '')`` with a
+    # "Could not convert string '' to INT32" error.  The CASTs force
+    # every column to its canonical TICKS_SCHEMA type before the
+    # GROUP BY / COALESCE see it.
+    tx_hash_sql = (
+        f"CAST(COALESCE(src.tx_hash, '') AS VARCHAR) AS tx_hash"
+        if "tx_hash" in present_cols
+        else "CAST('' AS VARCHAR) AS tx_hash"
+    )
     block_number_sql = _col_sql("block_number", "0")
     log_index_sql = _col_sql("log_index", "0")
     spot_price_usdt_sql = (
-        "src.spot_price_usdt" if "spot_price_usdt" in present_cols
+        "CAST(src.spot_price_usdt AS FLOAT) AS spot_price_usdt"
+        if "spot_price_usdt" in present_cols
         else "NULL::FLOAT AS spot_price_usdt"
     )
     spot_price_ts_ms_sql = (
-        "src.spot_price_ts_ms" if "spot_price_ts_ms" in present_cols
+        "CAST(src.spot_price_ts_ms AS BIGINT) AS spot_price_ts_ms"
+        if "spot_price_ts_ms" in present_cols
         else "NULL::BIGINT AS spot_price_ts_ms"
     )
     local_recv_ts_ns_sql = (
-        "src.local_recv_ts_ns" if "local_recv_ts_ns" in present_cols
+        "CAST(src.local_recv_ts_ns AS BIGINT) AS local_recv_ts_ns"
+        if "local_recv_ts_ns" in present_cols
         else "NULL::BIGINT AS local_recv_ts_ns"
     )
     order_hash_sql = (
-        "src.order_hash" if "order_hash" in present_cols
+        "CAST(src.order_hash AS VARCHAR) AS order_hash"
+        if "order_hash" in present_cols
         else "NULL::VARCHAR AS order_hash"
     )
 

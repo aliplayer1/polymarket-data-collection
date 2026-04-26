@@ -1536,6 +1536,99 @@ def test_consolidate_ws_ticks_chunked_appendonly(monkeypatch, tmp_path):
         assert out_chunked[col].tolist() == out_single[col].tolist(), col
 
 
+def test_consolidate_ws_ticks_with_pandas_all_none_order_hash(tmp_path):
+    """Regression: production WS shards with an all-NULL ``order_hash``
+    column written via ``pa.Table.from_pandas`` end up with a
+    non-VARCHAR Arrow type (pyarrow infers from pandas object dtype
+    holding only None), which under ``union_by_name=true`` poisoned
+    the unified schema and caused
+    ``COALESCE(order_hash, '') AS ... GROUP BY ...`` to fail with
+    "Could not convert string '' to INT32" on the production CAX21.
+
+    The fix is an explicit ``CAST(src.order_hash AS VARCHAR)`` in the
+    consolidation SELECT.  This test reproduces the failure mode by
+    writing one shard with ``order_hash`` as a populated VARCHAR and
+    another with ``order_hash`` as an all-None pandas object column.
+    """
+    from polymarket_pipeline.storage import consolidate_ticks
+
+    part = tmp_path / "crypto=BTC" / "timeframe=5-minute"
+    part.mkdir(parents=True)
+
+    # Shard A: a "good" WS shard — pandas-written, all None
+    # order_hash, one trade row.  This mirrors what the production WS
+    # writer produces.
+    df_a = pd.DataFrame({
+        "market_id": ["m1"],
+        "timestamp_ms": [1700000000000],
+        "token_id": ["tokA"],
+        "outcome": ["Up"],
+        "side": ["BUY"],
+        "price": [0.50],
+        "size_usdc": [10.0],
+        "tx_hash": [""],
+        "block_number": [0],
+        "log_index": [0],
+        "source": ["websocket"],
+        "spot_price_usdt": [67000.0],
+        "spot_price_ts_ms": [1700000000000],
+        "local_recv_ts_ns": [1700000000_001_000_000],
+        "order_hash": [None],  # all-None → pyarrow may pick non-VARCHAR
+    })
+    pq.write_table(
+        pa.Table.from_pandas(df_a, preserve_index=False),
+        str(part / "ws_ticks_a.parquet"),
+    )
+
+    # Shard B: a properly-typed shard with order_hash as VARCHAR.
+    # Mixing it with shard A reproduces the union_by_name schema
+    # ambiguity.
+    df_b = pd.DataFrame({
+        "market_id": ["m1"],
+        "timestamp_ms": [1700000000001],
+        "token_id": ["tokA"],
+        "outcome": ["Up"],
+        "side": ["SELL"],
+        "price": [0.51],
+        "size_usdc": [11.0],
+        "tx_hash": [""],
+        "block_number": [0],
+        "log_index": [0],
+        "source": ["websocket"],
+        "spot_price_usdt": [67050.0],
+        "spot_price_ts_ms": [1700000000001],
+        "local_recv_ts_ns": [1700000000_002_000_000],
+        "order_hash": [None],
+    })
+    schema_with_string_order_hash = pa.schema([
+        pa.field("market_id", pa.string()),
+        pa.field("timestamp_ms", pa.int64()),
+        pa.field("token_id", pa.string()),
+        pa.field("outcome", pa.string()),
+        pa.field("side", pa.string()),
+        pa.field("price", pa.float32()),
+        pa.field("size_usdc", pa.float32()),
+        pa.field("tx_hash", pa.string()),
+        pa.field("block_number", pa.int32()),
+        pa.field("log_index", pa.int32()),
+        pa.field("source", pa.string()),
+        pa.field("spot_price_usdt", pa.float32()),
+        pa.field("spot_price_ts_ms", pa.int64()),
+        pa.field("local_recv_ts_ns", pa.int64()),
+        pa.field("order_hash", pa.string()),
+    ])
+    pq.write_table(
+        pa.Table.from_pandas(df_b, preserve_index=False, schema=schema_with_string_order_hash),
+        str(part / "ws_ticks_b.parquet"),
+    )
+
+    # Must not raise.
+    consolidate_ticks(ticks_dir=str(tmp_path))
+
+    out = _read_partition_ticks(part)
+    assert len(out) == 2, f"expected both rows preserved, got {len(out)}"
+
+
 def test_make_duckdb_temp_dir_default_is_outside_data_tree(tmp_path, monkeypatch):
     """Spill must NOT live inside the data tree by default — when the
     data partition fills, the spill must not fail with ENOSPC for the
