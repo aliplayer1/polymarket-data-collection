@@ -14,6 +14,37 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+
+def _read_partition_ticks(part_dir) -> pd.DataFrame:
+    """Read all consolidated tick files in a partition.
+
+    A consolidated partition can hold:
+      * ``part-0.parquet`` — non-WS rows (backfill + legacy + folded part-0
+        from older runs) merged via the GROUP BY path.
+      * ``part-ws-{epoch_ms}-{seq}.parquet`` — WS rows from the
+        append-only path (one or more files per consolidation run).
+
+    Returns the union of all of them as a single DataFrame.  Empty
+    DataFrame if the partition is empty.  Reads each file as a
+    pandas DataFrame separately and concats (rather than via
+    ``pa.concat_tables``) so test fixtures with all-None nullable
+    columns — which pandas infers as float64 / int32 / int64
+    inconsistently across shards — don't trip on Arrow's strict
+    type-merge rules.
+    """
+    part_dir = str(part_dir)
+    if not os.path.isdir(part_dir):
+        return pd.DataFrame()
+    names = sorted(
+        f for f in os.listdir(part_dir)
+        if f.endswith(".parquet")
+        and (f == "part-0.parquet" or f.startswith("part-ws-"))
+    )
+    if not names:
+        return pd.DataFrame()
+    frames = [pq.read_table(os.path.join(part_dir, f)).to_pandas() for f in names]
+    return pd.concat(frames, ignore_index=True, sort=False)
+
 from polymarket_pipeline.storage import (
     STORAGE_SCHEMA_VERSION,
     _check_disk_space,
@@ -1237,7 +1268,9 @@ def test_consolidate_ticks_subgraph_overwrites_legacy_for_same_tx(tmp_path):
     )
 
     consolidate_ticks(ticks_dir=str(tmp_path))
-    out = pq.ParquetFile(str(part / "part-0.parquet")).read().to_pandas()
+    # WS rows now land in a separate part-ws-* file (append-only path),
+    # backfill shards merge into part-0.  Read the union.
+    out = _read_partition_ticks(part)
 
     # 2 subgraph + 1 WS = 3 rows.  Both legacy rows dropped.
     assert len(out) == 3, f"expected 3 rows (2 subgraph + 1 WS), got {len(out)}"
@@ -1326,7 +1359,8 @@ def test_consolidate_ticks_preserves_sub_ms_ws_trades_via_local_recv_ts_ns(tmp_p
     )
 
     consolidate_ticks(ticks_dir=str(tmp_path))
-    out = pq.ParquetFile(str(part / "part-0.parquet")).read().to_pandas()
+    # WS rows go to a part-ws-* file (append-only path).
+    out = _read_partition_ticks(part)
     assert len(out) == 2, (
         f"expected both sub-ms WS rows to survive, got {len(out)} row(s)"
     )
@@ -1390,15 +1424,23 @@ def test_persist_ticks_dedup_matches_consolidate_ticks(tmp_path):
     assert sorted(out_a["price"].tolist()) == sorted(out_b["price"].tolist())
 
 
-def test_consolidate_ticks_chunked_matches_single_pass(monkeypatch, tmp_path):
-    """A partition with more shards than ``_TICK_CONSOLIDATION_BATCH_SIZE``
-    is processed in multiple DuckDB passes — folded into ``part-0.parquet``
-    incrementally — instead of one giant COPY.  The final result must be
-    identical (row count, dedup tiebreaks, surviving values) to a
-    single-pass consolidation of the same shards.
+def test_consolidate_ws_ticks_chunked_appendonly(monkeypatch, tmp_path):
+    """WS shards are consolidated via the append-only path.  With more
+    shards than ``_TICK_CONSOLIDATION_BATCH_SIZE``, each batch becomes
+    its own ``part-ws-{epoch_ms}-{seq}.parquet`` file.
 
-    Regression: production BTC/5-minute partitions accumulate ~16k WS
-    shards between consolidations and OOM in a single 2 GB-capped COPY.
+    Production semantics being tested:
+      * Every input shard is consumed (deleted from disk).
+      * Each batch produces one output file.
+      * The union of all output files contains every WS row, with
+        within-batch dedup applied (production rows have unique
+        ``local_recv_ts_ns`` so cross-shard collisions are
+        effectively impossible).
+
+    Regression: the previous "fold part-0 into every batch" model
+    OOM'd at ~17 k shards on the production CAX21 because peak
+    memory tracked cumulative part-0 size, not batch size.  The
+    append-only path bounds memory to a single batch.
     """
     from polymarket_pipeline import storage as storage_mod
 
@@ -1407,10 +1449,6 @@ def test_consolidate_ticks_chunked_matches_single_pass(monkeypatch, tmp_path):
     def _build_shards(target_root):
         target = target_root / "crypto=BTC" / "timeframe=5-minute"
         target.mkdir(parents=True)
-        # Explicit Arrow schema so all-None nullable columns
-        # (spot_price_*, order_hash) get the right type — pandas would
-        # otherwise infer INT32 for None-only columns and break the
-        # COALESCE in the consolidation SQL.
         shard_schema = pa.schema([
             pa.field("market_id", pa.string()),
             pa.field("timestamp_ms", pa.int64()),
@@ -1429,13 +1467,14 @@ def test_consolidate_ticks_chunked_matches_single_pass(monkeypatch, tmp_path):
             pa.field("order_hash", pa.string()),
         ])
         for i in range(NUM_SHARDS):
+            # Each shard contributes 2 distinct rows.  All
+            # ``local_recv_ts_ns`` are globally unique to mirror
+            # production (Linux CLOCK_MONOTONIC is system-wide and
+            # never repeats across shards), so neither within-batch
+            # nor cross-batch dedup will collapse anything.
             data = {
                 "market_id": ["m1", "m1"],
-                # Row 0 of each shard is unique (different ts_ms) → survives.
-                # Row 1 collides across all shards on the dedup key
-                # (same ts_ms, same local_recv_ts_ns) → only one survives,
-                # and the latest shard's values must win.
-                "timestamp_ms": [2_000_000 + i, 1_000_000],
+                "timestamp_ms": [2_000_000 + i, 1_000_000 + i],
                 "token_id": ["tokA", "tokA"],
                 "outcome": ["Up", "Up"],
                 "side": ["BUY", "BUY"],
@@ -1447,64 +1486,52 @@ def test_consolidate_ticks_chunked_matches_single_pass(monkeypatch, tmp_path):
                 "source": ["websocket", "websocket"],
                 "spot_price_usdt": [None, None],
                 "spot_price_ts_ms": [None, None],
-                # Unique vs collider local_recv_ts_ns.
                 "local_recv_ts_ns": [
-                    1_700_000_000_000_000_000 + i * 1_000,
-                    42,
+                    1_700_000_000_000_000_000 + i * 2_000,
+                    1_700_000_000_000_000_000 + i * 2_000 + 1,
                 ],
                 "order_hash": [None, None],
             }
             table = pa.Table.from_pydict(data, schema=shard_schema)
             shard_path = target / f"ws_ticks_{i:03d}.parquet"
             pq.write_table(table, str(shard_path))
-            # Monotonic mtimes — newer shards (higher i) have later mtime,
-            # so they should win the dedup tiebreak.
             os.utime(shard_path, (1000 + i, 1000 + i))
 
-    # Single-pass baseline: batch large enough to fit everything.
+    # Single-batch path: batch_size large enough to swallow all shards.
     monkeypatch.setattr(storage_mod, "_TICK_CONSOLIDATION_BATCH_SIZE", 1000)
     single_root = tmp_path / "single"
     _build_shards(single_root)
     consolidate_ticks(ticks_dir=str(single_root))
-    out_single = (
-        pq.read_table(
-            str(single_root / "crypto=BTC" / "timeframe=5-minute" / "part-0.parquet")
-        )
-        .to_pandas()
-        .sort_values(["timestamp_ms", "local_recv_ts_ns"])
-        .reset_index(drop=True)
-    )
+    single_part = single_root / "crypto=BTC" / "timeframe=5-minute"
+    # All input shards consumed; one part-ws file emitted.
+    remaining_single = sorted(os.listdir(single_part))
+    assert all(f.startswith("part-ws-") for f in remaining_single), remaining_single
+    assert len(remaining_single) == 1, remaining_single
+    out_single = _read_partition_ticks(single_part).sort_values(
+        ["timestamp_ms", "local_recv_ts_ns"]
+    ).reset_index(drop=True)
 
-    # Chunked: batch_size=3 forces 4 passes for 10 shards.
+    # Chunked path: batch_size=3 forces 4 batches for 10 shards.
     monkeypatch.setattr(storage_mod, "_TICK_CONSOLIDATION_BATCH_SIZE", 3)
     chunked_root = tmp_path / "chunked"
     _build_shards(chunked_root)
     consolidate_ticks(ticks_dir=str(chunked_root))
     chunked_part = chunked_root / "crypto=BTC" / "timeframe=5-minute"
-    # Every shard cleaned up; only the consolidated file remains.
-    assert sorted(os.listdir(chunked_part)) == ["part-0.parquet"]
-    out_chunked = (
-        pq.read_table(str(chunked_part / "part-0.parquet"))
-        .to_pandas()
-        .sort_values(["timestamp_ms", "local_recv_ts_ns"])
-        .reset_index(drop=True)
-    )
+    # All input shards consumed; one part-ws file per batch (4 batches).
+    remaining_chunked = sorted(os.listdir(chunked_part))
+    assert all(f.startswith("part-ws-") for f in remaining_chunked), remaining_chunked
+    assert len(remaining_chunked) == 4, remaining_chunked
+    out_chunked = _read_partition_ticks(chunked_part).sort_values(
+        ["timestamp_ms", "local_recv_ts_ns"]
+    ).reset_index(drop=True)
 
-    # Same row count: NUM_SHARDS unique survivors + 1 collider winner.
-    assert len(out_chunked) == NUM_SHARDS + 1
+    # The union of part-ws files must match the single-batch output —
+    # production WS shards have no cross-shard collisions, so all
+    # 20 rows survive both paths.
+    assert len(out_single) == 2 * NUM_SHARDS
     assert len(out_chunked) == len(out_single)
 
-    # Tiebreak winner for the collider must be the latest shard
-    # (i = NUM_SHARDS - 1) in BOTH paths.  Without correct part-0
-    # ordering across passes, chunked could pick a stale early-batch
-    # winner.
-    expected_collider_price = 0.50 + (NUM_SHARDS - 1) * 0.01
-    collider_chunked = out_chunked[out_chunked["timestamp_ms"] == 1_000_000].iloc[0]
-    collider_single = out_single[out_single["timestamp_ms"] == 1_000_000].iloc[0]
-    assert collider_single["price"] == pytest.approx(expected_collider_price)
-    assert collider_chunked["price"] == pytest.approx(expected_collider_price)
-
-    # Column-wise parity over all rows.
+    # Column-wise parity over all rows (after sort-by ts_ms+local_recv_ts_ns).
     for col in ("market_id", "timestamp_ms", "token_id", "price", "size_usdc"):
         assert out_chunked[col].tolist() == out_single[col].tolist(), col
 
@@ -1698,9 +1725,9 @@ def test_consolidate_ticks_join_based_legacy_filter_matches_window_semantics(mon
     monkeypatch.setattr(storage_mod, "_TICK_CONSOLIDATION_BATCH_SIZE", 1)
 
     consolidate_ticks(ticks_dir=str(tmp_path))
-    out = pq.read_table(str(part / "part-0.parquet")).to_pandas().sort_values(
-        "timestamp_ms"
-    ).reset_index(drop=True)
+    # WS rows go to part-ws-* (append-only), backfill rows merge into
+    # part-0 — read the union of both.
+    out = _read_partition_ticks(part).sort_values("timestamp_ms").reset_index(drop=True)
 
     # Expected: 3 rows.  Legacy-A dropped (shadowed by subgraph-X);
     # subgraph-X kept; lonely-legacy kept; WS kept.
