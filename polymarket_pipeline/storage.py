@@ -818,6 +818,14 @@ _TICKS_EMPTY_COLS = [
 # order_hash) don't collapse multi-fill transactions.
 _TICKS_DEDUP_COLS = ["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"]
 
+# Cap on shards processed in a single DuckDB COPY pass.  The window function
+# in ``consolidate_ticks`` plus the union-by-name read across all shard files
+# scales memory ~linearly with shard count; on the production CAX21 (8 GB,
+# DuckDB capped at 2 GB), partitions over a few thousand shards OOM in a
+# single pass.  Past this threshold the consolidator processes shards in
+# chunks, each pass folding into ``part-0.parquet`` as the accumulator.
+_TICK_CONSOLIDATION_BATCH_SIZE = 1500
+
 
 def _tick_consolidation_select_sql(sort_key_sql: str) -> str:
     """Build the SELECT list for DuckDB shard consolidation."""
@@ -958,6 +966,174 @@ def append_ticks_only(
     log.info("Ticks appended (no merge): %s/ (%s new rows)", t_dir, len(ticks_df))
 
 
+def _run_tick_consolidation_pass(
+    con: Any,
+    *,
+    dirpath: str,
+    input_basenames: list[str],
+    consolidated_path: str,
+    rel: str,
+    log: logging.Logger,
+) -> int:
+    """Run one DuckDB consolidation pass over *input_basenames* in *dirpath*.
+
+    The order of *input_basenames* defines ``file_order`` (and therefore
+    the dedup tiebreak): earlier entries lose ties to later entries.  When
+    folding a previous ``part-0.parquet`` into a fresh batch, place it
+    first so the new shards' rows win.
+
+    Atomically replaces ``consolidated_path`` with the new output, then
+    deletes every input file *except* ``part-0.parquet`` (which was just
+    swapped in via ``os.replace``).  Returns the row count written.
+    """
+    file_paths = [os.path.join(dirpath, f) for f in input_basenames]
+    tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
+
+    files_sql = ", ".join(f"'{_duckdb_escape(p)}'" for p in file_paths)
+    files_with_order_sql = ", ".join(
+        f"('{_duckdb_escape(path)}', {idx})" for idx, path in enumerate(file_paths)
+    )
+    select_sql = _tick_consolidation_select_sql("sort_key")
+    group_by_sql = ", ".join(_TICKS_DEDUP_COLS)
+
+    desc_res = con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet([{files_sql}], union_by_name=true)"
+    ).fetchall()
+    present_cols = {row[0] for row in desc_res}
+
+    def _col_sql(name: str, default: str) -> str:
+        if name in present_cols:
+            return f"COALESCE(src.{name}, {default}) AS {name}"
+        return f"{default} AS {name}"
+
+    tx_hash_sql = _col_sql("tx_hash", "''")
+    block_number_sql = _col_sql("block_number", "0")
+    log_index_sql = _col_sql("log_index", "0")
+    spot_price_usdt_sql = "src.spot_price_usdt" if "spot_price_usdt" in present_cols else "NULL::FLOAT AS spot_price_usdt"
+    spot_price_ts_ms_sql = "src.spot_price_ts_ms" if "spot_price_ts_ms" in present_cols else "NULL::BIGINT AS spot_price_ts_ms"
+    local_recv_ts_ns_sql = "src.local_recv_ts_ns" if "local_recv_ts_ns" in present_cols else "NULL::BIGINT AS local_recv_ts_ns"
+    # v5 order_hash — missing in pre-v5 shards, populated by SubgraphTickFetcher.
+    order_hash_sql = "src.order_hash" if "order_hash" in present_cols else "NULL::VARCHAR AS order_hash"
+
+    try:
+        result = con.execute(f"""
+            COPY (
+                WITH source_files(file_path, file_order) AS (
+                    VALUES {files_with_order_sql}
+                ),
+                ranked_rows AS (
+                    SELECT
+                        src.market_id,
+                        src.timestamp_ms,
+                        src.token_id,
+                        src.outcome,
+                        src.side,
+                        src.price,
+                        src.size_usdc,
+                        {tx_hash_sql},
+                        {block_number_sql},
+                        {log_index_sql},
+                        src.source,
+                        {spot_price_usdt_sql},
+                        {spot_price_ts_ms_sql},
+                        {local_recv_ts_ns_sql},
+                        {order_hash_sql},
+                        ((f.file_order::BIGINT << 32) + src.file_row_number::BIGINT) AS sort_key
+                    FROM read_parquet(
+                        [{files_sql}],
+                        union_by_name=true,
+                        filename=true,
+                        file_row_number=true
+                    ) AS src
+                    JOIN source_files AS f ON src.filename = f.file_path
+                ),
+                -- Hybrid legacy↔subgraph dedup.  Legacy (Etherscan/RPC)
+                -- rows have populated tx_hash and log_index but NULL
+                -- order_hash.  Subgraph rows have the same tx_hash,
+                -- log_index=0, and a real order_hash.  When BOTH exist
+                -- for the same (market_id, ts_ms, token_id, tx_hash),
+                -- the subgraph rows are canonical — drop the legacy
+                -- ones so re-collecting silently overwrites the old
+                -- data with the new schema.
+                --
+                -- WS rows have tx_hash='' (unaffected) and ride the
+                -- order_hash + local_recv_ts_ns discriminators below.
+                flagged AS (
+                    SELECT
+                        ranked_rows.*,
+                        MAX(CASE WHEN order_hash IS NOT NULL THEN 1 ELSE 0 END)
+                            OVER (
+                                PARTITION BY market_id, timestamp_ms,
+                                             token_id, tx_hash
+                            ) AS has_subgraph_for_tx
+                    FROM ranked_rows
+                ),
+                dedup_input AS (
+                    SELECT * FROM flagged
+                    WHERE NOT (
+                        tx_hash <> ''             -- never filter WS rows
+                        AND has_subgraph_for_tx = 1
+                        AND order_hash IS NULL    -- legacy
+                    )
+                )
+                -- Intentionally omit a final ORDER BY: the global sort is
+                -- another blocking operator and was the main OOM trigger.
+                --
+                -- Dedup key includes:
+                --   * COALESCE(order_hash, '') so subgraph-sourced rows
+                --     (populated order_hash, unique per-fill within a
+                --     tx) don't collapse with legacy on-chain / WS rows
+                --     that have NULL order_hash.
+                --   * COALESCE(local_recv_ts_ns, 0) so multiple WS
+                --     trades on the same (market_id, ts_ms, token_id) —
+                --     where tx_hash="", log_index=0, order_hash IS
+                --     NULL — but with distinct nanosecond receive times
+                --     survive consolidation.  Sub-millisecond fills can
+                --     and do happen on hot tokens; without this
+                --     discriminator they used to collapse to one row.
+                --     Old shards without local_recv_ts_ns map to 0 and
+                --     dedup as before.
+                SELECT
+                    {select_sql}
+                FROM dedup_input AS ranked_rows
+                GROUP BY {group_by_sql},
+                         COALESCE(order_hash, ''),
+                         COALESCE(local_recv_ts_ns, 0)
+            ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """).fetchone()
+        nrows = result[0] if result else 0
+
+        # Replace consolidated file FIRST so a crash between the two
+        # steps leaves orphan shards (idempotent — the next
+        # consolidation run merges them again via dedup) rather than an
+        # empty partition that the HF upload's delete_patterns would
+        # propagate to the Hub.
+        os.replace(tmp_path, consolidated_path)
+        _fsync_dir(dirpath)
+
+        remove_errors: list[str] = []
+        for fname in input_basenames:
+            if fname == "part-0.parquet":
+                continue  # already replaced atomically above
+            try:
+                os.remove(os.path.join(dirpath, fname))
+            except OSError as exc:
+                remove_errors.append(f"{fname}: {exc}")
+        if remove_errors:
+            log.warning(
+                "  -> could not remove %d old shard file(s) in %s; "
+                "duplicates may remain until the next consolidation: %s",
+                len(remove_errors),
+                rel,
+                "; ".join(remove_errors),
+            )
+        return nrows
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
 def consolidate_ticks(
     *,
     ticks_dir: str | None = None,
@@ -970,7 +1146,12 @@ def consolidate_ticks(
     deduplicates, and rewrites a single consolidated file.
 
     Uses DuckDB for out-of-core merge/dedup so peak memory stays well
-    below the full partition size even with many shard files.
+    below the full partition size even with many shard files.  When the
+    shard count for a single partition exceeds
+    ``_TICK_CONSOLIDATION_BATCH_SIZE``, the work is split into multiple
+    DuckDB passes — each pass folds a chunk of shards into the running
+    ``part-0.parquet``.  This caps the rows-in-flight per pass (and thus
+    peak memory) regardless of partition size.
     """
     log = logger or logging.getLogger("polymarket_pipeline")
     t_dir = ticks_dir or PARQUET_TICKS_DIR
@@ -995,17 +1176,22 @@ def consolidate_ticks(
             log.info("Consolidating partition %s (%d shard files)...", rel, len(parquet_files))
             _check_disk_space(dirpath)
 
-            file_paths = [os.path.join(dirpath, f) for f in parquet_files]
-            file_paths.sort(key=lambda path: (os.path.getmtime(path), path))
             consolidated_path = os.path.join(dirpath, "part-0.parquet")
-            tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
-
-            files_sql = ", ".join(f"'{_duckdb_escape(p)}'" for p in file_paths)
-            files_with_order_sql = ", ".join(
-                f"('{_duckdb_escape(path)}', {idx})" for idx, path in enumerate(file_paths)
+            has_part0 = "part-0.parquet" in parquet_files
+            shard_files = [f for f in parquet_files if f != "part-0.parquet"]
+            shard_files.sort(
+                key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
             )
-            select_sql = _tick_consolidation_select_sql("sort_key")
-            group_by_sql = ", ".join(_TICKS_DEDUP_COLS)
+
+            batch_size = _TICK_CONSOLIDATION_BATCH_SIZE
+            num_batches = max(1, (len(shard_files) + batch_size - 1) // batch_size)
+            chunked = num_batches > 1
+            if chunked:
+                log.info(
+                    "  -> Large partition: splitting %d shards into %d batches of <=%d",
+                    len(shard_files), num_batches, batch_size,
+                )
+
             temp_dir = os.path.join(dirpath, ".duckdb_tmp")
             con = None
             try:
@@ -1023,140 +1209,64 @@ def consolidate_ticks(
                     threads,
                 )
 
-                desc_res = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{files_sql}], union_by_name=true)").fetchall()
-                present_cols = {row[0] for row in desc_res}
-
-                def _col_sql(name: str, default: str) -> str:
-                    if name in present_cols:
-                        return f"COALESCE(src.{name}, {default}) AS {name}"
-                    return f"{default} AS {name}"
-
-                tx_hash_sql = _col_sql("tx_hash", "''")
-                block_number_sql = _col_sql("block_number", "0")
-                log_index_sql = _col_sql("log_index", "0")
-                spot_price_usdt_sql = "src.spot_price_usdt" if "spot_price_usdt" in present_cols else "NULL::FLOAT AS spot_price_usdt"
-                spot_price_ts_ms_sql = "src.spot_price_ts_ms" if "spot_price_ts_ms" in present_cols else "NULL::BIGINT AS spot_price_ts_ms"
-                local_recv_ts_ns_sql = "src.local_recv_ts_ns" if "local_recv_ts_ns" in present_cols else "NULL::BIGINT AS local_recv_ts_ns"
-                # v5 order_hash — missing in pre-v5 shards, populated by SubgraphTickFetcher.
-                order_hash_sql = "src.order_hash" if "order_hash" in present_cols else "NULL::VARCHAR AS order_hash"
-
-                result = con.execute(f"""
-                    COPY (
-                        WITH source_files(file_path, file_order) AS (
-                            VALUES {files_with_order_sql}
-                        ),
-                        ranked_rows AS (
-                            SELECT
-                                src.market_id,
-                                src.timestamp_ms,
-                                src.token_id,
-                                src.outcome,
-                                src.side,
-                                src.price,
-                                src.size_usdc,
-                                {tx_hash_sql},
-                                {block_number_sql},
-                                {log_index_sql},
-                                src.source,
-                                {spot_price_usdt_sql},
-                                {spot_price_ts_ms_sql},
-                                {local_recv_ts_ns_sql},
-                                {order_hash_sql},
-                                ((f.file_order::BIGINT << 32) + src.file_row_number::BIGINT) AS sort_key
-                            FROM read_parquet(
-                                [{files_sql}],
-                                union_by_name=true,
-                                filename=true,
-                                file_row_number=true
-                            ) AS src
-                            JOIN source_files AS f ON src.filename = f.file_path
-                        ),
-                        -- Hybrid legacy↔subgraph dedup.  Legacy
-                        -- (Etherscan/RPC) rows have populated tx_hash and
-                        -- log_index but NULL order_hash.  Subgraph rows
-                        -- have the same tx_hash, log_index=0, and a real
-                        -- order_hash.  When BOTH exist for the same
-                        -- (market_id, ts_ms, token_id, tx_hash), the
-                        -- subgraph rows are canonical — drop the legacy
-                        -- ones so re-collecting silently overwrites the
-                        -- old data with the new schema.
-                        --
-                        -- WS rows have tx_hash='' (unaffected) and ride
-                        -- the order_hash + local_recv_ts_ns
-                        -- discriminators below.
-                        flagged AS (
-                            SELECT
-                                ranked_rows.*,
-                                MAX(CASE WHEN order_hash IS NOT NULL THEN 1 ELSE 0 END)
-                                    OVER (
-                                        PARTITION BY market_id, timestamp_ms,
-                                                     token_id, tx_hash
-                                    ) AS has_subgraph_for_tx
-                            FROM ranked_rows
-                        ),
-                        dedup_input AS (
-                            SELECT * FROM flagged
-                            WHERE NOT (
-                                tx_hash <> ''             -- never filter WS rows
-                                AND has_subgraph_for_tx = 1
-                                AND order_hash IS NULL    -- legacy
-                            )
-                        )
-                        -- Intentionally omit a final ORDER BY: the global sort is
-                        -- another blocking operator and was the main OOM trigger.
-                        --
-                        -- Dedup key includes:
-                        --   * COALESCE(order_hash, '') so subgraph-sourced
-                        --     rows (populated order_hash, unique per-fill
-                        --     within a tx) don't collapse with legacy
-                        --     on-chain / WS rows that have NULL order_hash.
-                        --   * COALESCE(local_recv_ts_ns, 0) so multiple WS
-                        --     trades on the same (market_id, ts_ms,
-                        --     token_id) — where tx_hash="", log_index=0,
-                        --     order_hash IS NULL — but with distinct
-                        --     nanosecond receive times survive
-                        --     consolidation.  Sub-millisecond fills can
-                        --     and do happen on hot tokens; without this
-                        --     discriminator they used to collapse to one
-                        --     row.  Old shards without local_recv_ts_ns
-                        --     map to 0 and dedup as before.
-                        SELECT
-                            {select_sql}
-                        FROM dedup_input AS ranked_rows
-                        GROUP BY {group_by_sql},
-                                 COALESCE(order_hash, ''),
-                                 COALESCE(local_recv_ts_ns, 0)
-                    ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
-                """).fetchone()
-                nrows = result[0] if result else 0
-
-                # Replace consolidated file FIRST so a crash between the
-                # two steps leaves orphan shards (idempotent — the next
-                # consolidation run merges them again via dedup) rather
-                # than an empty partition that the HF upload's
-                # delete_patterns would propagate to the Hub.
-                os.replace(tmp_path, consolidated_path)
-                _fsync_dir(dirpath)
-                remove_errors: list[str] = []
-                for fname in parquet_files:
-                    if fname == "part-0.parquet":
-                        continue  # already replaced atomically above
-                    try:
-                        os.remove(os.path.join(dirpath, fname))
-                    except OSError as exc:
-                        remove_errors.append(f"{fname}: {exc}")
-                if remove_errors:
-                    log.warning(
-                        "  -> could not remove %d old shard file(s) in %s; "
-                        "duplicates may remain until the next consolidation: %s",
-                        len(remove_errors),
-                        rel,
-                        "; ".join(remove_errors),
+                nrows = 0
+                if not chunked:
+                    # Single-pass: include part-0 (if present) plus all
+                    # shards, sorted by mtime so newer shards win ties.
+                    input_files = parquet_files[:]
+                    input_files.sort(
+                        key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
                     )
-            except Exception:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
+                    nrows = _run_tick_consolidation_pass(
+                        con,
+                        dirpath=dirpath,
+                        input_basenames=input_files,
+                        consolidated_path=consolidated_path,
+                        rel=rel,
+                        log=log,
+                    )
+                else:
+                    # Multi-pass.  Each iteration folds <=batch_size new
+                    # shards into part-0.  After pass 0, part-0 ALWAYS
+                    # exists (we just wrote it) and represents the older
+                    # accumulated state, so place it FIRST in the input
+                    # list — this gives it the lowest file_order, and
+                    # the chronologically-newer batch shards win ties
+                    # (matching the single-pass mtime-sorted semantics).
+                    for pass_idx in range(num_batches):
+                        batch = shard_files[
+                            pass_idx * batch_size : (pass_idx + 1) * batch_size
+                        ]
+                        if pass_idx == 0:
+                            # First pass: include part-0 if it exists.
+                            # Sort by mtime as in the single-pass branch.
+                            include_part0 = has_part0
+                            input_files = (
+                                ["part-0.parquet"] if include_part0 else []
+                            ) + batch
+                            input_files.sort(
+                                key=lambda f: (
+                                    os.path.getmtime(os.path.join(dirpath, f)),
+                                    f,
+                                )
+                            )
+                        else:
+                            # Subsequent passes: part-0 (just written) is
+                            # the accumulator. Force it first so its
+                            # rows lose ties to the newer batch shards.
+                            input_files = ["part-0.parquet"] + batch
+                        log.info(
+                            "  -> Batch %d/%d (%d input file(s))",
+                            pass_idx + 1, num_batches, len(input_files),
+                        )
+                        nrows = _run_tick_consolidation_pass(
+                            con,
+                            dirpath=dirpath,
+                            input_basenames=input_files,
+                            consolidated_path=consolidated_path,
+                            rel=rel,
+                            log=log,
+                        )
             finally:
                 try:
                     if con is not None:

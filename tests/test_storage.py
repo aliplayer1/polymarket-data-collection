@@ -1389,6 +1389,125 @@ def test_persist_ticks_dedup_matches_consolidate_ticks(tmp_path):
     assert sorted(out_a["price"].tolist()) == sorted(out_b["price"].tolist())
 
 
+def test_consolidate_ticks_chunked_matches_single_pass(monkeypatch, tmp_path):
+    """A partition with more shards than ``_TICK_CONSOLIDATION_BATCH_SIZE``
+    is processed in multiple DuckDB passes — folded into ``part-0.parquet``
+    incrementally — instead of one giant COPY.  The final result must be
+    identical (row count, dedup tiebreaks, surviving values) to a
+    single-pass consolidation of the same shards.
+
+    Regression: production BTC/5-minute partitions accumulate ~16k WS
+    shards between consolidations and OOM in a single 2 GB-capped COPY.
+    """
+    from polymarket_pipeline import storage as storage_mod
+
+    NUM_SHARDS = 10
+
+    def _build_shards(target_root):
+        target = target_root / "crypto=BTC" / "timeframe=5-minute"
+        target.mkdir(parents=True)
+        # Explicit Arrow schema so all-None nullable columns
+        # (spot_price_*, order_hash) get the right type — pandas would
+        # otherwise infer INT32 for None-only columns and break the
+        # COALESCE in the consolidation SQL.
+        shard_schema = pa.schema([
+            pa.field("market_id", pa.string()),
+            pa.field("timestamp_ms", pa.int64()),
+            pa.field("token_id", pa.string()),
+            pa.field("outcome", pa.string()),
+            pa.field("side", pa.string()),
+            pa.field("price", pa.float32()),
+            pa.field("size_usdc", pa.float32()),
+            pa.field("tx_hash", pa.string()),
+            pa.field("block_number", pa.int32()),
+            pa.field("log_index", pa.int32()),
+            pa.field("source", pa.string()),
+            pa.field("spot_price_usdt", pa.float32()),
+            pa.field("spot_price_ts_ms", pa.int64()),
+            pa.field("local_recv_ts_ns", pa.int64()),
+            pa.field("order_hash", pa.string()),
+        ])
+        for i in range(NUM_SHARDS):
+            data = {
+                "market_id": ["m1", "m1"],
+                # Row 0 of each shard is unique (different ts_ms) → survives.
+                # Row 1 collides across all shards on the dedup key
+                # (same ts_ms, same local_recv_ts_ns) → only one survives,
+                # and the latest shard's values must win.
+                "timestamp_ms": [2_000_000 + i, 1_000_000],
+                "token_id": ["tokA", "tokA"],
+                "outcome": ["Up", "Up"],
+                "side": ["BUY", "BUY"],
+                "price": [0.30 + i * 0.01, 0.50 + i * 0.01],
+                "size_usdc": [10.0 + i, 99.0 + i],
+                "tx_hash": ["", ""],
+                "block_number": [0, 0],
+                "log_index": [0, 0],
+                "source": ["websocket", "websocket"],
+                "spot_price_usdt": [None, None],
+                "spot_price_ts_ms": [None, None],
+                # Unique vs collider local_recv_ts_ns.
+                "local_recv_ts_ns": [
+                    1_700_000_000_000_000_000 + i * 1_000,
+                    42,
+                ],
+                "order_hash": [None, None],
+            }
+            table = pa.Table.from_pydict(data, schema=shard_schema)
+            shard_path = target / f"ws_ticks_{i:03d}.parquet"
+            pq.write_table(table, str(shard_path))
+            # Monotonic mtimes — newer shards (higher i) have later mtime,
+            # so they should win the dedup tiebreak.
+            os.utime(shard_path, (1000 + i, 1000 + i))
+
+    # Single-pass baseline: batch large enough to fit everything.
+    monkeypatch.setattr(storage_mod, "_TICK_CONSOLIDATION_BATCH_SIZE", 1000)
+    single_root = tmp_path / "single"
+    _build_shards(single_root)
+    consolidate_ticks(ticks_dir=str(single_root))
+    out_single = (
+        pq.read_table(
+            str(single_root / "crypto=BTC" / "timeframe=5-minute" / "part-0.parquet")
+        )
+        .to_pandas()
+        .sort_values(["timestamp_ms", "local_recv_ts_ns"])
+        .reset_index(drop=True)
+    )
+
+    # Chunked: batch_size=3 forces 4 passes for 10 shards.
+    monkeypatch.setattr(storage_mod, "_TICK_CONSOLIDATION_BATCH_SIZE", 3)
+    chunked_root = tmp_path / "chunked"
+    _build_shards(chunked_root)
+    consolidate_ticks(ticks_dir=str(chunked_root))
+    chunked_part = chunked_root / "crypto=BTC" / "timeframe=5-minute"
+    # Every shard cleaned up; only the consolidated file remains.
+    assert sorted(os.listdir(chunked_part)) == ["part-0.parquet"]
+    out_chunked = (
+        pq.read_table(str(chunked_part / "part-0.parquet"))
+        .to_pandas()
+        .sort_values(["timestamp_ms", "local_recv_ts_ns"])
+        .reset_index(drop=True)
+    )
+
+    # Same row count: NUM_SHARDS unique survivors + 1 collider winner.
+    assert len(out_chunked) == NUM_SHARDS + 1
+    assert len(out_chunked) == len(out_single)
+
+    # Tiebreak winner for the collider must be the latest shard
+    # (i = NUM_SHARDS - 1) in BOTH paths.  Without correct part-0
+    # ordering across passes, chunked could pick a stale early-batch
+    # winner.
+    expected_collider_price = 0.50 + (NUM_SHARDS - 1) * 0.01
+    collider_chunked = out_chunked[out_chunked["timestamp_ms"] == 1_000_000].iloc[0]
+    collider_single = out_single[out_single["timestamp_ms"] == 1_000_000].iloc[0]
+    assert collider_single["price"] == pytest.approx(expected_collider_price)
+    assert collider_chunked["price"] == pytest.approx(expected_collider_price)
+
+    # Column-wise parity over all rows.
+    for col in ("market_id", "timestamp_ms", "token_id", "price", "size_usdc"):
+        assert out_chunked[col].tolist() == out_single[col].tolist(), col
+
+
 def test_orderbook_schema_has_local_recv_ts_ns():
     from polymarket_pipeline.storage import ORDERBOOK_SCHEMA
     assert "local_recv_ts_ns" in ORDERBOOK_SCHEMA.names
