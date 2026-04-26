@@ -5,6 +5,7 @@ cleaned up automatically after each test.
 """
 
 import os
+import shutil
 import threading
 import time
 
@@ -1506,6 +1507,63 @@ def test_consolidate_ticks_chunked_matches_single_pass(monkeypatch, tmp_path):
     # Column-wise parity over all rows.
     for col in ("market_id", "timestamp_ms", "token_id", "price", "size_usdc"):
         assert out_chunked[col].tolist() == out_single[col].tolist(), col
+
+
+def test_make_duckdb_temp_dir_default_is_outside_data_tree(tmp_path, monkeypatch):
+    """Spill must NOT live inside the data tree by default — when the
+    data partition fills, the spill must not fail with ENOSPC for the
+    same reason.  Regression: production CAX21 had ``.duckdb_tmp/``
+    inside ``data/ticks/.../`` and a single tick-consolidation pass
+    over thousands of shards spilled enough to exhaust the data
+    volume mid-COPY.
+    """
+    import tempfile as _tempfile
+    from polymarket_pipeline.storage import _make_duckdb_temp_dir
+
+    monkeypatch.delenv("PM_DUCKDB_TEMP_DIR", raising=False)
+    fake_data = tmp_path / "data"
+    fake_data.mkdir()
+
+    spill = _make_duckdb_temp_dir("ticks")
+    try:
+        assert os.path.isdir(spill)
+        # Default location must come from $TMPDIR / /tmp, NOT from the
+        # data tree.  Using ``commonpath`` because /tmp may resolve via
+        # symlinks on some platforms.
+        assert os.path.commonpath([spill, str(fake_data)]) != str(fake_data)
+        # Default location should be a child of the system temp root.
+        sys_tmp = _tempfile.gettempdir()
+        assert os.path.commonpath([spill, sys_tmp]) == os.path.realpath(sys_tmp) \
+            or os.path.commonpath([spill, sys_tmp]) == sys_tmp
+        # Each call returns a distinct directory.
+        spill2 = _make_duckdb_temp_dir("ticks")
+        try:
+            assert spill != spill2
+        finally:
+            shutil.rmtree(spill2, ignore_errors=True)
+    finally:
+        shutil.rmtree(spill, ignore_errors=True)
+
+
+def test_make_duckdb_temp_dir_honours_pm_duckdb_temp_dir_env(tmp_path, monkeypatch):
+    """``PM_DUCKDB_TEMP_DIR`` lets operators redirect spill to a
+    dedicated mount (e.g. a separate block volume).  When set, the
+    helper creates a unique subdirectory under that parent.
+    """
+    from polymarket_pipeline.storage import _make_duckdb_temp_dir
+
+    parent = tmp_path / "spill_root"
+    monkeypatch.setenv("PM_DUCKDB_TEMP_DIR", str(parent))
+
+    spill = _make_duckdb_temp_dir("ticks")
+    try:
+        assert os.path.isdir(spill)
+        # Spill is under the configured parent.
+        assert os.path.commonpath([spill, str(parent)]) == str(parent)
+        # Parent was auto-created if missing.
+        assert parent.exists()
+    finally:
+        shutil.rmtree(spill, ignore_errors=True)
 
 
 def test_consolidate_ticks_join_based_legacy_filter_matches_window_semantics(monkeypatch, tmp_path):

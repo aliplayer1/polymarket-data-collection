@@ -46,6 +46,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -482,6 +483,33 @@ def _get_consolidation_threads() -> int:
     if value < 1:
         raise ValueError(f"Invalid PM_DUCKDB_THREADS={raw!r}: expected a positive integer")
     return value
+
+
+def _make_duckdb_temp_dir(label: str) -> str:
+    """Return a fresh, writable scratch directory for DuckDB spills.
+
+    Spilling inside the data tree (the historical default of
+    ``<partition>/.duckdb_tmp/``) competes with the data files for
+    the same volume.  On the production CAX21 the data partition is
+    ~80 GB; a single tick-consolidation pass over thousands of shards
+    can spill several GB and exhaust the volume — bringing both the
+    spill *and* the partition write down with the same ENOSPC.
+
+    Resolution order:
+      1. ``PM_DUCKDB_TEMP_DIR`` env var — used as the parent.  A
+         unique subdirectory is created under it so concurrent runs
+         and stale leftovers can't collide.
+      2. ``tempfile.mkdtemp()`` — uses ``$TMPDIR`` (or ``/tmp``).
+
+    The caller owns the returned directory and is responsible for
+    ``shutil.rmtree(..., ignore_errors=True)`` cleanup.
+    """
+    parent = os.environ.get("PM_DUCKDB_TEMP_DIR")
+    prefix = f"polymarket_duckdb_{label}_"
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+        return tempfile.mkdtemp(prefix=prefix, dir=parent)
+    return tempfile.mkdtemp(prefix=prefix)
 
 
 def _configure_duckdb_for_consolidation(
@@ -1244,32 +1272,36 @@ def consolidate_ticks(
                     len(shard_files), num_batches, batch_size,
                 )
 
-            temp_dir = os.path.join(dirpath, ".duckdb_tmp")
-            con = None
-            try:
-                # Use a dedicated connection and configure for disk-spilling
-                # plus conservative memory usage inside systemd/cgroup limits.
-                con = duckdb.connect()
-                os.makedirs(temp_dir, exist_ok=True)
-                memory_limit, threads = _configure_duckdb_for_consolidation(
-                    con,
-                    temp_dir=temp_dir,
-                )
-                log.info(
-                    "  -> DuckDB settings: memory_limit=%s threads=%s",
-                    memory_limit or "default",
-                    threads,
-                )
+            # Per-partition logging only — actual DuckDB connection +
+            # temp_dir live for the duration of a single pass, see
+            # ``_run_pass`` below.  Spilling inside the data tree
+            # (the historical ``<dirpath>/.duckdb_tmp/`` location)
+            # competes with the data files for the same volume, and
+            # reusing a single connection across all 70+ passes for a
+            # backlogged hot partition lets DuckDB's per-pass spill
+            # files accumulate until the disk is exhausted.  Both
+            # problems are fixed by the per-pass connection +
+            # ``_make_duckdb_temp_dir`` (system tmp by default,
+            # ``PM_DUCKDB_TEMP_DIR`` overridable).
+            settings_logged = False
 
-                nrows = 0
-                if not chunked:
-                    # Single-pass: include part-0 (if present) plus all
-                    # shards, sorted by mtime so newer shards win ties.
-                    input_files = parquet_files[:]
-                    input_files.sort(
-                        key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
+            def _run_pass(input_files: list[str]) -> int:
+                nonlocal settings_logged
+                pass_temp_dir = _make_duckdb_temp_dir("ticks")
+                con = duckdb.connect()
+                try:
+                    memory_limit, threads = _configure_duckdb_for_consolidation(
+                        con, temp_dir=pass_temp_dir,
                     )
-                    nrows = _run_tick_consolidation_pass(
+                    if not settings_logged:
+                        log.info(
+                            "  -> DuckDB settings: memory_limit=%s threads=%s temp_dir=%s",
+                            memory_limit or "default",
+                            threads,
+                            pass_temp_dir,
+                        )
+                        settings_logged = True
+                    return _run_tick_consolidation_pass(
                         con,
                         dirpath=dirpath,
                         input_basenames=input_files,
@@ -1277,54 +1309,56 @@ def consolidate_ticks(
                         rel=rel,
                         log=log,
                     )
-                else:
-                    # Multi-pass.  Each iteration folds <=batch_size new
-                    # shards into part-0.  After pass 0, part-0 ALWAYS
-                    # exists (we just wrote it) and represents the older
-                    # accumulated state, so place it FIRST in the input
-                    # list — this gives it the lowest file_order, and
-                    # the chronologically-newer batch shards win ties
-                    # (matching the single-pass mtime-sorted semantics).
-                    for pass_idx in range(num_batches):
-                        batch = shard_files[
-                            pass_idx * batch_size : (pass_idx + 1) * batch_size
-                        ]
-                        if pass_idx == 0:
-                            # First pass: include part-0 if it exists.
-                            # Sort by mtime as in the single-pass branch.
-                            include_part0 = has_part0
-                            input_files = (
-                                ["part-0.parquet"] if include_part0 else []
-                            ) + batch
-                            input_files.sort(
-                                key=lambda f: (
-                                    os.path.getmtime(os.path.join(dirpath, f)),
-                                    f,
-                                )
-                            )
-                        else:
-                            # Subsequent passes: part-0 (just written) is
-                            # the accumulator. Force it first so its
-                            # rows lose ties to the newer batch shards.
-                            input_files = ["part-0.parquet"] + batch
-                        log.info(
-                            "  -> Batch %d/%d (%d input file(s))",
-                            pass_idx + 1, num_batches, len(input_files),
-                        )
-                        nrows = _run_tick_consolidation_pass(
-                            con,
-                            dirpath=dirpath,
-                            input_basenames=input_files,
-                            consolidated_path=consolidated_path,
-                            rel=rel,
-                            log=log,
-                        )
-            finally:
-                try:
-                    if con is not None:
-                        con.close()
                 finally:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    try:
+                        con.close()
+                    finally:
+                        shutil.rmtree(pass_temp_dir, ignore_errors=True)
+
+            nrows = 0
+            if not chunked:
+                # Single-pass: include part-0 (if present) plus all
+                # shards, sorted by mtime so newer shards win ties.
+                input_files = parquet_files[:]
+                input_files.sort(
+                    key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
+                )
+                nrows = _run_pass(input_files)
+            else:
+                # Multi-pass.  Each iteration folds <=batch_size new
+                # shards into part-0.  After pass 0, part-0 ALWAYS
+                # exists (we just wrote it) and represents the older
+                # accumulated state, so place it FIRST in the input
+                # list — this gives it the lowest file_order, and
+                # the chronologically-newer batch shards win ties
+                # (matching the single-pass mtime-sorted semantics).
+                for pass_idx in range(num_batches):
+                    batch = shard_files[
+                        pass_idx * batch_size : (pass_idx + 1) * batch_size
+                    ]
+                    if pass_idx == 0:
+                        # First pass: include part-0 if it exists.
+                        # Sort by mtime as in the single-pass branch.
+                        include_part0 = has_part0
+                        input_files = (
+                            ["part-0.parquet"] if include_part0 else []
+                        ) + batch
+                        input_files.sort(
+                            key=lambda f: (
+                                os.path.getmtime(os.path.join(dirpath, f)),
+                                f,
+                            )
+                        )
+                    else:
+                        # Subsequent passes: part-0 (just written) is
+                        # the accumulator. Force it first so its
+                        # rows lose ties to the newer batch shards.
+                        input_files = ["part-0.parquet"] + batch
+                    log.info(
+                        "  -> Batch %d/%d (%d input file(s))",
+                        pass_idx + 1, num_batches, len(input_files),
+                    )
+                    nrows = _run_pass(input_files)
 
         log.info("  -> %s consolidated: %d rows", rel, nrows)
 
@@ -1709,12 +1743,12 @@ def _consolidate_partitioned_prices(
             consolidated_path = os.path.join(dirpath, "part-0.parquet")
             tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
 
-            temp_dir = os.path.join(dirpath, ".duckdb_tmp")
+            # Spill outside the data tree: see ``_make_duckdb_temp_dir``.
+            temp_dir = _make_duckdb_temp_dir(f"prices_{label}")
             con = None
             try:
                 _check_disk_space(dirpath)
                 con = duckdb.connect()
-                os.makedirs(temp_dir, exist_ok=True)
                 _configure_duckdb_for_consolidation(con, temp_dir=temp_dir)
 
                 # Discover the union schema once so we can build the
@@ -2007,11 +2041,11 @@ def consolidate_orderbook(
             tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
 
             files_sql = ", ".join(f"'{_duckdb_escape(p)}'" for p in file_paths)
-            temp_dir = os.path.join(dirpath, ".duckdb_tmp")
+            # Spill outside the data tree: see ``_make_duckdb_temp_dir``.
+            temp_dir = _make_duckdb_temp_dir("orderbook")
             con = None
             try:
                 con = duckdb.connect()
-                os.makedirs(temp_dir, exist_ok=True)
                 memory_limit, threads = _configure_duckdb_for_consolidation(
                     con, temp_dir=temp_dir,
                 )
