@@ -488,18 +488,28 @@ def _get_consolidation_threads() -> int:
 def _make_duckdb_temp_dir(label: str) -> str:
     """Return a fresh, writable scratch directory for DuckDB spills.
 
-    Spilling inside the data tree (the historical default of
-    ``<partition>/.duckdb_tmp/``) competes with the data files for
-    the same volume.  On the production CAX21 the data partition is
-    ~80 GB; a single tick-consolidation pass over thousands of shards
-    can spill several GB and exhaust the volume — bringing both the
-    spill *and* the partition write down with the same ENOSPC.
+    Two failure modes have been observed in production:
+
+    1. ``<partition>/.duckdb_tmp/`` (the historical default) lives
+       inside the data tree, so DuckDB's spill files compete with
+       the data files themselves for the same volume — a single
+       consolidation pass over thousands of shards can exhaust the
+       data partition and bring both writes down with one ENOSPC.
+
+    2. ``/tmp`` on systemd-based Linux distros is typically tmpfs
+       (RAM-backed) and capped at ~50% of physical RAM — on the
+       8 GB CAX21 that's ~4 GB, which is *less* than the spill
+       footprint of a tick consolidation merging a multi-million-row
+       ``part-0.parquet`` accumulator.
 
     Resolution order:
-      1. ``PM_DUCKDB_TEMP_DIR`` env var — used as the parent.  A
-         unique subdirectory is created under it so concurrent runs
-         and stale leftovers can't collide.
-      2. ``tempfile.mkdtemp()`` — uses ``$TMPDIR`` (or ``/tmp``).
+      1. ``PM_DUCKDB_TEMP_DIR`` env var — explicit operator override.
+      2. ``/var/tmp`` if it's a writable directory.  By POSIX/FHS
+         convention this is on persistent disk (not tmpfs), and on
+         a default Linux install it inherits the ample free space
+         of the root filesystem rather than the tmpfs RAM cap.
+      3. ``tempfile.mkdtemp()`` — final fallback, honours ``$TMPDIR``
+         then ``/tmp`` (which may be tmpfs — last resort).
 
     The caller owns the returned directory and is responsible for
     ``shutil.rmtree(..., ignore_errors=True)`` cleanup.
@@ -509,7 +519,25 @@ def _make_duckdb_temp_dir(label: str) -> str:
     if parent:
         os.makedirs(parent, exist_ok=True)
         return tempfile.mkdtemp(prefix=prefix, dir=parent)
+
+    if os.name == "posix" and os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK):
+        return tempfile.mkdtemp(prefix=prefix, dir="/var/tmp")
+
     return tempfile.mkdtemp(prefix=prefix)
+
+
+def _scratch_free_bytes(path: str) -> int | None:
+    """Best-effort free-bytes report for the volume that holds *path*.
+
+    Returns ``None`` if the volume can't be statvfs'd (e.g. unusual
+    filesystem).  Used purely for logging so operators can see whether
+    the scratch volume has room before a long consolidation starts.
+    """
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    return st.f_bavail * st.f_frsize
 
 
 def _configure_duckdb_for_consolidation(
@@ -1294,11 +1322,17 @@ def consolidate_ticks(
                         con, temp_dir=pass_temp_dir,
                     )
                     if not settings_logged:
+                        free = _scratch_free_bytes(pass_temp_dir)
+                        free_str = (
+                            f"{free / (1024 ** 3):.1f}GB free"
+                            if free is not None else "free=?"
+                        )
                         log.info(
-                            "  -> DuckDB settings: memory_limit=%s threads=%s temp_dir=%s",
+                            "  -> DuckDB settings: memory_limit=%s threads=%s temp_dir=%s (%s)",
                             memory_limit or "default",
                             threads,
                             pass_temp_dir,
+                            free_str,
                         )
                         settings_logged = True
                     return _run_tick_consolidation_pass(

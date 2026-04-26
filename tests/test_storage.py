@@ -1516,6 +1516,11 @@ def test_make_duckdb_temp_dir_default_is_outside_data_tree(tmp_path, monkeypatch
     inside ``data/ticks/.../`` and a single tick-consolidation pass
     over thousands of shards spilled enough to exhaust the data
     volume mid-COPY.
+
+    The default must also avoid ``/tmp`` when ``/var/tmp`` is
+    available — on systemd Linux ``/tmp`` is tmpfs (~50% of RAM) and
+    too small for tick-consolidation spill.  ``/var/tmp`` is on
+    persistent disk per FHS.
     """
     import tempfile as _tempfile
     from polymarket_pipeline.storage import _make_duckdb_temp_dir
@@ -1527,14 +1532,18 @@ def test_make_duckdb_temp_dir_default_is_outside_data_tree(tmp_path, monkeypatch
     spill = _make_duckdb_temp_dir("ticks")
     try:
         assert os.path.isdir(spill)
-        # Default location must come from $TMPDIR / /tmp, NOT from the
-        # data tree.  Using ``commonpath`` because /tmp may resolve via
-        # symlinks on some platforms.
+        # Spill is NOT inside the data tree.
         assert os.path.commonpath([spill, str(fake_data)]) != str(fake_data)
-        # Default location should be a child of the system temp root.
-        sys_tmp = _tempfile.gettempdir()
-        assert os.path.commonpath([spill, sys_tmp]) == os.path.realpath(sys_tmp) \
-            or os.path.commonpath([spill, sys_tmp]) == sys_tmp
+        # On POSIX with /var/tmp available + writable, the default must
+        # land there (persistent disk).  Otherwise fall back to
+        # tempfile.gettempdir() (typically /tmp).
+        if os.name == "posix" and os.path.isdir("/var/tmp") and os.access("/var/tmp", os.W_OK):
+            assert spill.startswith("/var/tmp/"), (
+                f"expected /var/tmp/... default, got {spill}"
+            )
+        else:
+            sys_tmp = _tempfile.gettempdir()
+            assert os.path.commonpath([spill, sys_tmp]) in (sys_tmp, os.path.realpath(sys_tmp))
         # Each call returns a distinct directory.
         spill2 = _make_duckdb_temp_dir("ticks")
         try:
