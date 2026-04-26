@@ -2313,11 +2313,28 @@ def consolidate_orderbook(
     orderbook_dir: str,
     logger: logging.Logger | None = None,
 ) -> None:
-    """Consolidate orderbook staging files per partition using DuckDB.
+    """Consolidate orderbook staging files per partition.
 
-    Uses the same memory-capped, disk-spilling DuckDB approach as
-    ``consolidate_ticks`` to avoid OOM on large partitions (e.g. BTC/5-minute
-    can exceed 8 GB when loaded entirely into pandas).
+    Append-only by construction.  Orderbook has a single writer
+    (``append_ws_orderbook_staged``) producing ``ws_ob_*.parquet``
+    shards from CLOB WebSocket ``price_change`` events; there's no
+    backfill path.  Shards never overlap with rows already in
+    ``part-0.parquet`` (live BBO snapshots have current-time ts_ms
+    values, not historical), so folding part-0 on every run was
+    pure waste — peak memory and spill scaled with cumulative
+    history rather than batch size, ENOSPC'ing the production
+    CAX21 on backlogged hot partitions (e.g. BNB/5-minute with
+    16 k+ shards estimated 14 hours / "0% remaining" before the
+    GROUP BY would even start emitting rows).
+
+    Each batch is written to a new ``part-ws-{epoch_ms}-{seq}.parquet``
+    file alongside the existing ``part-0.parquet``.  Within-batch
+    dedup keeps the latest BBO snapshot per
+    ``(ts_ms, market_id, token_id, outcome)``; cross-batch dedup is
+    skipped (production WS messages at the same ms are extremely
+    rare and would represent legitimately distinct snapshots
+    anyway).  Reading a multi-file partition is transparent to
+    DuckDB / pyarrow / pandas via ``read_parquet(<dir>)``.
     """
     import duckdb
 
@@ -2326,108 +2343,144 @@ def consolidate_orderbook(
         return
 
     data_root = os.path.dirname(os.path.abspath(orderbook_dir))
-    nrows = 0
+
+    # Prefer the module attribute when tests monkeypatch it; only
+    # consult the env var when the attribute is at its default.
+    if _TICK_CONSOLIDATION_BATCH_SIZE != _DEFAULT_TICK_CONSOLIDATION_BATCH_SIZE:
+        batch_size = _TICK_CONSOLIDATION_BATCH_SIZE
+    else:
+        batch_size = _get_tick_consolidation_batch_size()
 
     for dirpath, _dirs, _fnames in os.walk(orderbook_dir):
         with _write_lock(data_root):
             parquet_files = [f for f in os.listdir(dirpath) if f.endswith(".parquet")]
-            if not parquet_files or parquet_files == ["part-0.parquet"]:
+            # Anything that's not an already-consolidated part file
+            # is a WS shard.  Production writes only ``ws_ob_*.parquet``
+            # but we accept any non-``part-0`` / non-``part-ws-*`` name
+            # so unit tests using arbitrary shard names continue to work.
+            shard_files = [
+                f for f in parquet_files
+                if f != "part-0.parquet" and not f.startswith("part-ws-")
+            ]
+            if not shard_files:
                 continue
 
             rel = os.path.relpath(dirpath, orderbook_dir)
-            log.info("Consolidating orderbook partition %s (%d files)...", rel, len(parquet_files))
+            log.info(
+                "Consolidating orderbook partition %s (%d shard files)...",
+                rel, len(shard_files),
+            )
             _check_disk_space(dirpath)
 
-            file_paths = [os.path.join(dirpath, f) for f in parquet_files]
-            file_paths.sort(key=lambda path: (os.path.getmtime(path), path))
-            consolidated_path = os.path.join(dirpath, "part-0.parquet")
-            tmp_path = f"{consolidated_path}.{os.getpid()}.tmp"
+            shard_files.sort(
+                key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
+            )
 
-            files_sql = ", ".join(f"'{_duckdb_escape(p)}'" for p in file_paths)
-            # Spill outside the data tree: see ``_make_duckdb_temp_dir``.
-            temp_dir = _make_duckdb_temp_dir("orderbook")
-            con = None
-            try:
-                con = duckdb.connect()
-                memory_limit, threads = _configure_duckdb_for_consolidation(
-                    con, temp_dir=temp_dir,
+            num_batches = max(1, (len(shard_files) + batch_size - 1) // batch_size)
+            if num_batches > 1:
+                log.info(
+                    "  -> Append-only: %d shards → %d batch(es) of <=%d",
+                    len(shard_files), num_batches, batch_size,
                 )
 
-                # Intentionally omit ORDER BY: the global sort is a
-                # blocking operator that requires materializing the full
-                # result in memory/disk — the same OOM trigger that was
-                # already removed from consolidate_ticks.  Downstream
-                # queries can sort on read if needed.
-                #
-                # ``union_by_name=true`` tolerates old pre-v4 shard files
-                # that lack ``local_recv_ts_ns``; DuckDB fills NULL.  We
-                # still reference the column in SELECT so the output file
-                # always carries the v4 schema shape.
-                desc_res = con.execute(f"DESCRIBE SELECT * FROM read_parquet([{files_sql}], union_by_name=true)").fetchall()
-                present_cols = {row[0] for row in desc_res}
-                local_recv_present = "local_recv_ts_ns" in present_cols
-                # Recency tiebreaker for arg_max: prefer local_recv_ts_ns
-                # when present (per-row capture wallclock), else fall back
-                # to ts_ms scaled into ns so cross-shard ties still resolve.
-                recency_sql = (
-                    "COALESCE(local_recv_ts_ns, ts_ms * 1000000)"
-                    if local_recv_present
-                    else "ts_ms * 1000000"
-                )
-                local_recv_select = (
-                    "max(local_recv_ts_ns) AS local_recv_ts_ns"
-                    if local_recv_present
-                    else "NULL::BIGINT AS local_recv_ts_ns"
-                )
-                result = con.execute(f"""
-                    COPY (
-                        SELECT
-                            ts_ms, market_id, token_id, outcome,
-                            arg_max(best_bid,       {recency_sql}) AS best_bid,
-                            arg_max(best_ask,       {recency_sql}) AS best_ask,
-                            arg_max(best_bid_size,  {recency_sql}) AS best_bid_size,
-                            arg_max(best_ask_size,  {recency_sql}) AS best_ask_size,
-                            {local_recv_select}
-                        FROM read_parquet(
-                            [{files_sql}],
-                            union_by_name=true
-                        )
-                        GROUP BY ts_ms, market_id, token_id, outcome
-                    ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
-                """).fetchone()
-                nrows = result[0] if result else 0
+            epoch_ms = int(time.time() * 1000)
+            settings_logged = False
+            rows_total = 0
 
-                # Replace consolidated file FIRST so a crash between the two
-                # steps leaves orphan shards (idempotent — next run merges
-                # again) rather than an empty partition + delete-pattern
-                # propagating the gap to HF Hub.
-                os.replace(tmp_path, consolidated_path)
-                _fsync_dir(dirpath)
-                remove_errors: list[str] = []
-                for fname in parquet_files:
-                    if fname == "part-0.parquet":
-                        continue  # already replaced atomically above
-                    try:
-                        os.remove(os.path.join(dirpath, fname))
-                    except OSError as exc:
-                        remove_errors.append(f"{fname}: {exc}")
-                if remove_errors:
-                    log.warning(
-                        "  -> could not remove %d old shard file(s) in %s: %s",
-                        len(remove_errors), rel, "; ".join(remove_errors),
-                    )
-            except Exception:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-                raise
-            finally:
+            for batch_idx in range(num_batches):
+                batch = shard_files[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+                out_name = f"part-ws-{epoch_ms}-{batch_idx:03d}.parquet"
+                out_path = os.path.join(dirpath, out_name)
+                tmp_path = f"{out_path}.{os.getpid()}.tmp"
+
+                pass_temp_dir = _make_duckdb_temp_dir("orderbook")
+                con = None
                 try:
-                    if con is not None:
-                        con.close()
-                finally:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    con = duckdb.connect()
+                    memory_limit, threads = _configure_duckdb_for_consolidation(
+                        con, temp_dir=pass_temp_dir,
+                    )
+                    if not settings_logged:
+                        free = _scratch_free_bytes(pass_temp_dir)
+                        free_str = (
+                            f"{free / (1024 ** 3):.1f}GB free"
+                            if free is not None else "free=?"
+                        )
+                        log.info(
+                            "  -> DuckDB settings: memory_limit=%s threads=%s temp_dir=%s (%s)",
+                            memory_limit or "default", threads, pass_temp_dir, free_str,
+                        )
+                        settings_logged = True
+                    if num_batches > 1:
+                        log.info(
+                            "  -> Batch %d/%d (%d shards)",
+                            batch_idx + 1, num_batches, len(batch),
+                        )
 
-        log.info("  -> %s consolidated: %d rows", rel, nrows)
+                    file_paths = [os.path.join(dirpath, f) for f in batch]
+                    files_sql = ", ".join(f"'{_duckdb_escape(p)}'" for p in file_paths)
+
+                    desc_res = con.execute(
+                        f"DESCRIBE SELECT * FROM read_parquet([{files_sql}], union_by_name=true)"
+                    ).fetchall()
+                    present_cols = {row[0] for row in desc_res}
+                    local_recv_present = "local_recv_ts_ns" in present_cols
+                    recency_sql = (
+                        "COALESCE(local_recv_ts_ns, ts_ms * 1000000)"
+                        if local_recv_present
+                        else "ts_ms * 1000000"
+                    )
+                    local_recv_select = (
+                        "max(local_recv_ts_ns) AS local_recv_ts_ns"
+                        if local_recv_present
+                        else "NULL::BIGINT AS local_recv_ts_ns"
+                    )
+                    result = con.execute(f"""
+                        COPY (
+                            SELECT
+                                ts_ms, market_id, token_id, outcome,
+                                arg_max(best_bid,       {recency_sql}) AS best_bid,
+                                arg_max(best_ask,       {recency_sql}) AS best_ask,
+                                arg_max(best_bid_size,  {recency_sql}) AS best_bid_size,
+                                arg_max(best_ask_size,  {recency_sql}) AS best_ask_size,
+                                {local_recv_select}
+                            FROM read_parquet(
+                                [{files_sql}],
+                                union_by_name=true
+                            )
+                            GROUP BY ts_ms, market_id, token_id, outcome
+                        ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                    """).fetchone()
+                    nrows = result[0] if result else 0
+
+                    os.replace(tmp_path, out_path)
+                    _fsync_dir(dirpath)
+
+                    for fname in batch:
+                        try:
+                            os.remove(os.path.join(dirpath, fname))
+                        except OSError:
+                            pass
+
+                    rows_total += nrows
+                except Exception:
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.remove(tmp_path)
+                        except OSError:
+                            pass
+                    raise
+                finally:
+                    try:
+                        if con is not None:
+                            con.close()
+                    finally:
+                        shutil.rmtree(pass_temp_dir, ignore_errors=True)
+
+            log.info(
+                "  -> %s consolidated: %d rows in %d new file(s)",
+                rel, rows_total, num_batches,
+            )
 
 
 # ---------------------------------------------------------------------------

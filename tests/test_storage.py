@@ -45,6 +45,28 @@ def _read_partition_ticks(part_dir) -> pd.DataFrame:
     frames = [pq.read_table(os.path.join(part_dir, f)).to_pandas() for f in names]
     return pd.concat(frames, ignore_index=True, sort=False)
 
+
+def _read_partition_orderbook(part_dir) -> pd.DataFrame:
+    """Read all consolidated orderbook files in a partition.
+
+    Same multi-file shape as ticks: ``part-0.parquet`` (legacy
+    consolidated content) + zero or more
+    ``part-ws-{epoch_ms}-{seq}.parquet`` files written by the
+    append-only path.
+    """
+    part_dir = str(part_dir)
+    if not os.path.isdir(part_dir):
+        return pd.DataFrame()
+    names = sorted(
+        f for f in os.listdir(part_dir)
+        if f.endswith(".parquet")
+        and (f == "part-0.parquet" or f.startswith("part-ws-"))
+    )
+    if not names:
+        return pd.DataFrame()
+    frames = [pq.read_table(os.path.join(part_dir, f)).to_pandas() for f in names]
+    return pd.concat(frames, ignore_index=True, sort=False)
+
 from polymarket_pipeline.storage import (
     STORAGE_SCHEMA_VERSION,
     _check_disk_space,
@@ -622,8 +644,10 @@ def test_consolidate_orderbook_merges_shards(tmp_path):
 
     consolidate_orderbook(orderbook_dir=str(ob_dir))
 
-    assert sorted(os.listdir(shard_dir)) == ["part-0.parquet"]
-    result = pq.read_table(shard_dir / "part-0.parquet").to_pandas()
+    # Append-only path now writes part-ws-* files alongside part-0.
+    remaining = sorted(os.listdir(shard_dir))
+    assert all(f.startswith("part-ws-") for f in remaining), remaining
+    result = _read_partition_orderbook(shard_dir)
     assert len(result) == 3
     assert set(result["ts_ms"]) == {1000, 2000, 3000}
 
@@ -655,12 +679,12 @@ def test_orderbook_shard_write_then_consolidate(tmp_path):
     shards = [f for f in os.listdir(part_dir) if f.endswith(".parquet")]
     assert len(shards) == 3  # one shard per flush
 
-    # Consolidation merges all shards into part-0.parquet
+    # Consolidation consumes all shards and writes part-ws-* files.
     consolidate_orderbook(orderbook_dir=ob_dir)
 
-    remaining = os.listdir(part_dir)
-    assert remaining == ["part-0.parquet"]
-    result = pq.read_table(os.path.join(part_dir, "part-0.parquet")).to_pandas()
+    remaining = sorted(os.listdir(part_dir))
+    assert all(f.startswith("part-ws-") for f in remaining), remaining
+    result = _read_partition_orderbook(part_dir)
     assert len(result) == 5
     assert sorted(result["ts_ms"].tolist()) == [1000, 2000, 3000, 4000, 5000]
 
@@ -805,10 +829,13 @@ def test_consolidate_orderbook_deduplicates_overlapping_rows(tmp_path):
     pq.write_table(pa.Table.from_pandas(df_new, preserve_index=False), shard_dir / "ws_ob_2.parquet")
 
     consolidate_orderbook(orderbook_dir=str(ob_dir))
-    assert os.listdir(shard_dir) == ["part-0.parquet"]
+    remaining = sorted(os.listdir(shard_dir))
+    assert all(f.startswith("part-ws-") for f in remaining), remaining
 
-    result = pq.read_table(shard_dir / "part-0.parquet").to_pandas()
-    assert len(result) == 2  # two distinct ts_ms, no duplicates
+    # Both shards land in the same batch → within-batch arg_max picks
+    # the row with max local_recv_ts_ns for each (ts_ms, …) tuple.
+    result = _read_partition_orderbook(shard_dir)
+    assert len(result) == 2  # two distinct ts_ms, dedup'd within batch
 
     by_ts = {row["ts_ms"]: row for _, row in result.iterrows()}
     # Newer values (from df_new) must win because their local_recv_ts_ns is larger
