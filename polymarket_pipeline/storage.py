@@ -818,13 +818,45 @@ _TICKS_EMPTY_COLS = [
 # order_hash) don't collapse multi-fill transactions.
 _TICKS_DEDUP_COLS = ["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"]
 
-# Cap on shards processed in a single DuckDB COPY pass.  The window function
-# in ``consolidate_ticks`` plus the union-by-name read across all shard files
-# scales memory ~linearly with shard count; on the production CAX21 (8 GB,
-# DuckDB capped at 2 GB), partitions over a few thousand shards OOM in a
-# single pass.  Past this threshold the consolidator processes shards in
-# chunks, each pass folding into ``part-0.parquet`` as the accumulator.
-_TICK_CONSOLIDATION_BATCH_SIZE = 1500
+# Cap on shards processed in a single DuckDB COPY pass.  Each pass loads
+# part-0.parquet (the running accumulator) plus this many fresh shards
+# into one ``read_parquet`` call, so peak memory grows with both the
+# accumulator size *and* the batch size.  Past this threshold the
+# consolidator splits the work into multiple passes, each pass folding
+# into ``part-0.parquet``.
+#
+# Default is conservative on purpose: production CAX21 has DuckDB capped
+# at ~2 GB by the systemd cgroup, and a backlog of 16k shards on a hot
+# partition (BTC/5-minute) plus a multi-million-row part-0 will OOM
+# above ~300 shards/pass even with the legacy window function removed.
+# Override via ``PM_TICK_CONSOLIDATION_BATCH_SIZE`` for hosts with more
+# headroom.
+_DEFAULT_TICK_CONSOLIDATION_BATCH_SIZE = 250
+
+
+def _get_tick_consolidation_batch_size() -> int:
+    raw = os.environ.get("PM_TICK_CONSOLIDATION_BATCH_SIZE")
+    if not raw:
+        return _DEFAULT_TICK_CONSOLIDATION_BATCH_SIZE
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid PM_TICK_CONSOLIDATION_BATCH_SIZE={raw!r}: expected a positive integer"
+        ) from exc
+    if value < 1:
+        raise ValueError(
+            f"Invalid PM_TICK_CONSOLIDATION_BATCH_SIZE={raw!r}: expected a positive integer"
+        )
+    return value
+
+
+# Module-level constant retained so existing tests (which monkeypatch it)
+# keep working.  ``consolidate_ticks`` reads the *effective* value via
+# ``_get_tick_consolidation_batch_size()`` so the env override wins, and
+# falls back to this attribute when no override is set — that's the
+# hook the regression tests use.
+_TICK_CONSOLIDATION_BATCH_SIZE = _DEFAULT_TICK_CONSOLIDATION_BATCH_SIZE
 
 
 def _tick_consolidation_select_sql(sort_key_sql: str) -> str:
@@ -1058,22 +1090,35 @@ def _run_tick_consolidation_pass(
                 --
                 -- WS rows have tx_hash='' (unaffected) and ride the
                 -- order_hash + local_recv_ts_ns discriminators below.
-                flagged AS (
-                    SELECT
-                        ranked_rows.*,
-                        MAX(CASE WHEN order_hash IS NOT NULL THEN 1 ELSE 0 END)
-                            OVER (
-                                PARTITION BY market_id, timestamp_ms,
-                                             token_id, tx_hash
-                            ) AS has_subgraph_for_tx
+                --
+                -- Implemented as a small DISTINCT CTE + LEFT JOIN
+                -- rather than a ``MAX(...) OVER (PARTITION BY ...)``
+                -- window function: the window function is a blocking
+                -- operator that materialises the entire row set before
+                -- emitting any output, which OOM'd the production
+                -- 2 GB-capped DuckDB on hot partitions with thousands
+                -- of shards.  The JOIN's build side is just the
+                -- distinct (mid, ts, tid, tx_hash) tuples that have
+                -- a subgraph sibling — typically a tiny fraction of
+                -- the row set, and trivially spillable.
+                subgraph_keys AS (
+                    SELECT DISTINCT market_id, timestamp_ms, token_id, tx_hash
                     FROM ranked_rows
+                    WHERE order_hash IS NOT NULL
+                      AND tx_hash <> ''
                 ),
                 dedup_input AS (
-                    SELECT * FROM flagged
+                    SELECT r.*
+                    FROM ranked_rows AS r
+                    LEFT JOIN subgraph_keys AS sk
+                        ON sk.market_id    = r.market_id
+                       AND sk.timestamp_ms = r.timestamp_ms
+                       AND sk.token_id     = r.token_id
+                       AND sk.tx_hash      = r.tx_hash
                     WHERE NOT (
-                        tx_hash <> ''             -- never filter WS rows
-                        AND has_subgraph_for_tx = 1
-                        AND order_hash IS NULL    -- legacy
+                        r.tx_hash <> ''           -- never filter WS rows
+                        AND r.order_hash IS NULL  -- legacy on-chain
+                        AND sk.market_id IS NOT NULL  -- subgraph sibling exists
                     )
                 )
                 -- Intentionally omit a final ORDER BY: the global sort is
@@ -1183,7 +1228,14 @@ def consolidate_ticks(
                 key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
             )
 
-            batch_size = _TICK_CONSOLIDATION_BATCH_SIZE
+            # Prefer the module attribute when tests monkeypatch it; only
+            # consult the env var when the attribute is at its default
+            # (so production tuning via PM_TICK_CONSOLIDATION_BATCH_SIZE
+            # still wins over the bundled default).
+            if _TICK_CONSOLIDATION_BATCH_SIZE != _DEFAULT_TICK_CONSOLIDATION_BATCH_SIZE:
+                batch_size = _TICK_CONSOLIDATION_BATCH_SIZE
+            else:
+                batch_size = _get_tick_consolidation_batch_size()
             num_batches = max(1, (len(shard_files) + batch_size - 1) // batch_size)
             chunked = num_batches > 1
             if chunked:

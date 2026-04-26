@@ -1508,6 +1508,145 @@ def test_consolidate_ticks_chunked_matches_single_pass(monkeypatch, tmp_path):
         assert out_chunked[col].tolist() == out_single[col].tolist(), col
 
 
+def test_consolidate_ticks_join_based_legacy_filter_matches_window_semantics(monkeypatch, tmp_path):
+    """The legacy↔subgraph filter must keep the same semantics after the
+    window-function-to-JOIN refactor.  This test mixes a legacy on-chain
+    row (NULL order_hash, populated tx_hash + log_index), a subgraph row
+    for the SAME tx (populated order_hash, log_index=0), a WS row
+    (tx_hash=''), and a "lonely" legacy row whose tx has no subgraph
+    sibling — across many shards, forcing the chunked path.
+
+    Regression: production CAX21 (DuckDB capped at 2 GB) OOM'd in the
+    window function (``MAX(...) OVER (PARTITION BY mid, ts, tid, txh)``)
+    on partitions with thousands of shards.  The JOIN-based filter
+    must produce the identical row set without the blocking operator.
+    """
+    from polymarket_pipeline import storage as storage_mod
+    from polymarket_pipeline.storage import consolidate_ticks
+
+    part = tmp_path / "crypto=BTC" / "timeframe=5-minute"
+    part.mkdir(parents=True)
+
+    shard_schema = pa.schema([
+        pa.field("market_id", pa.string()),
+        pa.field("timestamp_ms", pa.int64()),
+        pa.field("token_id", pa.string()),
+        pa.field("outcome", pa.string()),
+        pa.field("side", pa.string()),
+        pa.field("price", pa.float32()),
+        pa.field("size_usdc", pa.float32()),
+        pa.field("tx_hash", pa.string()),
+        pa.field("block_number", pa.int32()),
+        pa.field("log_index", pa.int32()),
+        pa.field("source", pa.string()),
+        pa.field("spot_price_usdt", pa.float32()),
+        pa.field("spot_price_ts_ms", pa.int64()),
+        pa.field("local_recv_ts_ns", pa.int64()),
+        pa.field("order_hash", pa.string()),
+    ])
+
+    def _shard(name: str, mtime: int, rows: dict[str, list]) -> None:
+        path = part / name
+        pq.write_table(pa.Table.from_pydict(rows, schema=shard_schema), str(path))
+        os.utime(path, (mtime, mtime))
+
+    # Shard A: legacy on-chain row for tx_overridden — should be dropped.
+    _shard("backfill_legacy_a.parquet", 1000, {
+        "market_id": ["m1"],
+        "timestamp_ms": [1700000000000],
+        "token_id": ["tokA"],
+        "outcome": ["Up"],
+        "side": ["BUY"],
+        "price": [0.40],
+        "size_usdc": [10.0],
+        "tx_hash": ["0xtx_overridden"],
+        "block_number": [58000000],
+        "log_index": [5],
+        "source": ["onchain"],
+        "spot_price_usdt": [None],
+        "spot_price_ts_ms": [None],
+        "local_recv_ts_ns": [None],
+        "order_hash": [None],
+    })
+
+    # Shard B: subgraph row for SAME tx — overrides shard A.
+    _shard("backfill_subgraph_a.parquet", 1100, {
+        "market_id": ["m1"],
+        "timestamp_ms": [1700000000000],
+        "token_id": ["tokA"],
+        "outcome": ["Up"],
+        "side": ["BUY"],
+        "price": [0.42],
+        "size_usdc": [10.0],
+        "tx_hash": ["0xtx_overridden"],
+        "block_number": [0],
+        "log_index": [0],
+        "source": ["onchain"],
+        "spot_price_usdt": [67000.0],
+        "spot_price_ts_ms": [1700000000000],
+        "local_recv_ts_ns": [None],
+        "order_hash": ["0xorder_X"],
+    })
+
+    # Shard C: legacy on-chain row for a DIFFERENT tx (no subgraph sibling)
+    # — must be preserved.
+    _shard("backfill_legacy_b.parquet", 1200, {
+        "market_id": ["m1"],
+        "timestamp_ms": [1700000111000],
+        "token_id": ["tokA"],
+        "outcome": ["Up"],
+        "side": ["SELL"],
+        "price": [0.55],
+        "size_usdc": [5.0],
+        "tx_hash": ["0xtx_lonely_legacy"],
+        "block_number": [58000010],
+        "log_index": [3],
+        "source": ["onchain"],
+        "spot_price_usdt": [None],
+        "spot_price_ts_ms": [None],
+        "local_recv_ts_ns": [None],
+        "order_hash": [None],
+    })
+
+    # Shard D: WS row (tx_hash='') — never affected by the filter.
+    _shard("ws_ticks_d.parquet", 1300, {
+        "market_id": ["m1"],
+        "timestamp_ms": [1700000222000],
+        "token_id": ["tokA"],
+        "outcome": ["Up"],
+        "side": ["BUY"],
+        "price": [0.60],
+        "size_usdc": [3.0],
+        "tx_hash": [""],
+        "block_number": [0],
+        "log_index": [0],
+        "source": ["websocket"],
+        "spot_price_usdt": [67050.0],
+        "spot_price_ts_ms": [1700000222000],
+        "local_recv_ts_ns": [1700000222_000_000_000],
+        "order_hash": [None],
+    })
+
+    # Force the chunked path: batch_size=1 → each shard its own pass.
+    monkeypatch.setattr(storage_mod, "_TICK_CONSOLIDATION_BATCH_SIZE", 1)
+
+    consolidate_ticks(ticks_dir=str(tmp_path))
+    out = pq.read_table(str(part / "part-0.parquet")).to_pandas().sort_values(
+        "timestamp_ms"
+    ).reset_index(drop=True)
+
+    # Expected: 3 rows.  Legacy-A dropped (shadowed by subgraph-X);
+    # subgraph-X kept; lonely-legacy kept; WS kept.
+    assert len(out) == 3
+    assert out.loc[0, "tx_hash"] == "0xtx_overridden"
+    assert out.loc[0, "order_hash"] == "0xorder_X"
+    assert out.loc[0, "price"] == pytest.approx(0.42)
+    assert out.loc[1, "tx_hash"] == "0xtx_lonely_legacy"
+    assert out.loc[1, "log_index"] == 3
+    assert out.loc[2, "source"] == "websocket"
+    assert out.loc[2, "tx_hash"] == ""
+
+
 def test_orderbook_schema_has_local_recv_ts_ns():
     from polymarket_pipeline.storage import ORDERBOOK_SCHEMA
     assert "local_recv_ts_ns" in ORDERBOOK_SCHEMA.names
