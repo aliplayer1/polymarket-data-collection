@@ -62,23 +62,26 @@ class DataHeartbeat:
     grace_period_s: float = 30.0
     _last_seen: dict[str, float] = field(default_factory=dict)
     _installed_at: float = field(default_factory=time.monotonic)
-    _grace_extended: bool = False
+    # Per-key grace anchor.  Earlier this was a single instance-level
+    # ``_installed_at`` that the first ``mark()`` re-anchored — but that
+    # was shared across all keys, so the first key to arrive (often
+    # btcusdt on RTDS) silently postponed staleness detection for every
+    # other key in the heartbeat (e.g. a server-side dropped solusdt
+    # subscription would go undetected for an extra grace_period_s
+    # beyond its threshold).  Per-key anchors mean a noisy key cannot
+    # mask a silent one.
+    _grace_anchor: dict[str, float] = field(default_factory=dict)
 
     def mark(self, key: str) -> None:
         """Record that ``key`` just delivered data.
 
-        On the very first ``mark`` after a ``reset`` (or construction)
-        we re-anchor the grace period to *now*.  This rolls the
-        watchdog forward past any subscription-confirmation delay that
-        consumed part of the original grace window, so the first valid
-        message — not the connection moment — defines when keys must
-        start delivering data.  Subsequent ``mark`` calls leave the
-        grace anchor alone so the staleness check works normally.
+        First ``mark`` for a key re-anchors that key's grace window so
+        a per-key subscription-confirmation delay doesn't trigger a
+        false stale.  Other keys are unaffected.
         """
         now = time.monotonic()
-        if not self._grace_extended:
-            self._grace_extended = True
-            self._installed_at = now
+        if key not in self._grace_anchor:
+            self._grace_anchor[key] = now
         self._last_seen[key] = now
 
     def age(self, key: str) -> float | None:
@@ -101,23 +104,31 @@ class DataHeartbeat:
     def stale_keys(self) -> list[tuple[str, float]]:
         """Return ``[(key, age_seconds)]`` for every key past its threshold.
 
-        Returns ``[]`` during the grace period.  Keys that have never been
-        seen are flagged only after ``max(threshold, grace_period_s)`` has
-        elapsed since construction / reset; their reported "age" is
-        ``inf`` so log consumers can distinguish "stale" (real staleness)
-        from "never seen" (session uptime, often misleadingly large).
+        Each key uses its own grace window anchored at first ``mark()``
+        (or instance construction / ``reset()`` for never-seen keys).
+        Keys that have never been seen are flagged only after
+        ``max(threshold, grace_period_s)`` has elapsed since the
+        instance grace anchor; their reported "age" is ``inf`` so log
+        consumers can distinguish "stale" (real staleness) from
+        "never seen" (session uptime, often misleadingly large).
         """
         now = time.monotonic()
-        elapsed = now - self._installed_at
-        if elapsed < self.grace_period_s:
-            return []
+        instance_elapsed = now - self._installed_at
         stale: list[tuple[str, float]] = []
         for key, threshold in self.stale_after.items():
             last = self._last_seen.get(key)
             if last is None:
-                if elapsed > max(threshold, self.grace_period_s):
+                # Never-seen key: gate on the instance-level grace
+                # window (the only meaningful anchor since the key
+                # itself has no first-mark time yet).
+                if instance_elapsed > max(threshold, self.grace_period_s):
                     stale.append((key, float("inf")))
             else:
+                # Seen key: gate on its own grace anchor so a quiet
+                # interval after first-data still respects grace.
+                anchor = self._grace_anchor.get(key, self._installed_at)
+                if now - anchor < self.grace_period_s:
+                    continue
                 age = now - last
                 if age > threshold:
                     stale.append((key, age))
@@ -126,8 +137,8 @@ class DataHeartbeat:
     def reset(self) -> None:
         """Forget all last-seen entries and restart the grace period."""
         self._last_seen.clear()
+        self._grace_anchor.clear()
         self._installed_at = time.monotonic()
-        self._grace_extended = False
 
 
 # --- Reconnect helpers (shared by CLOB + RTDS) ---------------------------

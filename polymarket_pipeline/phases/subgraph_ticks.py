@@ -253,6 +253,22 @@ class SubgraphTickFetcher:
         maker_asset = str(event.get("makerAssetId", ""))
         taker_asset = str(event.get("takerAssetId", ""))
 
+        # Cross-token fills (both legs are tracked outcome tokens, e.g.
+        # an UP-for-DOWN swap on the same condition) have ambiguous
+        # USDC-per-outcome price semantics — neither amount is a USDC
+        # quantity, so ``usdc_size / outcome_size`` would silently
+        # mislabel the price.  Skip such fills explicitly rather than
+        # quietly dropping the taker leg as the previous code did.
+        # In normal Polymarket CLOB flow one side is always USDC
+        # (asset_id "0"), so this branch is rare; logging at debug
+        # keeps it visible without spam.
+        if maker_asset in token_to_market and taker_asset in token_to_market:
+            self.logger.debug(
+                "Skipping cross-token fill %s: both maker (%s) and taker (%s) are tracked outcomes",
+                event.get("id"), maker_asset, taker_asset,
+            )
+            return None
+
         market: MarketRecord | None = token_to_market.get(maker_asset)
         if market is not None:
             outcome_side = market.side_for_token_id(maker_asset)
@@ -318,7 +334,18 @@ class SubgraphTickFetcher:
             block_number=0,
             log_index=0,
             source="onchain",
-            order_hash=str(event.get("orderHash", "")) or None,
+            # Coerce missing/null orderHash to Python None.  Earlier
+            # code did ``str(event.get("orderHash", "")) or None``,
+            # which turns an explicit ``None`` from the GraphQL
+            # response into the literal string "None" (truthy under
+            # ``or``) and then defeats dedup downstream
+            # (``COALESCE(order_hash, '')`` never folds these
+            # duplicates).  Treat empty / missing / null as None.
+            order_hash=(
+                None
+                if (oh := event.get("orderHash")) in (None, "")
+                else str(oh)
+            ),
             **spot_kwargs,
         )
         return market.market_id, row

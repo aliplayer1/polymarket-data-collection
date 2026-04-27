@@ -394,7 +394,19 @@ class PolymarketDataPipeline:
             # early-resolved markets (e.g. culture markets) can have end_ts
             # months in the future, inflating the checkpoint and causing all
             # subsequent runs to find zero relevant markets.
-            checkpoint_ts = market.closed_ts if market.closed_ts is not None else market.end_ts
+            #
+            # When closed_ts is None (Gamma omitted closedTime, common for
+            # some culture markets), we still need *some* monotonic anchor.
+            # Falling back to end_ts is dangerous because culture buckets
+            # can have end_ts months in the future, so cap the fallback at
+            # ``now`` — the load-side cap covers the same scenario, but
+            # bounding here keeps a single corrupt write from polluting
+            # downstream tooling that reads the checkpoint directly.
+            now_ts = int(time.time())
+            if market.closed_ts is not None:
+                checkpoint_ts = market.closed_ts
+            else:
+                checkpoint_ts = min(market.end_ts, now_ts)
             if checkpoint_ts > max_closed_ts_seen:
                 max_closed_ts_seen = checkpoint_ts
 

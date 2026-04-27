@@ -88,9 +88,17 @@ def test_tick_backfill_phase_chunks_large_windows(tmp_path, monkeypatch) -> None
 
     # 345600 / 21600 (6 hours) = 16 chunks
     assert len(provider.calls) == 16
-    # Verify first and last chunk
+    # Chunks are half-open at the boundary: each subsequent chunk
+    # advances ``current_start = current_end + 1`` so that subgraph
+    # queries with inclusive ``timestamp_gte`` / ``timestamp_lte``
+    # don't double-fetch fills landing exactly on a chunk boundary.
     assert provider.calls[0] == (("m-large",), 0, 21600)
-    assert provider.calls[-1] == (("m-large",), 324000, 345600)
+    assert provider.calls[1] == (("m-large",), 21601, 43201)
+    # 16th chunk: 15 prior chunks each advanced 21601s → start = 15*21601
+    assert provider.calls[-1] == (("m-large",), 15 * 21601, 345600)
+    # Boundaries strictly disjoint: each chunk's start is past the previous end
+    for prev, nxt in zip(provider.calls, provider.calls[1:]):
+        assert nxt[1] == prev[2] + 1
 
 
 # ---------------------------------------------------------------------------

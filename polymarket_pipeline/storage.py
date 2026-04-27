@@ -915,6 +915,38 @@ def _get_tick_consolidation_batch_size() -> int:
 _TICK_CONSOLIDATION_BATCH_SIZE = _DEFAULT_TICK_CONSOLIDATION_BATCH_SIZE
 
 
+# Tier-2 compaction threshold: when a partition accumulates more than
+# this many ``part-ws-*.parquet`` files, fold them into a single
+# consolidated ``part-ws-*.parquet``.  The append-only consolidation
+# path (``_consolidate_ws_ticks_appendonly`` for ticks,
+# ``consolidate_orderbook`` for orderbook BBO) writes a NEW file every
+# run; without this tier-2 fold the partition would grow without bound,
+# slowing partition reads (DuckDB / pyarrow file-listing overhead) and
+# inflating the HF Hub object count.  Threshold tuned for ~hourly
+# upload-only runs producing 1 new part-ws-* per hot partition: a
+# ~32-file ceiling means compaction runs at most once a day per
+# partition, keeping amortised cost low.
+_DEFAULT_PART_WS_COMPACTION_THRESHOLD = 32
+_PART_WS_COMPACTION_THRESHOLD = _DEFAULT_PART_WS_COMPACTION_THRESHOLD
+
+
+def _get_part_ws_compaction_threshold() -> int:
+    raw = os.environ.get("PM_PART_WS_COMPACTION_THRESHOLD")
+    if not raw:
+        return _PART_WS_COMPACTION_THRESHOLD
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid PM_PART_WS_COMPACTION_THRESHOLD={raw!r}: expected a positive integer"
+        ) from None
+    if value < 2:
+        raise ValueError(
+            f"Invalid PM_PART_WS_COMPACTION_THRESHOLD={raw!r}: must be >= 2"
+        )
+    return value
+
+
 def _tick_consolidation_select_sql(sort_key_sql: str) -> str:
     """Build the SELECT list for DuckDB shard consolidation."""
     select_exprs = []
@@ -1323,13 +1355,22 @@ def consolidate_ticks(
                 and not f.startswith("part-ws-")  # already-consolidated WS outputs
             ]
             has_part0 = "part-0.parquet" in parquet_files
+            part_ws_count = sum(
+                1 for f in parquet_files if f.startswith("part-ws-")
+            )
+            # The tier-2 compaction needs to run even when no fresh
+            # shards exist (a long-idle hot partition has only
+            # accumulated part-ws-* files), so include the threshold
+            # check in the "is there work?" decision.
+            needs_compact = part_ws_count >= _get_part_ws_compaction_threshold()
 
-            if not ws_shards and not non_ws_shards:
+            if not ws_shards and not non_ws_shards and not needs_compact:
                 continue  # nothing to consolidate (only part-0 and/or part-ws-*)
 
             log.info(
-                "Consolidating partition %s (ws=%d, backfill=%d, has_part0=%s)",
-                rel, len(ws_shards), len(non_ws_shards), "yes" if has_part0 else "no",
+                "Consolidating partition %s (ws=%d, backfill=%d, part_ws=%d, has_part0=%s)",
+                rel, len(ws_shards), len(non_ws_shards), part_ws_count,
+                "yes" if has_part0 else "no",
             )
             _check_disk_space(dirpath)
 
@@ -1356,6 +1397,18 @@ def consolidate_ticks(
                     batch_size=batch_size,
                     log=log,
                 )
+
+            # Tier-2: when accumulated part-ws-*.parquet count crosses
+            # the compaction threshold, fold them into a single file.
+            # This bounds long-term file accumulation under the
+            # append-only design (each batch writes a new part-ws-* and
+            # never re-folds).  Only runs when threshold is exceeded so
+            # most consolidation passes pay zero extra cost.
+            _compact_part_ws_ticks(
+                duckdb_module=duckdb,
+                dirpath=dirpath,
+                log=log,
+            )
 
             # Phase 2: non-WS shards merged with part-0 (existing path).
             if non_ws_shards:
@@ -1399,14 +1452,18 @@ def _consolidate_ws_ticks_appendonly(
     )
 
     epoch_ms = int(time.time() * 1000)
+    pid = os.getpid()
     settings_logged = False
     rows_total = 0
 
     for batch_idx in range(num_batches):
         batch = shard_files[batch_idx * batch_size : (batch_idx + 1) * batch_size]
-        out_name = f"part-ws-{epoch_ms}-{batch_idx:03d}.parquet"
+        # Include PID so two consolidations on the same partition that
+        # land in the same millisecond (rare but possible across systemd
+        # timers) don't overwrite each other's batch_000 output.
+        out_name = f"part-ws-{epoch_ms}-{pid}-{batch_idx:03d}.parquet"
         out_path = os.path.join(dirpath, out_name)
-        tmp_path = f"{out_path}.{os.getpid()}.tmp"
+        tmp_path = f"{out_path}.{pid}.tmp"
 
         pass_temp_dir = _make_duckdb_temp_dir("ws_ticks")
         con = None
@@ -1570,6 +1627,84 @@ def _run_ws_appendonly_pass(
         ) TO '{_duckdb_escape(output_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """).fetchone()
     return result[0] if result else 0
+
+
+def _compact_part_ws_ticks(
+    *,
+    duckdb_module: Any,
+    dirpath: str,
+    log: logging.Logger,
+) -> None:
+    """Tier-2 fold: collapse accumulated ``part-ws-*.parquet`` files into one.
+
+    Each WS append-only batch creates a new ``part-ws-*.parquet`` file
+    in the partition.  Without compaction these accumulate forever
+    (production runs ~8 consolidations/day × N partitions).  When the
+    count exceeds ``PM_PART_WS_COMPACTION_THRESHOLD`` we read all of
+    them through DuckDB, run the same dedup pass used at append time
+    (groupby on the full TICKS dedup key plus ``order_hash`` and
+    ``local_recv_ts_ns``), and write a single new ``part-ws-*.parquet``
+    file replacing the entire set.  ``part-0.parquet`` is **not**
+    touched — same invariant as the regular WS append-only path.
+    """
+    threshold = _get_part_ws_compaction_threshold()
+    part_ws_files = sorted(
+        [
+            f for f in os.listdir(dirpath)
+            if f.startswith("part-ws-") and f.endswith(".parquet")
+        ],
+        key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f),
+    )
+    if len(part_ws_files) < threshold:
+        return
+
+    log.info(
+        "  -> Tier-2 compaction: folding %d part-ws-*.parquet files in %s",
+        len(part_ws_files), dirpath,
+    )
+
+    epoch_ms = int(time.time() * 1000)
+    pid = os.getpid()
+    out_name = f"part-ws-{epoch_ms}-{pid}-compact.parquet"
+    out_path = os.path.join(dirpath, out_name)
+    tmp_path = f"{out_path}.{pid}.tmp"
+    pass_temp_dir = _make_duckdb_temp_dir("ticks_compact")
+    con = None
+    try:
+        con = duckdb_module.connect()
+        _configure_duckdb_for_consolidation(con, temp_dir=pass_temp_dir)
+        nrows = _run_ws_appendonly_pass(
+            con,
+            dirpath=dirpath,
+            input_basenames=part_ws_files,
+            output_path=tmp_path,
+        )
+        os.replace(tmp_path, out_path)
+        _fsync_dir(dirpath)
+
+        for fname in part_ws_files:
+            try:
+                os.remove(os.path.join(dirpath, fname))
+            except OSError:
+                pass
+
+        log.info(
+            "  -> Tier-2 compaction complete: %d rows in %s",
+            nrows, out_name,
+        )
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        finally:
+            shutil.rmtree(pass_temp_dir, ignore_errors=True)
 
 
 def _consolidate_nonws_ticks_with_part0(
@@ -2308,6 +2443,110 @@ def consolidate_heartbeats(
         log.info("  -> heartbeats consolidated: %d rows", len(merged))
 
 
+def _compact_part_ws_orderbook(
+    *,
+    duckdb_module: Any,
+    dirpath: str,
+    log: logging.Logger,
+) -> None:
+    """Tier-2 fold: collapse accumulated orderbook ``part-ws-*.parquet`` files.
+
+    Mirrors ``_compact_part_ws_ticks`` but uses the orderbook's
+    ``arg_max(... ORDER BY local_recv_ts_ns)`` recency-tiebreak dedup
+    so multiple snapshots for the same
+    ``(ts_ms, market_id, token_id, outcome)`` collapse to the latest.
+    """
+    threshold = _get_part_ws_compaction_threshold()
+    part_ws_files = sorted(
+        [
+            f for f in os.listdir(dirpath)
+            if f.startswith("part-ws-") and f.endswith(".parquet")
+        ],
+        key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f),
+    )
+    if len(part_ws_files) < threshold:
+        return
+
+    log.info(
+        "  -> Tier-2 orderbook compaction: folding %d part-ws-*.parquet files in %s",
+        len(part_ws_files), dirpath,
+    )
+
+    epoch_ms = int(time.time() * 1000)
+    pid = os.getpid()
+    out_name = f"part-ws-{epoch_ms}-{pid}-compact.parquet"
+    out_path = os.path.join(dirpath, out_name)
+    tmp_path = f"{out_path}.{pid}.tmp"
+    pass_temp_dir = _make_duckdb_temp_dir("orderbook_compact")
+    con = None
+    try:
+        con = duckdb_module.connect()
+        _configure_duckdb_for_consolidation(con, temp_dir=pass_temp_dir)
+
+        file_paths = [os.path.join(dirpath, f) for f in part_ws_files]
+        files_sql = ", ".join(f"'{_duckdb_escape(p)}'" for p in file_paths)
+
+        desc_res = con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet([{files_sql}], union_by_name=true)"
+        ).fetchall()
+        present_cols = {row[0] for row in desc_res}
+        local_recv_present = "local_recv_ts_ns" in present_cols
+        recency_sql = (
+            "COALESCE(local_recv_ts_ns, ts_ms * 1000000)"
+            if local_recv_present
+            else "ts_ms * 1000000"
+        )
+        local_recv_select = (
+            "max(local_recv_ts_ns) AS local_recv_ts_ns"
+            if local_recv_present
+            else "NULL::BIGINT AS local_recv_ts_ns"
+        )
+        result = con.execute(f"""
+            COPY (
+                SELECT
+                    ts_ms, market_id, token_id, outcome,
+                    arg_max(best_bid,       {recency_sql}) AS best_bid,
+                    arg_max(best_ask,       {recency_sql}) AS best_ask,
+                    arg_max(best_bid_size,  {recency_sql}) AS best_bid_size,
+                    arg_max(best_ask_size,  {recency_sql}) AS best_ask_size,
+                    {local_recv_select}
+                FROM read_parquet(
+                    [{files_sql}],
+                    union_by_name=true
+                )
+                GROUP BY ts_ms, market_id, token_id, outcome
+            ) TO '{_duckdb_escape(tmp_path)}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """).fetchone()
+        nrows = result[0] if result else 0
+
+        os.replace(tmp_path, out_path)
+        _fsync_dir(dirpath)
+
+        for fname in part_ws_files:
+            try:
+                os.remove(os.path.join(dirpath, fname))
+            except OSError:
+                pass
+
+        log.info(
+            "  -> Tier-2 orderbook compaction complete: %d rows in %s",
+            nrows, out_name,
+        )
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        finally:
+            shutil.rmtree(pass_temp_dir, ignore_errors=True)
+
+
 def consolidate_orderbook(
     *,
     orderbook_dir: str,
@@ -2362,13 +2601,17 @@ def consolidate_orderbook(
                 f for f in parquet_files
                 if f != "part-0.parquet" and not f.startswith("part-ws-")
             ]
-            if not shard_files:
+            part_ws_count = sum(
+                1 for f in parquet_files if f.startswith("part-ws-")
+            )
+            needs_compact = part_ws_count >= _get_part_ws_compaction_threshold()
+            if not shard_files and not needs_compact:
                 continue
 
             rel = os.path.relpath(dirpath, orderbook_dir)
             log.info(
-                "Consolidating orderbook partition %s (%d shard files)...",
-                rel, len(shard_files),
+                "Consolidating orderbook partition %s (%d shard files, part_ws=%d)...",
+                rel, len(shard_files), part_ws_count,
             )
             _check_disk_space(dirpath)
 
@@ -2376,7 +2619,13 @@ def consolidate_orderbook(
                 key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
             )
 
-            num_batches = max(1, (len(shard_files) + batch_size - 1) // batch_size)
+            # If only tier-2 compaction is needed (no fresh shards),
+            # skip the batch loop entirely.  Otherwise run the normal
+            # append path then tier-2 fold once at the end.
+            num_batches = (
+                max(1, (len(shard_files) + batch_size - 1) // batch_size)
+                if shard_files else 0
+            )
             if num_batches > 1:
                 log.info(
                     "  -> Append-only: %d shards → %d batch(es) of <=%d",
@@ -2384,14 +2633,17 @@ def consolidate_orderbook(
                 )
 
             epoch_ms = int(time.time() * 1000)
+            pid = os.getpid()
             settings_logged = False
             rows_total = 0
 
             for batch_idx in range(num_batches):
                 batch = shard_files[batch_idx * batch_size : (batch_idx + 1) * batch_size]
-                out_name = f"part-ws-{epoch_ms}-{batch_idx:03d}.parquet"
+                # Include PID so two consolidations within the same
+                # millisecond don't overwrite each other's batch_000.
+                out_name = f"part-ws-{epoch_ms}-{pid}-{batch_idx:03d}.parquet"
                 out_path = os.path.join(dirpath, out_name)
-                tmp_path = f"{out_path}.{os.getpid()}.tmp"
+                tmp_path = f"{out_path}.{pid}.tmp"
 
                 pass_temp_dir = _make_duckdb_temp_dir("orderbook")
                 con = None
@@ -2477,9 +2729,17 @@ def consolidate_orderbook(
                     finally:
                         shutil.rmtree(pass_temp_dir, ignore_errors=True)
 
-            log.info(
-                "  -> %s consolidated: %d rows in %d new file(s)",
-                rel, rows_total, num_batches,
+            if num_batches:
+                log.info(
+                    "  -> %s consolidated: %d rows in %d new file(s)",
+                    rel, rows_total, num_batches,
+                )
+
+            # Tier-2 fold: bound long-term part-ws-* accumulation.
+            _compact_part_ws_orderbook(
+                duckdb_module=duckdb,
+                dirpath=dirpath,
+                log=log,
             )
 
 

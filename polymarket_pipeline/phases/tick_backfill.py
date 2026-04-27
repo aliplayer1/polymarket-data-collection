@@ -64,13 +64,19 @@ class TickBackfillPhase:
         windows: dict[tuple[int, int], list[MarketRecord]] = defaultdict(list)
         for market in markets:
             win_start = market.start_ts
-            
-            # Chunk the window if it exceeds MAX_WINDOW_SECONDS
+
+            # Chunk the window if it exceeds MAX_WINDOW_SECONDS.  Use
+            # half-open chunks: the next chunk starts at ``current_end + 1``
+            # (subgraph queries use inclusive ``timestamp_gte`` /
+            # ``timestamp_lte``, so reusing ``current_end`` as the next
+            # ``current_start`` would re-fetch every fill that lands
+            # exactly on a chunk boundary, doubling our subgraph budget
+            # at every 6 h boundary on busy markets).
             current_start = win_start
             while current_start < market.end_ts:
                 current_end = min(current_start + MAX_WINDOW_SECONDS, market.end_ts)
                 windows[(current_start, current_end)].append(market)
-                current_start = current_end
+                current_start = current_end + 1
 
         tick_flush_every = 5
         total_ticks = 0
@@ -122,10 +128,15 @@ class TickBackfillPhase:
                 return []
 
         pending_ticks: list[dict] = []
-        
-        # Use a ThreadPoolExecutor to process windows in parallel.
-        # This allows hitting both RPC and Etherscan rate limits concurrently.
-        with ThreadPoolExecutor(max_workers=4) as executor:
+
+        # The legacy Etherscan/RPC tick provider supported parallelism;
+        # the subgraph provider that replaced it (commit 1ee7f9a)
+        # serialises every request on a global 5 req/s polite throttle
+        # (see ``subgraph_client._throttle``), so 4 worker threads
+        # gained no throughput and just wasted thread overhead.  We
+        # keep an executor here only to preserve the as-completed
+        # iteration shape of the surrounding flush logic.
+        with ThreadPoolExecutor(max_workers=1) as executor:
             futures = [
                 executor.submit(process_window, i, ws, we, wm) 
                 for i, ((ws, we), wm) in enumerate(sorted_windows, 1)

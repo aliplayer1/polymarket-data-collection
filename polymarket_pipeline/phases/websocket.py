@@ -124,7 +124,11 @@ class WebSocketPhase:
     # price — better a missing value than a wrong one.
     _SPOT_PRICE_MAX_AGE_MS: int = 30_000
 
-    def _spot_price_kwargs(self, crypto: str) -> dict[str, float | int | None]:
+    def _spot_price_kwargs(
+        self,
+        crypto: str,
+        trade_ts_ms: int | None = None,
+    ) -> dict[str, float | int | None]:
         rtds_symbol = CRYPTO_TO_RTDS_SYMBOL.get(crypto)
         if rtds_symbol is None:
             return {"spot_price_usdt": None, "spot_price_ts_ms": None}
@@ -132,6 +136,15 @@ class WebSocketPhase:
         if entry is None:
             return {"spot_price_usdt": None, "spot_price_ts_ms": None}
         price, ts_ms = entry
+        # Point-in-time correctness: if the cache holds a price observed
+        # AFTER the trade timestamp (clock skew, queueing delay, late
+        # broadcast), embedding it into the tick row leaks future spot
+        # state into a past trade — exactly what subgraph_ticks.py guards
+        # against via SpotPriceLookup.get(t<=).  WS-collected and
+        # subgraph-recollected rows for the same trade should agree on
+        # the invariant ``spot_price_ts_ms <= timestamp_ms``.
+        if trade_ts_ms is not None and int(ts_ms) > int(trade_ts_ms):
+            return {"spot_price_usdt": None, "spot_price_ts_ms": None}
         # Freshness guard: if the RTDS feed has stalled, don't paint the
         # last-known price onto fresh ticks.  Tick row's local_recv_ts_ns
         # is wallclock-now, so a hours-old spot_price_usdt next to a
@@ -172,20 +185,26 @@ class WebSocketPhase:
 
         def _fetch_one(market: MarketRecord) -> tuple[str, dict[str, float]]:
             prices = {}
+            # Binary crypto markets need lowercase keys to match what
+            # build_binary_price_row consumes (see _apply_last_trade for
+            # the same convention); culture markets keep the original
+            # outcome label.
+            normalize_key = market.category == "crypto"
             for outcome, token_id in market.tokens.items():
+                key = outcome.lower() if normalize_key else outcome
                 try:
                     raw = api_call_with_retry(
                         self.last_trade_price_provider.get_last_trade_price,
                         token_id,
                         logger=self.logger,
                     ) or 0.5
-                    prices[outcome] = _parse_price(raw)
+                    prices[key] = _parse_price(raw)
                 except Exception as exc:
                     self.logger.warning(
                         "Falling back to 0.5 for market %s outcome %s: %s",
                         market.market_id, outcome, exc,
                     )
-                    prices[outcome] = 0.5
+                    prices[key] = 0.5
             return market.market_id, prices
 
         with ThreadPoolExecutor(max_workers=min(5, len(needs_api))) as executor:
@@ -566,7 +585,18 @@ class WebSocketPhase:
 
         if market.market_id not in last_prices:
             last_prices[market.market_id] = {}
-        last_prices[market.market_id][outcome_side] = trade.price
+        # Binary crypto markets keep lowercase keys ("up"/"down") because
+        # build_binary_price_row reads side_prices["up"]/["down"]
+        # (phases/shared.py:_validated_side_prices).  Gamma returns the
+        # canonical labels capitalized ("Up"/"Down" — see
+        # tests/test_market_normalization.py:30-31), so storing under
+        # outcome_side directly would write under "Up" while the row
+        # builder reads "up" — silently emitting 0.5/0.5 (or stale
+        # cached values) for every WS-driven crypto price row.
+        # Culture markets keep the original case because the long-format
+        # schema's `outcome` column carries the label verbatim.
+        store_key = outcome_side.lower() if market.category == "crypto" else outcome_side
+        last_prices[market.market_id][store_key] = trade.price
 
         if market.category == "crypto":
             if "up" not in last_prices[market.market_id]:
@@ -619,7 +649,7 @@ class WebSocketPhase:
                 log_index=0,
                 source="websocket",
                 local_recv_ts_ns=local_recv_ts_ns,
-                **self._spot_price_kwargs(market.crypto),
+                **self._spot_price_kwargs(market.crypto, trade_ts_ms=trade.timestamp_ms),
             )
         )
 
@@ -948,6 +978,13 @@ class WebSocketPhase:
                         len(hb_snapshot),
                     )
                     last_heartbeat_time = 0.0
+                # Surface backpressure alerts even on the failure path:
+                # producers keep filling the buffer past ``maxlen``
+                # while the flush is failing, and ``DropOldestBuffer``
+                # increments ``dropped_count`` every time it evicts.
+                # Skipping the check here masks exactly the condition
+                # the alert is supposed to surface.
+                self._check_drop_alerts(ws_buffer, tick_buffer, orderbook_buffer)
                 continue
 
             # After a successful flush, check whether any buffer dropped
@@ -1001,6 +1038,27 @@ class WebSocketPhase:
             len(active_markets), len(token_ids), n_shards, WS_MAX_TOKENS_PER_SHARD,
         )
 
+        # Prune stale shard heartbeats from a previous run that had more
+        # shards.  The registry is shared across hourly market refreshes
+        # via the outer pipeline; without this pruning, shard indices
+        # >= n_shards retain references to old DataHeartbeat objects
+        # that nothing marks anymore — _build_heartbeat_rows would emit
+        # ever-staling rows for ghost shards and gap-audit alerts on
+        # phantom outages.
+        stale_shard_keys = [
+            k for k in self._heartbeats
+            if k.startswith("clob_shard_")
+            and k.removeprefix("clob_shard_").isdigit()
+            and int(k.removeprefix("clob_shard_")) >= n_shards
+        ]
+        for k in stale_shard_keys:
+            self._heartbeats.pop(k, None)
+        if stale_shard_keys:
+            self.logger.info(
+                "Pruned %d stale shard heartbeat(s) from previous run: %s",
+                len(stale_shard_keys), ", ".join(sorted(stale_shard_keys)),
+            )
+
         shard_tasks = [
             asyncio.create_task(
                 self._run_ws_shard(
@@ -1027,7 +1085,35 @@ class WebSocketPhase:
             final_spot = self.spot_price_buffer.drain()
             final_hb = self._build_heartbeat_rows()
             if final_ws or final_ticks or final_ob or final_spot or final_hb:
-                flushed = self._flush_snapshot(final_ws, final_ticks, final_ob, final_spot, final_hb)
-                total = flushed + len(final_spot) + sum(len(r) for r in final_ob.values()) + len(final_hb)
-                if total:
-                    self.logger.info("Final flush on shutdown: %d rows", total)
+                # Wrap in try/except: the regular _ws_flush_loop has a
+                # buffer-on-error retry path (rows go back to the deque
+                # for the next cycle), but this final flush runs after
+                # the loop has been cancelled — there's no "next cycle".
+                # Without this guard a transient ENOSPC during a refresh
+                # silently drops the last ~5s of WS data.  Surfacing it
+                # via the alert webhook lets ops investigate before
+                # downstream consumers notice the gap.
+                try:
+                    flushed = self._flush_snapshot(final_ws, final_ticks, final_ob, final_spot, final_hb)
+                    total = flushed + len(final_spot) + sum(len(r) for r in final_ob.values()) + len(final_hb)
+                    if total:
+                        self.logger.info("Final flush on shutdown: %d rows", total)
+                except Exception as exc:
+                    lost = (
+                        sum(len(r) for r in final_ws.values())
+                        + sum(len(r) for r in final_ticks.values())
+                        + sum(len(r) for r in final_ob.values())
+                        + len(final_spot) + len(final_hb)
+                    )
+                    self.logger.exception(
+                        "Final flush failed during shutdown — %d rows lost: %s",
+                        lost, exc,
+                    )
+                    try:
+                        send_alert_async(
+                            "ws_final_flush_failed",
+                            "WebSocket final flush failed on shutdown",
+                            extra={"rows_lost": lost, "error": str(exc)[:500]},
+                        )
+                    except Exception:  # alerts are best-effort
+                        pass

@@ -83,19 +83,31 @@ def load_markets(path: Path, crypto: str, timeframe: str) -> list[MarketRecord]:
 
 
 def load_spot_lookup(spot_dir: Path) -> SpotPriceLookup:
+    """Build a per-crypto Binance-USDT spot lookup from spot_prices/.
+
+    Filter to ``source == "binance"`` rows.  The schema contract
+    (TICKS_SCHEMA.spot_price_usdt) is "BTC/USDT close from Binance" —
+    Chainlink USD prices and chainlink_proxy entries are different
+    series with different cadences and would silently violate the
+    contract if mixed into the same per-crypto bucket.  Without this
+    filter the ``<= t`` lookup returns whichever source happens to
+    have the largest timestamp, producing inconsistent
+    ``spot_price_usdt`` columns when this script re-collects ticks.
+    """
     import pyarrow.parquet as pq
     lookup = SpotPriceLookup()
     for f in spot_dir.glob("*.parquet"):
         df = pq.ParquetFile(str(f)).read().to_pandas()
+        if "source" in df.columns:
+            df = df[df["source"] == "binance"]
         for _, row in df.iterrows():
             sym = str(row["symbol"]).lower()
-            if sym.endswith("usdt"):
-                crypto = sym[:-4].upper()
-            else:
-                crypto = sym.split("/")[0].upper()
+            if not sym.endswith("usdt"):
+                continue  # only Binance USDT pairs
+            crypto = sym[:-4].upper()
             lookup.add(crypto, int(row["ts_ms"]), float(row["price"]))
     lookup.finalize()
-    log.info("Loaded %d spot price points into lookup", len(lookup))
+    log.info("Loaded %d Binance spot price points into lookup", len(lookup))
     return lookup
 
 

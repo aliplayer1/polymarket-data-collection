@@ -1,11 +1,22 @@
 import logging
 import random
 import time
+from email.utils import parsedate_to_datetime
 from typing import Any, Callable
 
 
 def _parse_retry_after(exc: Exception) -> float | None:
-    """Extract Retry-After value from a 429 or 503 response, if present."""
+    """Extract Retry-After value from a 429 or 503 response, if present.
+
+    RFC 7231 allows two formats:
+      - delta-seconds (integer or float): ``Retry-After: 120``
+      - HTTP-date:   ``Retry-After: Wed, 21 Oct 2026 07:28:00 GMT``
+
+    Cloudflare-fronted services (and AWS WAF) frequently send the
+    HTTP-date variant; without parsing it we'd silently fall back to
+    the 5 s default and hammer the service well before the real ban
+    window has elapsed.
+    """
     response = getattr(exc, "response", None)
     if response is None:
         return None
@@ -18,7 +29,21 @@ def _parse_retry_after(exc: Exception) -> float | None:
     try:
         return max(float(raw), 1.0)
     except (TypeError, ValueError):
+        pass
+    # Fall back to HTTP-date parsing.  parsedate_to_datetime returns an
+    # aware datetime when the input has a timezone (RFC 7231 mandates
+    # GMT) and a naive one otherwise; coerce to UTC either way.
+    try:
+        dt = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
         return 5.0
+    if dt is None:
+        return 5.0
+    epoch = dt.timestamp() if dt.tzinfo else dt.timestamp()  # naive treated as local
+    delay = epoch - time.time()
+    if delay <= 0:
+        return 1.0  # date already passed; minimum back-off floor
+    return delay
 
 
 def _is_non_retryable_client_error(exc: Exception) -> bool:
