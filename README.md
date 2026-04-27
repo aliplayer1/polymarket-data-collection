@@ -114,12 +114,17 @@ The runtime is strictly partitioned to maintain isolation between heavily standa
 ### Data Reliability & Robustness
 
 - **Subgraph-only tick backfill.** Polymarket's orderbook subgraph is the sole on-chain tick source. Subgraph rows zero out `block_number` / `log_index` (the subgraph doesn't expose them) and instead carry an `order_hash` (EIP-712, unique per fill within a transaction) that serves as the dedup discriminator. No rate limits, no daily caps, no provider rotation — a single GraphQL query per window returns canonical fill records.
-- **Hybrid legacy↔subgraph dedup.** When `consolidate_ticks` sees a `(market_id, timestamp_ms, token_id, tx_hash)` group containing both legacy rows (`order_hash IS NULL`) and subgraph rows (`order_hash IS NOT NULL`), the legacy rows are dropped. Re-running historical via the subgraph for any pre-migration window silently overwrites the old data. WS rows (`tx_hash=""`) are explicitly excluded from the filter.
-- **Sub-millisecond WS-tick preservation.** The dedup key includes `COALESCE(local_recv_ts_ns, 0)` so multiple WS fills on the same `(market_id, ts_ms, token_id)` survive consolidation as distinct rows. Sub-ms fills happen on hot tokens; without the discriminator they used to silently collapse to one row.
+- **Point-in-time correct spot prices.** `BinanceHistoryPhase` keys every kline's `close_price` on its `close_time` (= `open_time + 59999ms`) — both in the `spot_prices/` parquet table and in the in-process `SpotPriceLookup`. `SpotPriceLookup.get(t)` returns the entry with the largest `ts_ms ≤ t` (strict ≤, not nearest-neighbour); queries before any observed close return `None`, so `subgraph_ticks.py` writes a NULL `spot_price_usdt` rather than a forward-leaked value. Eliminating the original 0–60 s look-ahead leak swung a tail-scalper backtest's win rate by 56 percentage points — the canonical demonstration that PiT correctness matters even at minute resolution.
+- **Hybrid legacy↔subgraph dedup.** Inside the backfill (non-WS) branch of `consolidate_ticks`, when a `(market_id, timestamp_ms, token_id, tx_hash)` group contains both legacy rows (`order_hash IS NULL`) and subgraph rows (`order_hash IS NOT NULL`), the legacy rows are dropped. Re-running historical via the subgraph for any pre-migration window silently overwrites the old data. WS rows (`tx_hash=""`) bypass this filter via the append-only path described below.
+- **Sub-millisecond WS-tick preservation.** Within an append-only batch, the dedup key includes `COALESCE(local_recv_ts_ns, 0)` so multiple WS fills on the same `(market_id, ts_ms, token_id)` survive consolidation as distinct rows. Sub-ms fills happen on hot tokens; without the discriminator they used to silently collapse to one row.
 - **Two-layer watchdog.** TCP keepalive surfaces a half-open connection within ~25 s; on top of that, every WS connection (CLOB shards + RTDS feeds) carries a `DataHeartbeat` that flags per-key staleness. The watchdog reports `inf` as the age for keys that were *never seen*, distinguishing "session was healthy then went stale" from "session never delivered anything" so the reconnect loop only resets backoff in the former case.
 - **Lock-free WebSocket writes.** All five WS data types (prices, ticks, orderbook, spot prices, heartbeats — and culture prices) write uniquely-named shard files. The flush loop holds zero locks. A module-level `_KNOWN_SHARD_PREFIXES` allowlist tells `_write_partitioned_atomic` which files NOT to delete during stale-file cleanup; a regression test pins parity between the allowlist and the actual writers.
-- **Memory-bounded consolidation.** Every consolidation path (ticks, orderbook, prices, culture-prices, spot-prices, heartbeats) streams through DuckDB with a configurable memory cap (`PM_DUCKDB_MEMORY_LIMIT`) and disk spilling. Backed-up shard backlogs that previously OOM-ed the 8 GB CAX21 are now safe.
-- **Crash-safe consolidation ordering.** Every consolidate function does `os.replace(tmp, part-0.parquet)` BEFORE removing the old shard files, so a SIGKILL between the two leaves orphan shards (idempotent — next run merges again) rather than an empty partition that the HF upload's `delete_patterns` would propagate to the Hub. After replace, the containing directory is `fsync`-ed for durability across power loss.
+- **Append-only consolidation for WS shards.** `consolidate_ticks` and `consolidate_orderbook` split shards by filename prefix and route them to two paths:
+  - **WS append-only** (`ws_ticks_*.parquet`, `ws_ob_*.parquet`): each batch is dedup'd within itself and emitted as a new `part-ws-{epoch_ms}-{seq}.parquet` file alongside any existing `part-0.parquet`. **part-0 is never read or rewritten.** WS rows have `tx_hash=""`, `log_index=0`, `order_hash IS NULL`, and a system-monotonic `local_recv_ts_ns` (or millisecond-resolution `ts_ms` for orderbook), so they cannot dedup-collide with rows already in part-0 — there's nothing to fold. Peak memory is bounded by batch size, not partition history.
+  - **Backfill merge** (`backfill_*.parquet`, ticks only): existing chunked GROUP BY merge with `part-0.parquet`. Backfill rows have populated `tx_hash` and may overlap part-0 (e.g. re-fetched markets), so a real GROUP BY dedup is needed; volume is small in normal operation.
+  This split was forced by the prod CAX21 — a hot partition (BTC/5-min) accumulated 17 k+ WS shards during an outage and the previous "fold part-0 every batch" model OOM'd / ENOSPC'd because peak memory and disk spill scaled with **cumulative history**, not batch size. Reading a multi-file partition is transparent to DuckDB / pyarrow / pandas via `read_parquet(<dir>)`.
+- **Memory-bounded consolidation.** Every consolidation path (ticks, orderbook, prices, culture-prices, spot-prices, heartbeats) streams through DuckDB with a configurable memory cap (`PM_DUCKDB_MEMORY_LIMIT`), disk spilling, and per-pass connection / temp-dir teardown so spill files don't accumulate across batches. The spill location is controlled by `PM_DUCKDB_TEMP_DIR` and defaults to `/var/tmp` (persistent disk per FHS, NOT tmpfs — `/tmp` on systemd Linux is RAM-backed and capped at ~50 % of RAM, which exhausts mid-pass on hot partitions). Per-pass batch size is `PM_TICK_CONSOLIDATION_BATCH_SIZE` (default 250). All nullable columns added in v4/v5 (`tx_hash`, `local_recv_ts_ns`, `order_hash`, `spot_price_*`) are wrapped in explicit `CAST(... AS <canonical_type>)` so pandas-written all-NULL columns can't poison DuckDB's `union_by_name` schema with a non-string Arrow type.
+- **Crash-safe consolidation ordering.** Every consolidate function does `os.replace(tmp, <output_part_file>)` BEFORE removing the old shard files (the output is `part-0.parquet` for backfill / prices / spot / heartbeats and `part-ws-{epoch_ms}-NNN.parquet` for the append-only WS branches), so a SIGKILL between the two leaves orphan shards (idempotent — next run merges again) rather than an empty partition that the HF upload's `delete_patterns` would propagate to the Hub. After replace, the containing directory is `fsync`-ed for durability across power loss.
 - **HF upload safeguards.** `delete_patterns=["**/part-*.parquet"]` (not `*.parquet`) protects `markets.parquet` from accidental remote wipes; if local consolidation produced zero `part-*.parquet`, the entire delete pass is skipped to avoid propagating a local hole. Transient retry covers `huggingface_hub.HfHubHTTPError` and `ConnectionError`, not just substring-matching the legacy ValueError text.
 - **Atomic scan checkpoint.** `data/.scan_checkpoint` is written via `.tmp` + `os.replace`. A SIGKILL/power loss mid-write used to truncate it and silently force a multi-hour full re-scan; corrupt checkpoints now log a warning instead of being silent.
 - **Reliable retry semantics.** `api_call_with_retry` skips retry for non-retryable 4xx (400/401/403/404/422) so callers' fallback paths (e.g. api.py's 422 → no-order rerun) fire immediately instead of waiting for 3 attempts × backoff. 408/429/503 still retry with `Retry-After` honoured.
@@ -138,8 +143,11 @@ The runtime is strictly partitioned to maintain isolation between heavily standa
 data/                          ← crypto binary markets
   markets.parquet              ← one row per market (metadata only)
   prices/crypto=*/timeframe=*/part-*.parquet     ← Hive-partitioned price series
-  ticks/crypto=*/timeframe=*/part-*.parquet      ← Hive-partitioned trade fills
-  orderbook/crypto=*/timeframe=*/part-*.parquet  ← per-token BBO snapshots
+  ticks/crypto=*/timeframe=*/                    ← Hive-partitioned trade fills
+    part-0.parquet                               ← non-WS rows (backfill + folded legacy)
+    part-ws-{epoch_ms}-NNN.parquet               ← WS rows, one file per consolidation batch
+  orderbook/crypto=*/timeframe=*/                ← per-token BBO snapshots
+    part-0.parquet (legacy) + part-ws-*.parquet
   spot_prices/part-*.parquet   ← continuous Binance + Chainlink spot prices
   heartbeats/part-*.parquet    ← WS connection-health heartbeats
   .scan_checkpoint             ← atomic incremental-scan cutoff
@@ -148,8 +156,10 @@ data/                          ← crypto binary markets
 data-culture/                  ← multi-outcome culture markets
   markets.parquet
   prices/crypto=*/timeframe=*/part-*.parquet
-  ticks/crypto=*/timeframe=*/part-*.parquet
+  ticks/crypto=*/timeframe=*/part-*.parquet      ← same multi-file shape as crypto ticks
 ```
+
+Read multi-file partitions with directory globbing (DuckDB `read_parquet('data/ticks/**/*.parquet', hive_partitioning=true)` or `pq.read_table('data/ticks/crypto=BTC/timeframe=5-minute')`); never hard-code a single `part-0.parquet` filename.
 
 ### Tick Schema (`TICKS_SCHEMA`, v5)
 
@@ -205,7 +215,7 @@ python -m polymarket_pipeline --upload-only
 Recommended local validation:
 
 - **Regression tests**: `./.venv/bin/python -m pytest -q`
-  Covers parsing, storage behaviour (244 tests), schema enforcement, definition loading, and offline pipeline run-mode matrix.
+  Covers parsing, storage behaviour, schema enforcement, definition loading, and the offline pipeline run-mode matrix (257 tests at last count).
 - **Lint**: `./.venv/bin/python -m ruff check polymarket_pipeline tests scripts`
 - **Live smoke test**: `./.venv/bin/python -m polymarket_pipeline --test 10`
   Fetches 10 real markets into `test_output_parquet/` and runs data-quality checks. `--upload` is silently stripped in `--test` mode (warning emitted at startup, not after the run).
@@ -220,6 +230,7 @@ Recommended local validation:
 | `polymarket_pipeline/market_normalization.py` | Populates category/tokens on unified `MarketRecord` |
 | `polymarket_pipeline/models.py` | `MarketRecord` dataclass with dynamic `tokens` map |
 | `polymarket_pipeline/parsing.py` | ISO-8601 timestamp parsing (Gamma quirks + tz-naive UTC coercion) |
+| `polymarket_pipeline/settings.py` | Typed `RuntimeSettings` + `PipelineRunOptions` — env / CLI normalization |
 | `polymarket_pipeline/retry.py` | `api_call_with_retry` — exponential backoff with `Retry-After`, skips non-retryable 4xx |
 | `polymarket_pipeline/api.py` | `PolymarketApi` — Gamma + CLOB client with status-code-based fallbacks |
 | `polymarket_pipeline/providers.py` | `MarketProvider` / `TickBatchProvider` / `LastTradePriceProvider` Protocols |

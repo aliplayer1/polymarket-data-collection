@@ -23,28 +23,55 @@ def test_spot_price_lookup_exact_match():
     assert result[1] == 2000
 
 
-def test_spot_price_lookup_nearest_before():
+def test_spot_price_lookup_returns_largest_le_query():
+    """``get(t)`` returns the entry with the largest ``ts_ms <= t`` —
+    the most recent observation strictly in the past or AT ``t``.
+    """
     lookup = SpotPriceLookup()
     lookup.add("BTC", 1000, 67000.0)
     lookup.add("BTC", 3000, 67200.0)
     lookup.finalize()
 
-    # 1500 is closer to 1000 than 3000
+    # 1500 lies between two entries — must return the past one (1000),
+    # never the future one (3000).
     result = lookup.get("BTC", 1500)
     assert result is not None
-    assert result[0] == 67000.0
+    assert result == (67000.0, 1000)
 
 
-def test_spot_price_lookup_nearest_after():
+def test_spot_price_lookup_query_after_a_future_entry_still_returns_past():
+    """Critical PiT case: even when a stored entry is closer to the
+    query in absolute terms, ``get`` must NOT return it if its
+    ``ts_ms`` is in the future.  Pre-PiT-fix this returned 3000
+    (nearest); now it must return 1000 (latest observable).
+    """
     lookup = SpotPriceLookup()
     lookup.add("BTC", 1000, 67000.0)
     lookup.add("BTC", 3000, 67200.0)
     lookup.finalize()
 
-    # 2500 is closer to 3000 than 1000
+    # 2500 is closer to 3000 (Δ500) than 1000 (Δ1500), but at t=2500
+    # the entry stored at ts_ms=3000 hasn't been observed yet.
     result = lookup.get("BTC", 2500)
     assert result is not None
-    assert result[0] == 67200.0
+    assert result == (67000.0, 1000), (
+        "lookup must never return a future-timestamped price; "
+        "regression of the SpotPriceLookup PiT contract"
+    )
+
+
+def test_spot_price_lookup_query_before_any_entry_returns_none():
+    """When no observation has happened by ``t`` yet, ``get`` returns
+    ``None`` (signals the caller to write NULL ``spot_price_usdt``)
+    rather than fabricating a future-leaked value.
+    """
+    lookup = SpotPriceLookup()
+    lookup.add("BTC", 1000, 67000.0)
+    lookup.add("BTC", 3000, 67200.0)
+    lookup.finalize()
+
+    assert lookup.get("BTC", 999) is None
+    assert lookup.get("BTC", 0) is None
 
 
 def test_spot_price_lookup_missing_crypto():
@@ -61,14 +88,24 @@ def test_spot_price_lookup_empty():
     assert lookup.get("BTC", 1000) is None
 
 
-def test_spot_price_lookup_single_entry():
+def test_spot_price_lookup_single_entry_query_after_returns_it():
+    """A single entry at ts=5000 satisfies any query at ts >= 5000."""
     lookup = SpotPriceLookup()
     lookup.add("ETH", 5000, 3200.0)
     lookup.finalize()
 
     result = lookup.get("ETH", 9999)
     assert result is not None
-    assert result[0] == 3200.0
+    assert result == (3200.0, 5000)
+
+
+def test_spot_price_lookup_single_entry_query_before_returns_none():
+    """A single entry at ts=5000 cannot satisfy a query at ts < 5000."""
+    lookup = SpotPriceLookup()
+    lookup.add("ETH", 5000, 3200.0)
+    lookup.finalize()
+
+    assert lookup.get("ETH", 4999) is None
 
 
 def test_spot_price_lookup_len():

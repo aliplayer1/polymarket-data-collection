@@ -85,23 +85,38 @@ class SpotPriceLookup:
             self._data[crypto].sort()
 
     def get(self, crypto: str, ts_ms: int) -> tuple[float, int] | None:
-        """Return ``(price, price_ts_ms)`` for the nearest entry, or None."""
+        """Return ``(price, price_ts_ms)`` for the latest entry whose
+        ``price_ts_ms <= ts_ms``, or ``None`` if no such entry exists.
+
+        Point-in-time correct: never returns a price observed in the
+        future.  Earlier this helper used nearest-neighbour bisect, which
+        — even after the ``open_time → close_time`` keying fix
+        (commit a2eb3bc8) — could still return a future kline's
+        close_price for a query landing inside an in-progress minute
+        (e.g. at ``open_time + 30s`` the *current* minute hadn't
+        closed yet but its close_time was the nearest stored entry).
+        That residual ~30s leak corrupted ``spot_price_usdt`` embedded
+        into tick rows by ``subgraph_ticks.py``.
+
+        The strict ``<=`` semantics mean queries before the first
+        observed close return ``None``, which downstream code maps to
+        a NULL ``spot_price_usdt`` — strictly better than a wrong
+        forward-looking value.
+        """
         arr = self._data.get(crypto)
         if not arr:
             return None
-        # Binary search for the closest timestamp
-        idx = bisect.bisect_left(arr, (ts_ms,))
-        best_idx = None
-        best_dist = float("inf")
-        for candidate in (idx - 1, idx):
-            if 0 <= candidate < len(arr):
-                dist = abs(arr[candidate][0] - ts_ms)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_idx = candidate
-        if best_idx is None:
+        # ``bisect_right(arr, (ts_ms, +inf))`` puts us *just past* every
+        # entry whose ts_ms == ts_ms (and after every entry strictly
+        # less).  ``idx - 1`` is therefore the largest entry with
+        # ``price_ts_ms <= ts_ms``.  Using +inf in the second tuple
+        # field guarantees the comparison is purely on ts_ms regardless
+        # of stored prices.
+        idx = bisect.bisect_right(arr, (ts_ms, float("inf"))) - 1
+        if idx < 0:
             return None
-        return arr[best_idx][1], arr[best_idx][0]
+        price_ts_ms, price = arr[idx]
+        return price, price_ts_ms
 
     def __len__(self) -> int:
         return sum(len(v) for v in self._data.values())
