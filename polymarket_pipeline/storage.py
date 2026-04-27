@@ -1317,18 +1317,27 @@ def consolidate_ticks(
     accumulator on every run.  Memory is bounded to one batch's
     worth of rows, regardless of partition history.
 
-    Phase 2 — **non-WS shards** (``backfill_*.parquet``): existing
-    chunked merge with part-0.  Backfill rows have populated
-    ``tx_hash`` and may overlap with rows already in part-0 (e.g.
-    re-fetched markets during a schema migration), so they need
-    the GROUP BY dedup.  Volume is small in normal operation
-    (a few markets per historical run × low 4-figure rows each),
-    so the merge fits within the configured memory cap.
+    Phase 2 — **backfill shards** (``backfill_*.parquet``): same
+    shape as Phase 1.  Each batch dedup'd within itself, written
+    to a new ``part-bf-{epoch_ms}-{pid}-{seq}.parquet`` file
+    alongside ``part-0.parquet``; **part-0 is never folded.**
+    Backfill rows can legitimately overlap rows already in part-0
+    (re-fetched markets within the historical scan's 2-day
+    rolling window), and the legacy "fold part-0 into every
+    batch" path turned that into a hard ENOSPC failure mode once
+    a single historical run produced 800+ shards on a multi-GB
+    part-0.  Append-only keeps peak DuckDB memory + spill bounded
+    by batch size regardless of how big part-0 grows; cross-file
+    dedup of the resulting ``part-0`` ⊕ ``part-bf-*`` collisions
+    is deferred to read time (every modern Parquet consumer
+    already handles a multi-file Hive partition transparently
+    via ``read_parquet(<dir>)``).
 
-    Reading a partition is unaffected by this split — every modern
-    Parquet consumer (DuckDB, pyarrow, pandas via
-    ``read_parquet(<dir>)``) handles a Hive partition with
-    multiple ``part-*.parquet`` files transparently.
+    Tier-2 compaction folds accumulated ``part-ws-*`` and
+    ``part-bf-*`` files into single compact files per partition
+    once their counts cross ``PM_PART_WS_COMPACTION_THRESHOLD`` —
+    so the file count cannot drift unboundedly even though
+    individual passes never touch part-0.
     """
     log = logger or logging.getLogger("polymarket_pipeline")
     t_dir = ticks_dir or PARQUET_TICKS_DIR
@@ -1353,23 +1362,32 @@ def consolidate_ticks(
                 if f != "part-0.parquet"
                 and not f.startswith("ws_ticks_")
                 and not f.startswith("part-ws-")  # already-consolidated WS outputs
+                and not f.startswith("part-bf-")  # already-consolidated backfill outputs
             ]
             has_part0 = "part-0.parquet" in parquet_files
             part_ws_count = sum(
                 1 for f in parquet_files if f.startswith("part-ws-")
             )
+            part_bf_count = sum(
+                1 for f in parquet_files if f.startswith("part-bf-")
+            )
             # The tier-2 compaction needs to run even when no fresh
             # shards exist (a long-idle hot partition has only
-            # accumulated part-ws-* files), so include the threshold
-            # check in the "is there work?" decision.
-            needs_compact = part_ws_count >= _get_part_ws_compaction_threshold()
+            # accumulated part-ws-* / part-bf-* files), so include the
+            # threshold check in the "is there work?" decision.
+            compact_threshold = _get_part_ws_compaction_threshold()
+            needs_compact = (
+                part_ws_count >= compact_threshold
+                or part_bf_count >= compact_threshold
+            )
 
             if not ws_shards and not non_ws_shards and not needs_compact:
-                continue  # nothing to consolidate (only part-0 and/or part-ws-*)
+                continue  # nothing to consolidate (only part-0 and/or part-ws-* / part-bf-*)
 
             log.info(
-                "Consolidating partition %s (ws=%d, backfill=%d, part_ws=%d, has_part0=%s)",
-                rel, len(ws_shards), len(non_ws_shards), part_ws_count,
+                "Consolidating partition %s (ws=%d, backfill=%d, part_ws=%d, part_bf=%d, has_part0=%s)",
+                rel, len(ws_shards), len(non_ws_shards),
+                part_ws_count, part_bf_count,
                 "yes" if has_part0 else "no",
             )
             _check_disk_space(dirpath)
@@ -1410,17 +1428,27 @@ def consolidate_ticks(
                 log=log,
             )
 
-            # Phase 2: non-WS shards merged with part-0 (existing path).
+            # Phase 2: backfill shards as append-only part-bf-* files.
+            # Same shape as Phase 1: each batch dedup'd within itself,
+            # written to a fresh part-bf-*.parquet, no part-0 fold.
             if non_ws_shards:
-                _consolidate_nonws_ticks_with_part0(
+                _consolidate_backfill_appendonly(
                     duckdb_module=duckdb,
                     dirpath=dirpath,
                     shard_files=non_ws_shards,
-                    has_part0=has_part0,
                     batch_size=batch_size,
-                    rel=rel,
                     log=log,
                 )
+
+            # Tier-2: backfill compaction.  When accumulated
+            # part-bf-*.parquet count crosses the compaction
+            # threshold, fold them into a single file (same
+            # invariants as the WS tier-2 fold above).
+            _compact_part_bf_ticks(
+                duckdb_module=duckdb,
+                dirpath=dirpath,
+                log=log,
+            )
 
 
 def _consolidate_ws_ticks_appendonly(
@@ -1529,9 +1557,22 @@ def _run_ws_appendonly_pass(
     input_basenames: list[str],
     output_path: str,
 ) -> int:
-    """Single WS-append-only pass: dedup ``input_basenames`` within
-    the batch and write to ``output_path``.  Legacy↔subgraph filter
-    is omitted (WS rows have ``tx_hash=""``, outside its scope)."""
+    """Single append-only pass: dedup ``input_basenames`` within the
+    batch and write to ``output_path``.
+
+    Includes the same legacy↔subgraph filter as
+    ``_run_tick_consolidation_pass`` so the backfill path (which now
+    flows through this function instead of folding part-0) preserves
+    the schema-migration override: when the same (market_id, ts_ms,
+    token_id, tx_hash) appears as both legacy (Etherscan/RPC: populated
+    log_index, NULL order_hash) and subgraph (log_index=0, populated
+    order_hash) rows in the batch, the legacy rows are dropped.
+
+    The filter is a no-op for WS rows (``tx_hash=""``), so adding it
+    here doesn't change WS-only callers' behaviour — it only matters
+    when a backfill batch happens to contain both legacy and subgraph
+    rows for the same on-chain transaction.
+    """
     file_paths = [os.path.join(dirpath, f) for f in input_basenames]
     files_sql = ", ".join(f"'{_duckdb_escape(p)}'" for p in file_paths)
     files_with_order_sql = ", ".join(
@@ -1617,10 +1658,34 @@ def _run_ws_appendonly_pass(
                     file_row_number=true
                 ) AS src
                 JOIN source_files AS f ON src.filename = f.file_path
+            ),
+            -- Legacy↔subgraph filter (see _run_tick_consolidation_pass
+            -- for the rationale): drop legacy rows when a subgraph
+            -- sibling exists for the same (market, ts, token, tx).
+            -- WS rows have tx_hash='' so the filter is a no-op for them.
+            subgraph_keys AS (
+                SELECT DISTINCT market_id, timestamp_ms, token_id, tx_hash
+                FROM ranked_rows
+                WHERE order_hash IS NOT NULL
+                  AND tx_hash <> ''
+            ),
+            dedup_input AS (
+                SELECT r.*
+                FROM ranked_rows AS r
+                LEFT JOIN subgraph_keys AS sk
+                    ON sk.market_id    = r.market_id
+                   AND sk.timestamp_ms = r.timestamp_ms
+                   AND sk.token_id     = r.token_id
+                   AND sk.tx_hash      = r.tx_hash
+                WHERE NOT (
+                    r.tx_hash <> ''
+                    AND r.order_hash IS NULL
+                    AND sk.market_id IS NOT NULL
+                )
             )
             SELECT
                 {select_sql}
-            FROM ranked_rows
+            FROM dedup_input AS ranked_rows
             GROUP BY {group_by_sql},
                      COALESCE(order_hash, ''),
                      COALESCE(local_recv_ts_ns, 0)
@@ -1707,42 +1772,61 @@ def _compact_part_ws_ticks(
             shutil.rmtree(pass_temp_dir, ignore_errors=True)
 
 
-def _consolidate_nonws_ticks_with_part0(
+def _consolidate_backfill_appendonly(
     *,
     duckdb_module: Any,
     dirpath: str,
     shard_files: list[str],
-    has_part0: bool,
     batch_size: int,
-    rel: str,
     log: logging.Logger,
 ) -> None:
-    """Existing chunked-merge path, restricted to non-WS shards.
+    """Consume backfill shards into new ``part-bf-{epoch_ms}-{pid}-{seq}.parquet`` files.
 
-    These are typically ``backfill_*.parquet`` written by the
-    historical phase (and any other future non-WS source), and
-    may legitimately overlap rows already in ``part-0.parquet``
-    (e.g. a re-fetched market), so a real GROUP BY dedup is
-    required.  Volume is small in normal operation, so peak
-    memory tracks a few backfill files plus part-0 — manageable
-    within the configured cap.
+    Mirrors the WS append-only path: each batch is dedup'd within
+    itself and emitted as a fresh ``part-bf-*`` file alongside
+    ``part-0.parquet``; **part-0 is never folded.**  Cross-batch and
+    cross-part-0 dedup are deferred to read time (every modern
+    Parquet consumer already handles a multi-file partition via
+    ``read_parquet(<dir>)``; downstream consumers GROUP BY the
+    ``_TICKS_DEDUP_COLS`` key plus ``order_hash`` / ``local_recv_ts_ns``
+    if they need to collapse re-fetched fills).
+
+    Why not fold part-0 like the legacy path did?  Backfill is
+    structurally allowed to repeat fills (re-fetched markets within
+    the historical scan's 2-day rolling window), but folding part-0
+    into every batch scales peak DuckDB memory + spill with
+    **cumulative history** — the same failure mode that forced the
+    WS append-only split.  In production (CAX21) one historical
+    run wrote 874 BTC/5-minute backfill shards which, merged
+    against a multi-GB part-0, ENOSPC'd a 22 GB scratch volume in
+    < 2 minutes.  Append-only keeps peak spill bounded by batch
+    size regardless of how big part-0 grows, and tier-2 compaction
+    keeps the part-bf-* file count from drifting.
     """
-    consolidated_path = os.path.join(dirpath, "part-0.parquet")
+    if not shard_files:
+        return
+
     num_batches = max(1, (len(shard_files) + batch_size - 1) // batch_size)
-    chunked = num_batches > 1
-    if chunked:
-        log.info(
-            "  -> Backfill: splitting %d shards into %d batches of <=%d",
-            len(shard_files), num_batches, batch_size,
-        )
+    log.info(
+        "  -> Backfill append-only: %d shards → %d batch(es) of <=%d",
+        len(shard_files), num_batches, batch_size,
+    )
 
+    epoch_ms = int(time.time() * 1000)
+    pid = os.getpid()
     settings_logged = False
+    rows_total = 0
 
-    def _run_pass(input_files: list[str]) -> int:
-        nonlocal settings_logged
-        pass_temp_dir = _make_duckdb_temp_dir("ticks")
-        con = duckdb_module.connect()
+    for batch_idx in range(num_batches):
+        batch = shard_files[batch_idx * batch_size : (batch_idx + 1) * batch_size]
+        out_name = f"part-bf-{epoch_ms}-{pid}-{batch_idx:03d}.parquet"
+        out_path = os.path.join(dirpath, out_name)
+        tmp_path = f"{out_path}.{pid}.tmp"
+
+        pass_temp_dir = _make_duckdb_temp_dir("backfill_ticks")
+        con = None
         try:
+            con = duckdb_module.connect()
             memory_limit, threads = _configure_duckdb_for_consolidation(
                 con, temp_dir=pass_temp_dir,
             )
@@ -1757,48 +1841,122 @@ def _consolidate_nonws_ticks_with_part0(
                     memory_limit or "default", threads, pass_temp_dir, free_str,
                 )
                 settings_logged = True
-            return _run_tick_consolidation_pass(
-                con,
-                dirpath=dirpath,
-                input_basenames=input_files,
-                consolidated_path=consolidated_path,
-                rel=rel,
-                log=log,
+            log.info(
+                "  -> Backfill Batch %d/%d (%d shards)",
+                batch_idx + 1, num_batches, len(batch),
             )
+
+            nrows = _run_ws_appendonly_pass(
+                con, dirpath=dirpath, input_basenames=batch, output_path=tmp_path,
+            )
+
+            os.replace(tmp_path, out_path)
+            _fsync_dir(dirpath)
+
+            for fname in batch:
+                try:
+                    os.remove(os.path.join(dirpath, fname))
+                except OSError:
+                    pass
+
+            rows_total += nrows
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
         finally:
             try:
-                con.close()
+                if con is not None:
+                    con.close()
             finally:
                 shutil.rmtree(pass_temp_dir, ignore_errors=True)
 
-    nrows = 0
-    if not chunked:
-        input_files = (["part-0.parquet"] if has_part0 else []) + shard_files
-        input_files.sort(
-            key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
-        )
-        nrows = _run_pass(input_files)
-    else:
-        for pass_idx in range(num_batches):
-            batch = shard_files[
-                pass_idx * batch_size : (pass_idx + 1) * batch_size
-            ]
-            if pass_idx == 0:
-                input_files = (["part-0.parquet"] if has_part0 else []) + batch
-                input_files.sort(
-                    key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f)
-                )
-            else:
-                # part-0 was just written by the previous pass; place
-                # it first so newer batch rows win on ties.
-                input_files = ["part-0.parquet"] + batch
-            log.info(
-                "  -> Backfill Batch %d/%d (%d input file(s))",
-                pass_idx + 1, num_batches, len(input_files),
-            )
-            nrows = _run_pass(input_files)
+    log.info(
+        "  -> Backfill append-only complete: %d rows in %d new file(s)",
+        rows_total, num_batches,
+    )
 
-    log.info("  -> %s backfill consolidated: %d rows", rel, nrows)
+
+def _compact_part_bf_ticks(
+    *,
+    duckdb_module: Any,
+    dirpath: str,
+    log: logging.Logger,
+) -> None:
+    """Tier-2 fold for ``part-bf-*.parquet`` files.
+
+    Mirrors ``_compact_part_ws_ticks``: when the count of
+    ``part-bf-*.parquet`` files in the partition crosses
+    ``PM_PART_WS_COMPACTION_THRESHOLD``, fold them into a single
+    ``part-bf-{epoch_ms}-{pid}-compact.parquet`` using the same
+    dedup pass.  ``part-0.parquet`` is **not** touched — same
+    invariant as the regular append-only path.
+
+    The threshold env var is shared with WS compaction because
+    the considerations are identical (read amplification, HF
+    object count) and a single tunable is easier to reason about.
+    """
+    threshold = _get_part_ws_compaction_threshold()
+    part_bf_files = sorted(
+        [
+            f for f in os.listdir(dirpath)
+            if f.startswith("part-bf-") and f.endswith(".parquet")
+        ],
+        key=lambda f: (os.path.getmtime(os.path.join(dirpath, f)), f),
+    )
+    if len(part_bf_files) < threshold:
+        return
+
+    log.info(
+        "  -> Tier-2 backfill compaction: folding %d part-bf-*.parquet files in %s",
+        len(part_bf_files), dirpath,
+    )
+
+    epoch_ms = int(time.time() * 1000)
+    pid = os.getpid()
+    out_name = f"part-bf-{epoch_ms}-{pid}-compact.parquet"
+    out_path = os.path.join(dirpath, out_name)
+    tmp_path = f"{out_path}.{pid}.tmp"
+    pass_temp_dir = _make_duckdb_temp_dir("backfill_compact")
+    con = None
+    try:
+        con = duckdb_module.connect()
+        _configure_duckdb_for_consolidation(con, temp_dir=pass_temp_dir)
+        nrows = _run_ws_appendonly_pass(
+            con,
+            dirpath=dirpath,
+            input_basenames=part_bf_files,
+            output_path=tmp_path,
+        )
+        os.replace(tmp_path, out_path)
+        _fsync_dir(dirpath)
+
+        for fname in part_bf_files:
+            try:
+                os.remove(os.path.join(dirpath, fname))
+            except OSError:
+                pass
+
+        log.info(
+            "  -> Tier-2 backfill compaction complete: %d rows in %s",
+            nrows, out_name,
+        )
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            if con is not None:
+                con.close()
+        finally:
+            shutil.rmtree(pass_temp_dir, ignore_errors=True)
 
 
 _WS_STAGING_FILENAME = "ws_staging.parquet"

@@ -19,9 +19,10 @@ def _read_partition_ticks(part_dir) -> pd.DataFrame:
     """Read all consolidated tick files in a partition.
 
     A consolidated partition can hold:
-      * ``part-0.parquet`` — non-WS rows (backfill + legacy + folded part-0
-        from older runs) merged via the GROUP BY path.
+      * ``part-0.parquet`` — legacy folded content from earlier runs.
       * ``part-ws-{epoch_ms}-{seq}.parquet`` — WS rows from the
+        append-only path (one or more files per consolidation run).
+      * ``part-bf-{epoch_ms}-{seq}.parquet`` — backfill rows from the
         append-only path (one or more files per consolidation run).
 
     Returns the union of all of them as a single DataFrame.  Empty
@@ -38,7 +39,11 @@ def _read_partition_ticks(part_dir) -> pd.DataFrame:
     names = sorted(
         f for f in os.listdir(part_dir)
         if f.endswith(".parquet")
-        and (f == "part-0.parquet" or f.startswith("part-ws-"))
+        and (
+            f == "part-0.parquet"
+            or f.startswith("part-ws-")
+            or f.startswith("part-bf-")
+        )
     )
     if not names:
         return pd.DataFrame()
@@ -52,7 +57,8 @@ def _read_partition_orderbook(part_dir) -> pd.DataFrame:
     Same multi-file shape as ticks: ``part-0.parquet`` (legacy
     consolidated content) + zero or more
     ``part-ws-{epoch_ms}-{seq}.parquet`` files written by the
-    append-only path.
+    append-only path.  Orderbook has no backfill source, so no
+    ``part-bf-*`` files exist for it.
     """
     part_dir = str(part_dir)
     if not os.path.isdir(part_dir):
@@ -435,9 +441,18 @@ def test_consolidate_ticks_merges_shards_and_deduplicates(tmp_path):
 
     consolidate_ticks(ticks_dir=str(ticks_dir))
 
-    assert sorted(os.listdir(shard_dir)) == ["part-0.parquet"]
+    # Backfill shards now flow through the append-only path: the
+    # consolidated output is one or more ``part-bf-*.parquet`` files
+    # alongside ``part-0.parquet`` (if any was already present).  The
+    # input shards must be gone.
+    remaining = sorted(os.listdir(shard_dir))
+    assert all(
+        f.startswith("part-bf-") or f == "part-0.parquet"
+        for f in remaining
+    ), remaining
+    assert not any(f.startswith("backfill_") for f in remaining)
 
-    consolidated = pq.read_table(shard_dir / "part-0.parquet").to_pandas()
+    consolidated = _read_partition_ticks(shard_dir)
     dedup_keys = ["market_id", "timestamp_ms", "token_id", "tx_hash", "log_index"]
     assert len(consolidated) == 3
     assert len(consolidated.drop_duplicates(subset=dedup_keys)) == 3
@@ -488,7 +503,7 @@ def test_consolidate_ticks_handles_legacy_shards_without_log_index(tmp_path):
 
     consolidate_ticks(ticks_dir=str(ticks_dir))
 
-    consolidated = pq.read_table(shard_dir / "part-0.parquet").to_pandas()
+    consolidated = _read_partition_ticks(shard_dir)
 
     assert len(consolidated) == 1
     assert consolidated.iloc[0]["price"] == pytest.approx(0.57)
@@ -1157,7 +1172,7 @@ def test_consolidate_ticks_preserves_order_hash_and_dedups_by_it(tmp_path):
     )
 
     consolidate_ticks(ticks_dir=str(tmp_path))
-    out = pq.ParquetFile(str(part / "part-0.parquet")).read().to_pandas()
+    out = _read_partition_ticks(part)
     assert len(out) == 3, f"expected 3 rows (1 legacy + 2 subgraph), got {len(out)}"
     # Legacy row NULL order_hash survives; subgraph rows carry their distinct hashes.
     order_hashes = set(str(x) if x is not None else "NULL" for x in out["order_hash"])
@@ -1342,7 +1357,7 @@ def test_consolidate_ticks_keeps_legacy_when_no_subgraph_overlap(tmp_path):
     )
 
     consolidate_ticks(ticks_dir=str(tmp_path))
-    out = pq.ParquetFile(str(part / "part-0.parquet")).read().to_pandas()
+    out = _read_partition_ticks(part)
     assert len(out) == 1
     assert out.iloc[0]["tx_hash"] == "0xtx_legacy_only"
     assert out.iloc[0]["log_index"] == 5  # legacy block info preserved
@@ -1434,17 +1449,17 @@ def test_persist_ticks_dedup_matches_consolidate_ticks(tmp_path):
     # Path A: persist_ticks (now delegates to append+consolidate)
     dir_a = tmp_path / "a"
     persist_ticks(rows.copy(), ticks_dir=str(dir_a))
-    out_a = pq.read_table(
-        str(dir_a / "crypto=BTC" / "timeframe=5-minute" / "part-0.parquet")
-    ).to_pandas()
+    out_a = _read_partition_ticks(
+        dir_a / "crypto=BTC" / "timeframe=5-minute"
+    )
 
     # Path B: explicit append_ticks_only + consolidate_ticks
     dir_b = tmp_path / "b"
     append_ticks_only(rows.copy(), ticks_dir=str(dir_b))
     consolidate_ticks(ticks_dir=str(dir_b))
-    out_b = pq.read_table(
-        str(dir_b / "crypto=BTC" / "timeframe=5-minute" / "part-0.parquet")
-    ).to_pandas()
+    out_b = _read_partition_ticks(
+        dir_b / "crypto=BTC" / "timeframe=5-minute"
+    )
 
     assert len(out_a) == 4
     assert len(out_b) == len(out_a), "persist_ticks and consolidate_ticks must agree"
@@ -1723,17 +1738,17 @@ def test_make_duckdb_temp_dir_honours_pm_duckdb_temp_dir_env(tmp_path, monkeypat
 
 
 def test_consolidate_ticks_join_based_legacy_filter_matches_window_semantics(monkeypatch, tmp_path):
-    """The legacy↔subgraph filter must keep the same semantics after the
-    window-function-to-JOIN refactor.  This test mixes a legacy on-chain
-    row (NULL order_hash, populated tx_hash + log_index), a subgraph row
-    for the SAME tx (populated order_hash, log_index=0), a WS row
-    (tx_hash=''), and a "lonely" legacy row whose tx has no subgraph
-    sibling — across many shards, forcing the chunked path.
+    """The JOIN-based legacy↔subgraph filter must drop legacy rows
+    whose tx has a subgraph sibling, while preserving lonely-legacy
+    and WS rows.
 
-    Regression: production CAX21 (DuckDB capped at 2 GB) OOM'd in the
-    window function (``MAX(...) OVER (PARTITION BY mid, ts, tid, txh)``)
-    on partitions with thousands of shards.  The JOIN-based filter
-    must produce the identical row set without the blocking operator.
+    With the append-only backfill path, the filter is per-batch:
+    legacy + subgraph rows for the same tx must end up in the same
+    DuckDB pass for the override to fire.  Tier-2 compaction folds
+    multiple part-bf-* files later if cross-batch dedup is needed.
+    The original chunked-with-part0 path's regression (window-function
+    OOM on production CAX21 with thousands of shards) is now
+    structurally impossible because no batch ever folds part-0.
     """
     from polymarket_pipeline import storage as storage_mod
     from polymarket_pipeline.storage import consolidate_ticks
@@ -1841,12 +1856,12 @@ def test_consolidate_ticks_join_based_legacy_filter_matches_window_semantics(mon
         "order_hash": [None],
     })
 
-    # Force the chunked path: batch_size=1 → each shard its own pass.
-    monkeypatch.setattr(storage_mod, "_TICK_CONSOLIDATION_BATCH_SIZE", 1)
+    # All three backfill shards in one batch so the legacy filter's
+    # subgraph-sibling JOIN can see them together (per-batch contract).
+    monkeypatch.setattr(storage_mod, "_TICK_CONSOLIDATION_BATCH_SIZE", 10)
 
     consolidate_ticks(ticks_dir=str(tmp_path))
-    # WS rows go to part-ws-* (append-only), backfill rows merge into
-    # part-0 — read the union of both.
+    # WS rows land in part-ws-*; backfill rows in part-bf-* — read the union.
     out = _read_partition_ticks(part).sort_values("timestamp_ms").reset_index(drop=True)
 
     # Expected: 3 rows.  Legacy-A dropped (shadowed by subgraph-X);
